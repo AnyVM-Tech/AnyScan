@@ -32,13 +32,14 @@ use anyscan::{
         bin_lookup_line_preview, normalized_bin_lookup_limit, parse_bin_lookup_candidates,
     },
     ops::init_tracing,
+    public_verification::verify_public_resource_control,
     store::AnyScanStore,
 };
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 const SESSION_COOKIE: &str = "anyscan_session";
 
@@ -294,10 +295,28 @@ async fn create_ownership_claim(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<OwnershipClaimRequest>,
 ) -> Result<(StatusCode, Json<OwnershipClaimRecord>), StatusCode> {
-    let record = state
+    let mut record = state
         .store
         .create_ownership_claim(&payload)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let verification = verify_public_resource_control(
+        record.resource_kind,
+        &record.resource,
+        record.verification_method,
+        &record.verification_value,
+        &record.requester_email,
+    )
+    .await;
+    match state.store.apply_ownership_claim_verification(
+        record.id,
+        verification.status,
+        Some(&verification.summary),
+        verification.verification_attempted_at,
+        verification.verification_completed_at,
+    ) {
+        Ok(updated) => record = updated,
+        Err(error) => warn!(claim_id = record.id, ?error, "failed to persist ownership claim verification result"),
+    }
     let _ = state.store.append_event(
         None,
         &ApiEvent::PublicWorkflowRecorded {
@@ -349,10 +368,28 @@ async fn create_opt_out_request(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<OptOutRequest>,
 ) -> Result<(StatusCode, Json<OptOutRecord>), StatusCode> {
-    let record = state
+    let mut record = state
         .store
         .create_opt_out_request(&payload)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let verification = verify_public_resource_control(
+        record.resource_kind,
+        &record.resource,
+        record.verification_method,
+        &record.verification_value,
+        &record.requester_email,
+    )
+    .await;
+    match state.store.apply_opt_out_verification(
+        record.id,
+        verification.status,
+        Some(&verification.summary),
+        verification.verification_attempted_at,
+        verification.verification_completed_at,
+    ) {
+        Ok(updated) => record = updated,
+        Err(error) => warn!(opt_out_id = record.id, ?error, "failed to persist opt-out verification result"),
+    }
     let _ = state.store.append_event(
         None,
         &ApiEvent::PublicWorkflowRecorded {
@@ -1209,10 +1246,17 @@ fn sanitize_api_event_for_session(
 fn require_auth(state: &AppState, jar: &CookieJar) -> Result<SessionContext, StatusCode> {
     let cookie = jar.get(SESSION_COOKIE).ok_or(StatusCode::UNAUTHORIZED)?;
     let token = cookie.value();
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.validate_nbf = false;
+    validation.required_spec_claims = ["exp", "iat", "sub"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let claims = decode::<SessionClaims>(
         token,
         &DecodingKey::from_secret(state.config.auth.jwt_secret.as_bytes()),
-        &Validation::default(),
+        &validation,
     )
     .map_err(|_| StatusCode::UNAUTHORIZED)?;
     let operator = state
