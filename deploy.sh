@@ -142,6 +142,11 @@ install -m 0644 "$SCRIPT_DIR/local-bootstrap-provisioner.json" "$LOCAL_BOOTSTRAP
 install -m 0755 "$SCRIPT_DIR/local-bootstrap-provisioner.py" "$EXTENSIONS_DIR/local-bootstrap-provisioner.py"
 install -m 0644 "$SCRIPT_DIR/vulnscanner-zmap-adapter.json" "$VULNSCANNER_MANIFEST"
 install -m 0755 "$SCRIPT_DIR/vulnscanner-zmap-adapter.py" "$EXTENSIONS_DIR/vulnscanner-zmap-adapter.py"
+install -d -m 0755 "$EXTENSIONS_DIR/bundled" "$EXTENSIONS_DIR/bundled/manifests" "$EXTENSIONS_DIR/bundled/scripts" "$EXTENSIONS_DIR/bundled/rules"
+cp -R "$SCRIPT_DIR/extensions/bundled/manifests/." "$EXTENSIONS_DIR/bundled/manifests/"
+cp -R "$SCRIPT_DIR/extensions/bundled/rules/." "$EXTENSIONS_DIR/bundled/rules/"
+cp -R "$SCRIPT_DIR/extensions/bundled/scripts/." "$EXTENSIONS_DIR/bundled/scripts/"
+chmod 0755 "$EXTENSIONS_DIR"/bundled/scripts/*.py
 
 if install_vulnscanner_binary; then
     ENABLED_EXTENSION_MANIFESTS="$ENABLED_EXTENSION_MANIFESTS,$VULNSCANNER_MANIFEST"

@@ -3,6 +3,8 @@ use std::{collections::HashMap, path::Path};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::plugins::{FindingPluginMetadata, PluginExecutionMode, PluginFamily, PluginLeakixLabel};
+
 pub const DEFAULT_FINDINGS_QUERY_LIMIT: usize = 50;
 pub const MAX_FINDINGS_QUERY_LIMIT: usize = 250;
 const DEFAULT_PUBLIC_FINDINGS_QUERY_LIMIT: usize = 20;
@@ -49,6 +51,37 @@ impl std::str::FromStr for Severity {
             "high" => Ok(Self::High),
             "critical" => Ok(Self::Critical),
             other => Err(format!("unknown severity: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+impl FindingConfidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FindingConfidence::Low => "low",
+            FindingConfidence::Medium => "medium",
+            FindingConfidence::High => "high",
+        }
+    }
+}
+
+impl std::str::FromStr for FindingConfidence {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!("unknown finding confidence: {other}")),
         }
     }
 }
@@ -247,7 +280,31 @@ pub struct RunScope {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
+    pub worker_pool: Option<String>,
+    #[serde(default)]
     pub failed_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ActiveAuthorizedPluginExecution {
+    #[serde(default)]
+    pub global_gate_enabled: bool,
+    #[serde(default, alias = "enabled")]
+    pub request_opt_in_enabled: bool,
+}
+
+impl ActiveAuthorizedPluginExecution {
+    pub fn is_enabled(&self) -> bool {
+        self.global_gate_enabled && self.request_opt_in_enabled
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveAuthorizedExecutionPolicySnapshot {
+    #[serde(default)]
+    pub active_authorized_supported: bool,
+    #[serde(default)]
+    pub active_authorized_gate_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -536,6 +593,172 @@ impl Default for PublicFindingStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveBackendKind {
+    B2S3,
+}
+
+impl ArchiveBackendKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::B2S3 => "b2_s3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchivePressureMode {
+    Normal,
+    Soft,
+    Hard,
+}
+
+impl ArchivePressureMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Soft => "soft",
+            Self::Hard => "hard",
+        }
+    }
+}
+
+impl Default for ArchivePressureMode {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveRecordKind {
+    Runs,
+    Jobs,
+    Findings,
+    Events,
+    PortScans,
+    WorkerEnrollmentTokens,
+    BootstrapJobs,
+    OwnershipClaims,
+    OptOutRequests,
+    AbuseReports,
+    BootstrapArtifacts,
+}
+
+impl ArchiveRecordKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::Jobs => "jobs",
+            Self::Findings => "findings",
+            Self::Events => "events",
+            Self::PortScans => "port_scans",
+            Self::WorkerEnrollmentTokens => "worker_enrollment_tokens",
+            Self::BootstrapJobs => "bootstrap_jobs",
+            Self::OwnershipClaims => "ownership_claims",
+            Self::OptOutRequests => "opt_out_requests",
+            Self::AbuseReports => "abuse_reports",
+            Self::BootstrapArtifacts => "bootstrap_artifacts",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ArchiveKindCount {
+    pub kind: String,
+    pub record_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchivePointerRecord {
+    pub id: i64,
+    pub kind: ArchiveRecordKind,
+    pub manifest_object_key: String,
+    pub data_object_key: String,
+    #[serde(default)]
+    pub object_prefix: Option<String>,
+    #[serde(default)]
+    pub source_namespace: Option<String>,
+    #[serde(default)]
+    pub local_artifact_path: Option<String>,
+    #[serde(default)]
+    pub record_count: usize,
+    #[serde(default)]
+    pub min_record_id: Option<i64>,
+    #[serde(default)]
+    pub max_record_id: Option<i64>,
+    #[serde(default)]
+    pub min_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub max_timestamp: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub size_bytes: u64,
+    pub archived_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveJobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+impl Default for ArchiveJobStatus {
+    fn default() -> Self {
+        Self::Running
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveJobRecord {
+    pub id: i64,
+    pub status: ArchiveJobStatus,
+    pub pressure_mode: ArchivePressureMode,
+    pub hot_retention_days: u64,
+    #[serde(default)]
+    pub archived_record_count: usize,
+    #[serde(default)]
+    pub archived_object_count: usize,
+    #[serde(default)]
+    pub kinds: Vec<ArchiveKindCount>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArchiveStatusSnapshot {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backend: Option<ArchiveBackendKind>,
+    #[serde(default)]
+    pub pressure_mode: ArchivePressureMode,
+    #[serde(default)]
+    pub current_hot_retention_days: u64,
+    #[serde(default)]
+    pub target_hot_retention_days: u64,
+    #[serde(default)]
+    pub soft_hot_retention_days: u64,
+    #[serde(default)]
+    pub hard_hot_retention_days: u64,
+    #[serde(default)]
+    pub used_memory_bytes: u64,
+    #[serde(default)]
+    pub namespace_estimated_bytes: u64,
+    #[serde(default)]
+    pub pointers_total: usize,
+    #[serde(default)]
+    pub recent_archive_jobs: Vec<ArchiveJobRecord>,
+    #[serde(default)]
+    pub pointer_counts: Vec<ArchiveKindCount>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PublicFindingModerationRequest {
     #[serde(default)]
@@ -554,6 +777,8 @@ pub struct PublicFindingModerationRecord {
     pub target_base_url: String,
     pub path: String,
     pub public_summary: String,
+    #[serde(default)]
+    pub plugin_metadata: Option<FindingPluginMetadata>,
     pub status: PublicFindingStatus,
     #[serde(default)]
     pub reviewed_by: Option<String>,
@@ -574,6 +799,8 @@ pub struct PublicFindingRecord {
     pub target_base_url: String,
     pub path: String,
     pub summary: String,
+    #[serde(default)]
+    pub plugin_metadata: Option<FindingPluginMetadata>,
     pub observed_at: DateTime<Utc>,
     pub published_at: DateTime<Utc>,
 }
@@ -586,6 +813,14 @@ pub struct PublicFindingSearchQuery {
     pub severity: Option<Severity>,
     #[serde(default)]
     pub detector: Option<String>,
+    #[serde(default)]
+    pub plugin_id: Option<String>,
+    #[serde(default)]
+    pub plugin_family: Option<PluginFamily>,
+    #[serde(default)]
+    pub execution_mode: Option<PluginExecutionMode>,
+    #[serde(default)]
+    pub leakix_label: Option<PluginLeakixLabel>,
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
@@ -650,15 +885,37 @@ pub struct WorkerRegistration {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
+    pub operating_system: Option<String>,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
     pub supports_runs: bool,
     #[serde(default)]
     pub supports_port_scans: bool,
     #[serde(default)]
     pub supports_bootstrap: bool,
     #[serde(default)]
+    pub supports_remote_updates: bool,
+    #[serde(default)]
+    pub supports_remote_debug_commands: bool,
+    #[serde(default)]
     pub scanner_adapters: Vec<String>,
     #[serde(default)]
     pub provisioners: Vec<String>,
+    #[serde(default)]
+    pub local_ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub public_ip_address: Option<String>,
+    #[serde(default)]
+    pub public_ip_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub remote_update_status: Option<WorkerRemoteUpdateStatus>,
+    #[serde(default)]
+    pub remote_update_status_message: Option<String>,
+    #[serde(default)]
+    pub remote_update_status_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub enrollment_token: Option<String>,
 }
@@ -673,17 +930,41 @@ pub struct WorkerRecord {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
+    pub operating_system: Option<String>,
+    #[serde(default)]
+    pub architecture: Option<String>,
+    #[serde(default)]
+    pub platform: Option<String>,
+    #[serde(default)]
     pub supports_runs: bool,
     #[serde(default)]
     pub supports_port_scans: bool,
     #[serde(default)]
     pub supports_bootstrap: bool,
     #[serde(default)]
+    pub supports_remote_updates: bool,
+    #[serde(default)]
+    pub supports_remote_debug_commands: bool,
+    #[serde(default)]
     pub scanner_adapters: Vec<String>,
     #[serde(default)]
     pub provisioners: Vec<String>,
     #[serde(default)]
+    pub local_ip_addresses: Vec<String>,
+    #[serde(default)]
+    pub public_ip_address: Option<String>,
+    #[serde(default)]
+    pub public_ip_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub remote_update_status: Option<WorkerRemoteUpdateStatus>,
+    #[serde(default)]
+    pub remote_update_status_message: Option<String>,
+    #[serde(default)]
+    pub remote_update_status_updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     pub lifecycle_state: WorkerLifecycleState,
+    #[serde(default)]
+    pub remote_update_requested_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub enrollment_token_id: Option<i64>,
     pub registered_at: DateTime<Utc>,
@@ -968,6 +1249,83 @@ pub struct WorkerLifecycleUpdateRequest {
     pub lifecycle_state: WorkerLifecycleState,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkerRemoteUpdateRequest {}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemoteUpdateStatus {
+    Running,
+    Success,
+    Failed,
+    RolledBack,
+    RollbackFailed,
+}
+
+impl WorkerRemoteUpdateStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerRemoteUpdateStatus::Running => "running",
+            WorkerRemoteUpdateStatus::Success => "success",
+            WorkerRemoteUpdateStatus::Failed => "failed",
+            WorkerRemoteUpdateStatus::RolledBack => "rolled_back",
+            WorkerRemoteUpdateStatus::RollbackFailed => "rollback_failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRemoteCommandStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl Default for WorkerRemoteCommandStatus {
+    fn default() -> Self {
+        Self::Queued
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkerRemoteCommandRequest {
+    pub command: String,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerRemoteCommandRecord {
+    pub id: i64,
+    pub worker_id: String,
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    pub command: String,
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub status: WorkerRemoteCommandStatus,
+    #[serde(default)]
+    pub claimed_by_worker_id: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub stdout: Option<String>,
+    #[serde(default)]
+    pub stderr: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkerEnrollmentTokenIssueRequest {
     pub label: String,
@@ -1000,6 +1358,88 @@ impl Default for WorkerEnrollmentTokenIssueRequest {
             expires_in_seconds: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerBootstrapCodeIssueRequest {
+    pub label: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_name: Option<String>,
+    #[serde(default)]
+    pub worker_pool: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_worker_enrollment_token_allow_runs")]
+    pub allow_runs: bool,
+    #[serde(default = "default_worker_enrollment_token_allow_port_scans")]
+    pub allow_port_scans: bool,
+    #[serde(default)]
+    pub allow_bootstrap: bool,
+    #[serde(default)]
+    pub expires_in_seconds: Option<u64>,
+}
+
+impl Default for WorkerBootstrapCodeIssueRequest {
+    fn default() -> Self {
+        Self {
+            label: String::new(),
+            worker_id: String::new(),
+            worker_name: None,
+            worker_pool: None,
+            tags: Vec::new(),
+            allow_runs: default_worker_enrollment_token_allow_runs(),
+            allow_port_scans: default_worker_enrollment_token_allow_port_scans(),
+            allow_bootstrap: false,
+            expires_in_seconds: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerBootstrapCodeRecord {
+    pub id: i64,
+    pub label: String,
+    pub worker_id: String,
+    #[serde(default)]
+    pub worker_name: Option<String>,
+    #[serde(default)]
+    pub worker_pool: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub allow_runs: bool,
+    #[serde(default)]
+    pub allow_port_scans: bool,
+    #[serde(default)]
+    pub allow_bootstrap: bool,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub consumed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub consumed_by_worker_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerBootstrapCodeIssued {
+    pub record: WorkerBootstrapCodeRecord,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkerBootstrapCodeExchangeRequest {
+    pub code: String,
+    pub worker_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerBootstrapCodeExchange {
+    pub bootstrap_code: WorkerBootstrapCodeRecord,
+    pub token: WorkerEnrollmentTokenIssued,
 }
 
 pub type WorkerBootstrapCandidateRejectRequest = WorkerBootstrapCandidateRejectionRequest;
@@ -1289,6 +1729,33 @@ impl WorkerBootstrapPolicy {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortScanFollowOnRunPolicy {
+    #[serde(default = "default_port_scan_follow_on_run_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub worker_pool: Option<String>,
+}
+
+impl Default for PortScanFollowOnRunPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: default_port_scan_follow_on_run_enabled(),
+            worker_pool: None,
+        }
+    }
+}
+
+impl PortScanFollowOnRunPolicy {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+fn default_port_scan_follow_on_run_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PortScanRequest {
     pub target_range: String,
@@ -1303,6 +1770,21 @@ pub struct PortScanRequest {
     pub worker_pool: Option<String>,
     #[serde(default)]
     pub bootstrap_policy: WorkerBootstrapPolicy,
+    #[serde(default)]
+    pub follow_on_run_policy: PortScanFollowOnRunPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortScanProtocolFindingRecord {
+    pub host: String,
+    pub port: u16,
+    #[serde(default)]
+    pub service_name: Option<String>,
+    #[serde(default)]
+    pub transport: Option<String>,
+    pub severity: Severity,
+    pub summary: String,
+    pub plugin_metadata: FindingPluginMetadata,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,6 +1803,10 @@ pub struct PortScanRecord {
     pub worker_pool: Option<String>,
     #[serde(default)]
     pub bootstrap_policy: WorkerBootstrapPolicy,
+    #[serde(default)]
+    pub follow_on_run_policy: PortScanFollowOnRunPolicy,
+    #[serde(default)]
+    pub active_authorized_plugins: ActiveAuthorizedPluginExecution,
     pub status: RunStatus,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -1332,6 +1818,8 @@ pub struct PortScanRecord {
     pub bootstrap_candidates_total: u64,
     #[serde(default)]
     pub queued_run_id: Option<i64>,
+    #[serde(default)]
+    pub protocol_findings: Vec<PortScanProtocolFindingRecord>,
     pub notes: Option<String>,
 }
 
@@ -1341,6 +1829,8 @@ pub struct ScanRunRecord {
     pub requested_by: Option<String>,
     #[serde(default)]
     pub scope: Option<RunScope>,
+    #[serde(default)]
+    pub active_authorized_plugins: ActiveAuthorizedPluginExecution,
     pub status: RunStatus,
     pub started_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
@@ -1412,6 +1902,14 @@ pub struct FindingRecord {
     pub redacted_value: String,
     pub evidence: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub confidence: Option<FindingConfidence>,
+    #[serde(default)]
+    pub matched_signals: Vec<String>,
+    #[serde(default)]
+    pub review_labels: Vec<String>,
+    #[serde(default)]
+    pub plugin_metadata: Option<FindingPluginMetadata>,
     pub discovered_at: DateTime<Utc>,
 }
 
@@ -1438,6 +1936,14 @@ pub struct FindingCandidate {
     pub redacted_value: String,
     pub evidence: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub confidence: Option<FindingConfidence>,
+    #[serde(default)]
+    pub matched_signals: Vec<String>,
+    #[serde(default)]
+    pub review_labels: Vec<String>,
+    #[serde(default)]
+    pub plugin_metadata: Option<FindingPluginMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1450,6 +1956,14 @@ pub struct NewFinding {
     pub redacted_value: String,
     pub evidence: String,
     pub fingerprint: String,
+    #[serde(default)]
+    pub confidence: Option<FindingConfidence>,
+    #[serde(default)]
+    pub matched_signals: Vec<String>,
+    #[serde(default)]
+    pub review_labels: Vec<String>,
+    #[serde(default)]
+    pub plugin_metadata: Option<FindingPluginMetadata>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1459,17 +1973,31 @@ pub struct FindingsQuery {
     #[serde(default)]
     pub cursor: Option<i64>,
     #[serde(default)]
+    pub include_archive: bool,
+    #[serde(default)]
     pub run_id: Option<i64>,
     #[serde(default)]
     pub target_id: Option<i64>,
     #[serde(default)]
     pub severity: Option<Severity>,
     #[serde(default)]
+    pub confidence: Option<FindingConfidence>,
+    #[serde(default)]
     pub detector: Option<String>,
+    #[serde(default)]
+    pub plugin_id: Option<String>,
+    #[serde(default)]
+    pub plugin_family: Option<PluginFamily>,
+    #[serde(default)]
+    pub execution_mode: Option<PluginExecutionMode>,
+    #[serde(default)]
+    pub leakix_label: Option<PluginLeakixLabel>,
     #[serde(default)]
     pub path_prefix: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub review_labels: Vec<String>,
     #[serde(default)]
     pub q: Option<String>,
 }
@@ -1571,6 +2099,8 @@ pub struct RecurringScheduleRecord {
     pub requested_by: Option<String>,
     #[serde(default)]
     pub scope: Option<RunScope>,
+    #[serde(default)]
+    pub active_authorized_plugins: ActiveAuthorizedPluginExecution,
     pub next_run_at: DateTime<Utc>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_queued_run_id: Option<i64>,
@@ -1616,6 +2146,22 @@ pub enum ApiEvent {
     },
     WorkerStateChanged {
         worker: WorkerRecord,
+    },
+    WorkerRemoteUpdateRequested {
+        worker: WorkerRecord,
+    },
+    WorkerRemoteCommandQueued {
+        command: WorkerRemoteCommandRecord,
+    },
+    WorkerRemoteCommandStarted {
+        command: WorkerRemoteCommandRecord,
+    },
+    WorkerRemoteCommandCompleted {
+        command: WorkerRemoteCommandRecord,
+    },
+    WorkerRemoteCommandFailed {
+        command: WorkerRemoteCommandRecord,
+        error: String,
     },
     WorkerEnrollmentTokenIssued {
         token: WorkerEnrollmentTokenRecord,
@@ -1685,6 +2231,10 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub scan_defaults: ScanDefaultsSummary,
     #[serde(default)]
+    pub active_authorized_execution_policy: ActiveAuthorizedExecutionPolicySnapshot,
+    #[serde(default)]
+    pub archive_status: Option<ArchiveStatusSnapshot>,
+    #[serde(default)]
     pub repositories: Vec<RepositoryRecord>,
     #[serde(default)]
     pub operators: Vec<OperatorRecord>,
@@ -1692,6 +2242,8 @@ pub struct DashboardSnapshot {
     pub workers: Vec<WorkerRecord>,
     #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRecord>,
+    #[serde(default)]
+    pub recent_worker_remote_commands: Vec<WorkerRemoteCommandRecord>,
     #[serde(default)]
     pub worker_enrollment_tokens: Vec<WorkerEnrollmentTokenRecord>,
     #[serde(default)]
@@ -1738,6 +2290,8 @@ pub struct ScanDefaultsSummary {
     pub poll_interval_seconds: u64,
     #[serde(default)]
     pub allow_invalid_tls: bool,
+    #[serde(default)]
+    pub allow_active_authorized_execution: bool,
     #[serde(default)]
     pub directory_probing_enabled: bool,
     #[serde(default)]
@@ -1955,8 +2509,14 @@ pub fn normalize_findings_query(mut query: FindingsQuery) -> FindingsQuery {
     query.cursor = query.cursor.filter(|cursor| *cursor > 0);
     query.run_id = query.run_id.filter(|run_id| *run_id > 0);
     query.target_id = query.target_id.filter(|target_id| *target_id > 0);
+    query.confidence = query.confidence.take();
     query.detector = query
         .detector
+        .take()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    query.plugin_id = query
+        .plugin_id
         .take()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
@@ -1986,6 +2546,15 @@ pub fn normalize_findings_query(mut query: FindingsQuery) -> FindingsQuery {
         }
     }
     query.tags = tags;
+
+    let mut review_labels = Vec::new();
+    for label in query.review_labels.drain(..) {
+        let trimmed = label.trim().to_ascii_lowercase();
+        if !trimmed.is_empty() && !review_labels.contains(&trimmed) {
+            review_labels.push(trimmed);
+        }
+    }
+    query.review_labels = review_labels;
     query
 }
 
@@ -1995,6 +2564,11 @@ pub fn normalize_public_finding_search_query(
     query.limit = Some(normalized_public_finding_search_limit(query.limit));
     query.detector = query
         .detector
+        .take()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    query.plugin_id = query
+        .plugin_id
         .take()
         .map(|value| value.trim().to_ascii_lowercase())
         .filter(|value| !value.is_empty());
@@ -2044,10 +2618,48 @@ pub fn finding_query_score<R: FindingsRanker>(
         return None;
     }
     if query
+        .confidence
+        .is_some_and(|confidence| finding.confidence != Some(confidence))
+    {
+        return None;
+    }
+    if query
         .detector
         .as_deref()
         .is_some_and(|detector| !finding.detector.eq_ignore_ascii_case(detector))
     {
+        return None;
+    }
+    if query.plugin_id.as_deref().is_some_and(|plugin_id| {
+        finding
+            .plugin_metadata
+            .as_ref()
+            .is_none_or(|metadata| !metadata.plugin_id.eq_ignore_ascii_case(plugin_id))
+    }) {
+        return None;
+    }
+    if query.plugin_family.is_some_and(|family| {
+        finding
+            .plugin_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.plugin_family != family)
+    }) {
+        return None;
+    }
+    if query.execution_mode.is_some_and(|mode| {
+        finding
+            .plugin_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.execution_mode != mode)
+    }) {
+        return None;
+    }
+    if query.leakix_label.is_some_and(|label| {
+        finding
+            .plugin_metadata
+            .as_ref()
+            .is_none_or(|metadata| metadata.leakix_label != label)
+    }) {
         return None;
     }
     if query
@@ -2061,6 +2673,17 @@ pub fn finding_query_score<R: FindingsRanker>(
         && !target_tags
             .iter()
             .any(|tag| query.tags.iter().any(|query_tag| query_tag == tag))
+    {
+        return None;
+    }
+    if !query.review_labels.is_empty()
+        && !finding.review_labels.iter().any(|label| {
+            let lowered = label.to_ascii_lowercase();
+            query
+                .review_labels
+                .iter()
+                .any(|query_label| query_label == &lowered)
+        })
     {
         return None;
     }
@@ -2114,10 +2737,93 @@ impl FindingsRanker for HybridFindingsRanker {
         let redacted_value = finding.redacted_value.to_ascii_lowercase();
         let evidence = finding.evidence.to_ascii_lowercase();
         let severity = finding.severity.as_str().to_string();
+        let confidence = finding
+            .confidence
+            .map(|value| value.as_str().to_string())
+            .unwrap_or_default();
+        let plugin_id = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| metadata.plugin_id.to_ascii_lowercase())
+            .unwrap_or_default();
+        let plugin_display_name = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| metadata.plugin_display_name.to_ascii_lowercase())
+            .unwrap_or_default();
+        let plugin_family = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| metadata.plugin_family.as_str().to_string())
+            .unwrap_or_default();
+        let execution_mode = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| metadata.execution_mode.as_str().to_string())
+            .unwrap_or_default();
+        let leakix_label = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| metadata.leakix_label.as_str().to_string())
+            .unwrap_or_default();
+        let product_name = finding
+            .plugin_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.product_name.as_ref())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let product_version = finding
+            .plugin_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.product_version.as_ref())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let cpe = finding
+            .plugin_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.cpe.as_ref())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let cve_ids = finding
+            .plugin_metadata
+            .as_ref()
+            .map(|metadata| {
+                metadata
+                    .cve_ids
+                    .iter()
+                    .map(|value| value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let service_protocol = finding
+            .plugin_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.service_protocol.as_ref())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        let service_port = finding
+            .plugin_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.service_port)
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         let tags = target_tags
             .iter()
             .map(|tag| tag.to_ascii_lowercase())
             .collect::<Vec<_>>();
+        let matched_signals = finding
+            .matched_signals
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let review_labels = finding
+            .review_labels
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
         let searchable_blob = [
             detector.as_str(),
             target_label.as_str(),
@@ -2126,6 +2832,20 @@ impl FindingsRanker for HybridFindingsRanker {
             redacted_value.as_str(),
             evidence.as_str(),
             severity.as_str(),
+            plugin_id.as_str(),
+            plugin_display_name.as_str(),
+            plugin_family.as_str(),
+            execution_mode.as_str(),
+            leakix_label.as_str(),
+            product_name.as_str(),
+            product_version.as_str(),
+            cpe.as_str(),
+            cve_ids.as_str(),
+            service_protocol.as_str(),
+            service_port.as_str(),
+            confidence.as_str(),
+            matched_signals.as_str(),
+            review_labels.as_str(),
             &tags.join(" "),
         ]
         .join("\n");
@@ -2146,6 +2866,20 @@ impl FindingsRanker for HybridFindingsRanker {
             score += score_search_term(term.as_str(), &redacted_value, 70, 30);
             score += score_search_term(term.as_str(), &evidence, 60, 25);
             score += score_search_term(term.as_str(), &severity, 40, 20);
+            score += score_search_term(term.as_str(), &confidence, 40, 20);
+            score += score_search_term(term.as_str(), &plugin_id, 130, 65);
+            score += score_search_term(term.as_str(), &plugin_display_name, 120, 55);
+            score += score_search_term(term.as_str(), &plugin_family, 90, 35);
+            score += score_search_term(term.as_str(), &execution_mode, 80, 30);
+            score += score_search_term(term.as_str(), &leakix_label, 70, 25);
+            score += score_search_term(term.as_str(), &product_name, 90, 35);
+            score += score_search_term(term.as_str(), &product_version, 70, 25);
+            score += score_search_term(term.as_str(), &cpe, 70, 25);
+            score += score_search_term(term.as_str(), &cve_ids, 80, 30);
+            score += score_search_term(term.as_str(), &service_protocol, 60, 20);
+            score += score_search_term(term.as_str(), &service_port, 60, 20);
+            score += score_search_term(term.as_str(), &matched_signals, 60, 20);
+            score += score_search_term(term.as_str(), &review_labels, 70, 25);
             score += tags
                 .iter()
                 .map(|tag| score_search_term(term.as_str(), tag, 50, 20))
@@ -2163,11 +2897,7 @@ fn normalized_search_terms(query: Option<&str>) -> Option<Vec<String>> {
         .filter(|term| !term.is_empty())
         .collect::<Vec<_>>();
 
-    if terms.is_empty() {
-        None
-    } else {
-        Some(terms)
-    }
+    if terms.is_empty() { None } else { Some(terms) }
 }
 
 fn score_search_term(term: &str, haystack: &str, exact_weight: u64, contains_weight: u64) -> u64 {
@@ -2211,15 +2941,40 @@ pub fn normalize_run_scope(scope: Option<RunScope>) -> Option<RunScope> {
         }
     }
 
-    if target_ids.is_empty() && tags.is_empty() && !scope.failed_only {
+    let worker_pool = scope
+        .worker_pool
+        .take()
+        .and_then(|value| normalize_run_scope_worker_pool_name(&value));
+
+    if target_ids.is_empty() && tags.is_empty() && worker_pool.is_none() && !scope.failed_only {
         return None;
     }
 
     Some(RunScope {
         target_ids,
         tags,
+        worker_pool,
         failed_only: scope.failed_only,
     })
+}
+
+fn normalize_run_scope_worker_pool_name(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| match character {
+            'a'..='z' | '0'..='9' | '-' | '_' | '.' => character,
+            _ => '-',
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 pub fn redact_secret(secret: &str) -> String {
@@ -2244,10 +2999,11 @@ pub fn utc_now() -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ActiveAuthorizedPluginExecution, ExtensionKind, ExtensionManifest, FindingConfidence,
+        FindingRecord, FindingsQuery, HybridFindingsRanker, RunScope, Severity, TargetStrategy,
         bin_lookup_line_preview, finding_query_score, normalize_findings_query,
         normalize_request_profile_name, normalize_run_scope, parse_bin_lookup_candidates,
-        redact_secret, sanitize_paths, ExtensionKind, ExtensionManifest, FindingRecord,
-        FindingsQuery, HybridFindingsRanker, RunScope, Severity, TargetStrategy,
+        redact_secret, sanitize_paths,
     };
     use chrono::Utc;
 
@@ -2275,13 +3031,49 @@ mod tests {
         let normalized = normalize_run_scope(Some(RunScope {
             target_ids: vec![4, 0, 4, 7],
             tags: vec![" Prod ".to_string(), "prod".to_string(), "api".to_string()],
+            worker_pool: Some(" Edge-Scanners ".to_string()),
             failed_only: true,
         }))
         .expect("scope should be retained");
 
         assert_eq!(normalized.target_ids, vec![4, 7]);
         assert_eq!(normalized.tags, vec!["prod", "api"]);
+        assert_eq!(normalized.worker_pool.as_deref(), Some("edge-scanners"));
         assert!(normalized.failed_only);
+    }
+
+    #[test]
+    fn active_authorized_plugin_execution_defaults_to_disabled() {
+        let execution = ActiveAuthorizedPluginExecution::default();
+
+        assert!(!execution.global_gate_enabled);
+        assert!(!execution.request_opt_in_enabled);
+        assert!(!execution.is_enabled());
+    }
+
+    #[test]
+    fn active_authorized_plugin_execution_requires_both_gates() {
+        assert!(
+            !ActiveAuthorizedPluginExecution {
+                global_gate_enabled: true,
+                request_opt_in_enabled: false,
+            }
+            .is_enabled()
+        );
+        assert!(
+            !ActiveAuthorizedPluginExecution {
+                global_gate_enabled: false,
+                request_opt_in_enabled: true,
+            }
+            .is_enabled()
+        );
+        assert!(
+            ActiveAuthorizedPluginExecution {
+                global_gate_enabled: true,
+                request_opt_in_enabled: true,
+            }
+            .is_enabled()
+        );
     }
 
     #[test]
@@ -2370,15 +3162,26 @@ mod tests {
         let query = normalize_findings_query(FindingsQuery {
             limit: Some(0),
             cursor: Some(-1),
+            include_archive: false,
             run_id: Some(12),
             target_id: Some(0),
             severity: Some(Severity::High),
+            confidence: Some(FindingConfidence::Medium),
             detector: Some("  Aws_Access_Key  ".to_string()),
+            plugin_id: None,
+            plugin_family: None,
+            execution_mode: None,
+            leakix_label: None,
             path_prefix: Some(" config".to_string()),
             tags: vec![
                 " Prod ".to_string(),
                 "prod".to_string(),
                 " api ".to_string(),
+            ],
+            review_labels: vec![
+                " Best_Effort ".to_string(),
+                "best_effort".to_string(),
+                " admin_panel ".to_string(),
             ],
             q: Some("  runtime config  ".to_string()),
         });
@@ -2387,9 +3190,14 @@ mod tests {
         assert_eq!(query.cursor, None);
         assert_eq!(query.run_id, Some(12));
         assert_eq!(query.target_id, None);
+        assert_eq!(query.confidence, Some(FindingConfidence::Medium));
         assert_eq!(query.detector, Some("aws_access_key".to_string()));
         assert_eq!(query.path_prefix, Some("/config".to_string()));
         assert_eq!(query.tags, vec!["prod".to_string(), "api".to_string()]);
+        assert_eq!(
+            query.review_labels,
+            vec!["best_effort".to_string(), "admin_panel".to_string()]
+        );
         assert_eq!(query.q, Some("runtime config".to_string()));
     }
 
@@ -2409,6 +3217,10 @@ mod tests {
             redacted_value: "AKIA****TEST".to_string(),
             evidence: "Runtime config references AWS credentials".to_string(),
             fingerprint: "fp-1".to_string(),
+            confidence: Some(FindingConfidence::Medium),
+            matched_signals: vec!["body_regex".to_string()],
+            review_labels: vec!["best_effort".to_string(), "admin_panel".to_string()],
+            plugin_metadata: None,
             discovered_at: Utc::now(),
         };
         let query = normalize_findings_query(FindingsQuery {
@@ -2426,6 +3238,27 @@ mod tests {
         .expect("query should match searchable redacted fields");
 
         assert!(score > 0);
+        let confidence_match = finding_query_score(
+            &HybridFindingsRanker,
+            &finding,
+            &["prod".to_string(), "api".to_string()],
+            &normalize_findings_query(FindingsQuery {
+                confidence: Some(FindingConfidence::Medium),
+                review_labels: vec!["admin_panel".to_string()],
+                ..FindingsQuery::default()
+            }),
+        );
+        assert!(confidence_match.is_some());
+        let confidence_miss = finding_query_score(
+            &HybridFindingsRanker,
+            &finding,
+            &["prod".to_string(), "api".to_string()],
+            &normalize_findings_query(FindingsQuery {
+                confidence: Some(FindingConfidence::High),
+                ..FindingsQuery::default()
+            }),
+        );
+        assert!(confidence_miss.is_none());
         let misses = finding_query_score(
             &HybridFindingsRanker,
             &finding,

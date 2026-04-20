@@ -5,8 +5,8 @@ use std::{
 };
 
 use crate::core::{
-    ExtensionKind, ExtensionManifest, GobusterTargetConfig, OperatorRecord, OperatorRole,
-    PortScanRequest, RepositoryDefinition, ScanDefaultsSummary, TargetDefinition,
+    ArchiveBackendKind, ExtensionKind, ExtensionManifest, GobusterTargetConfig, OperatorRecord,
+    OperatorRole, PortScanRequest, RepositoryDefinition, ScanDefaultsSummary, TargetDefinition,
     normalize_request_profile_name, sanitize_paths,
 };
 use anyhow::{Context, Result, anyhow};
@@ -17,6 +17,7 @@ use url::Url;
 #[serde(default)]
 pub struct AppConfig {
     pub storage: StorageConfig,
+    pub archive: ArchiveConfig,
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub inventory: InventoryConfig,
@@ -29,6 +30,7 @@ pub struct AppConfig {
 pub struct ServerConfig {
     pub bind_addr: String,
     pub private_control_plane_only: bool,
+    pub worker_only_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +141,8 @@ pub struct ScanConfig {
     pub user_agent: String,
     pub poll_interval_seconds: u64,
     pub allow_invalid_tls: bool,
+    pub allow_active_authorized_execution: bool,
+    pub enable_all_plugins_for_testing: bool,
     pub allow_authenticated_request_profiles: bool,
     pub proxy_mode: ProxyMode,
     pub proxy_url: Option<String>,
@@ -184,6 +188,28 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ArchiveConfig {
+    pub enabled: bool,
+    pub backend: ArchiveBackendKind,
+    pub endpoint: String,
+    pub region: String,
+    pub bucket: String,
+    pub key_id: Option<String>,
+    pub application_key: Option<String>,
+    pub object_prefix: String,
+    pub encryption_master_key: Option<String>,
+    pub cadence_seconds: u64,
+    pub target_hot_retention_days: u64,
+    pub soft_hot_retention_days: u64,
+    pub hard_hot_retention_days: u64,
+    pub min_hot_retention_days: u64,
+    pub max_records_per_batch: usize,
+    pub soft_max_used_memory_bytes: u64,
+    pub hard_max_used_memory_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GobusterConfig {
     pub enabled: bool,
     pub wordlist: Vec<String>,
@@ -201,6 +227,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             storage: StorageConfig::default(),
+            archive: ArchiveConfig::default(),
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
             inventory: InventoryConfig::default(),
@@ -215,6 +242,7 @@ impl Default for ServerConfig {
         Self {
             bind_addr: "127.0.0.1:8088".to_string(),
             private_control_plane_only: false,
+            worker_only_hosts: Vec::new(),
         }
     }
 }
@@ -253,6 +281,7 @@ impl Default for InventoryConfig {
             path_profiles: vec![
                 "baseline".to_string(),
                 "public-entrypoints".to_string(),
+                "public-exposure-plugins".to_string(),
                 "build-manifests".to_string(),
                 "well-known-metadata".to_string(),
                 "sitemaps-and-indexes".to_string(),
@@ -286,6 +315,30 @@ impl Default for StorageConfig {
     }
 }
 
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: ArchiveBackendKind::B2S3,
+            endpoint: "https://s3.us-east-005.backblazeb2.com".to_string(),
+            region: "us-east-005".to_string(),
+            bucket: "anygpt".to_string(),
+            key_id: None,
+            application_key: None,
+            object_prefix: default_archive_object_prefix().to_string(),
+            encryption_master_key: None,
+            cadence_seconds: 900,
+            target_hot_retention_days: 30,
+            soft_hot_retention_days: 14,
+            hard_hot_retention_days: 7,
+            min_hot_retention_days: 3,
+            max_records_per_batch: 5_000,
+            soft_max_used_memory_bytes: 512 * 1024 * 1024,
+            hard_max_used_memory_bytes: 768 * 1024 * 1024,
+        }
+    }
+}
+
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
@@ -299,9 +352,11 @@ impl Default for ScanConfig {
             max_discovered_paths_per_target: 12,
             host_backoff_initial_ms: 250,
             host_backoff_max_ms: 4_000,
-            user_agent: "AnyScan/0.1".to_string(),
+            user_agent: default_scan_user_agent().to_string(),
             poll_interval_seconds: 15,
             allow_invalid_tls: false,
+            allow_active_authorized_execution: false,
+            enable_all_plugins_for_testing: false,
             allow_authenticated_request_profiles: false,
             proxy_mode: ProxyMode::DirectOnly,
             proxy_url: None,
@@ -315,7 +370,7 @@ impl Default for ScanConfig {
 impl Default for PublicSiteConfig {
     fn default() -> Self {
         Self {
-            service_name: "AnyScan".to_string(),
+            service_name: default_public_service_name().to_string(),
             base_url: None,
             security_email: "security@anyvm.tech".to_string(),
             abuse_email: "abuse@anyvm.tech".to_string(),
@@ -388,6 +443,7 @@ const DEFAULT_GOBUSTER_WORDLIST: &[&str] = &[
 const KNOWN_PATH_PROFILES: &[&str] = &[
     "baseline",
     "public-entrypoints",
+    "public-exposure-plugins",
     "build-manifests",
     "well-known-metadata",
     "sitemaps-and-indexes",
@@ -420,6 +476,59 @@ const PUBLIC_ENTRYPOINT_PATHS: &[&str] = &[
     "/robots.txt",
     "/manifest.json",
     "/site.webmanifest",
+];
+
+const PUBLIC_EXPOSURE_PLUGIN_PATHS: &[&str] = &[
+    "/.DS_Store",
+    "/.git/config",
+    "/metrics",
+    "/version",
+    "/server-status",
+    "/check_mk/",
+    "/checkmk/",
+    "/_profiler",
+    "/trace.axd",
+    "/phpinfo.php",
+    "/telescope",
+    "/api/tags",
+    "/api/health",
+    "/api/version",
+    "/api/system/status",
+    "/api/v1/info",
+    "/api/v1/meta",
+    "/api/v1/heartbeat",
+    "/api/v2/heartbeat",
+    "/actuator/health",
+    "/collections",
+    "/json/version",
+    "/json/list",
+    "/status",
+    "/render.html",
+    "/ApplicationStatus",
+    "/v1/meta",
+    "/v1/models",
+    "/varz",
+    "/connz",
+    "/routez",
+    "/dfshealth.html",
+    "/cluster",
+    "/grid/console",
+    "/h2-console",
+    "/solr/admin/info/system",
+    "/solr/",
+    "/.vscode/sftp.json",
+    "/goanywhere/",
+    "/goanywhere/login.xhtml",
+    "/RECORDINGS/",
+    "/v2/",
+    "/v2/_catalog",
+    "/v1/status/leader",
+    "/readyz",
+    "/ui/",
+    "/browser/",
+    "/tree",
+    "/lab",
+    "/_utils/",
 ];
 
 const BUILD_MANIFEST_PATHS: &[&str] = &[
@@ -501,6 +610,12 @@ const FRAMEWORK_LEAK_PATHS: &[&str] = &[
     "/.env.test",
     "/env.js",
     "/server.js",
+    "/@fs//proc/self/environ?raw",
+    "/@fs//proc/1/environ?raw",
+    "/@fs/..%2f..%2f..%2f..%2fproc/self/environ?raw",
+    "/@fs/..%2f..%2f..%2f..%2f..%2f..%2fproc/self/environ?raw",
+    "/@fs/..%2f..%2f..%2f..%2f.env?raw",
+    "/@fs/..%2f..%2f..%2f..%2f..%2f..%2f.env?raw",
 ];
 
 const EXTENDED_CONFIG_VARIANT_PATHS: &[&str] = &[
@@ -552,6 +667,43 @@ const DEFAULT_BOOTSTRAP_REPOSITORY_STATUS: &str = "tracked";
 const DEFAULT_BOOTSTRAP_REPOSITORY_DESCRIPTION: &str =
     "Standalone C scanner repository tracked for later runtime execution work.";
 const DEFAULT_PORT_SCAN_RATE_LIMIT: u64 = 1_000;
+const DEFAULT_BUNDLED_EXTENSION_MANIFEST_RELATIVE_DIR: &str = "extensions/bundled/manifests";
+#[cfg(feature = "worker-bundle-stealth")]
+const DEFAULT_BUNDLED_EXTENSION_MANIFEST_INSTALLED_DIR: &str =
+    "/opt/agentd/extensions/bundled/manifests";
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const DEFAULT_BUNDLED_EXTENSION_MANIFEST_INSTALLED_DIR: &str =
+    "/opt/anyscan/extensions/bundled/manifests";
+
+#[cfg(feature = "worker-bundle-stealth")]
+const fn default_archive_object_prefix() -> &'static str {
+    "archive/"
+}
+
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const fn default_archive_object_prefix() -> &'static str {
+    "anyscan/"
+}
+
+#[cfg(feature = "worker-bundle-stealth")]
+const fn default_scan_user_agent() -> &'static str {
+    "agentd/1.0"
+}
+
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const fn default_scan_user_agent() -> &'static str {
+    "AnyScan/0.1"
+}
+
+#[cfg(feature = "worker-bundle-stealth")]
+const fn default_public_service_name() -> &'static str {
+    "Public Service"
+}
+
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const fn default_public_service_name() -> &'static str {
+    "AnyScan"
+}
 
 fn default_bootstrap_repository_local_path() -> String {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -561,6 +713,33 @@ fn default_bootstrap_repository_local_path() -> String {
         .join("VulnScanner-zmap-alternative-")
         .to_string_lossy()
         .into_owned()
+}
+
+fn bundled_extension_manifest_dirs() -> Vec<String> {
+    let repo_dir =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(DEFAULT_BUNDLED_EXTENSION_MANIFEST_RELATIVE_DIR);
+    let installed_dir = PathBuf::from(DEFAULT_BUNDLED_EXTENSION_MANIFEST_INSTALLED_DIR);
+
+    let mut dirs = Vec::new();
+    for dir in [repo_dir, installed_dir] {
+        if dir.is_dir() {
+            let rendered = dir.to_string_lossy().into_owned();
+            if !dirs.contains(&rendered) {
+                dirs.push(rendered);
+            }
+        }
+    }
+    dirs
+}
+
+fn merged_extension_manifest_dirs(configured: &[String]) -> Vec<String> {
+    let mut merged = configured.to_vec();
+    for dir in bundled_extension_manifest_dirs() {
+        if !merged.contains(&dir) {
+            merged.push(dir);
+        }
+    }
+    merged
 }
 
 fn default_bootstrap_repositories() -> Vec<RepositoryDefinition> {
@@ -995,6 +1174,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
     match profile {
         "baseline" => Some(BASELINE_PATHS),
         "public-entrypoints" => Some(PUBLIC_ENTRYPOINT_PATHS),
+        "public-exposure-plugins" => Some(PUBLIC_EXPOSURE_PLUGIN_PATHS),
         "build-manifests" => Some(BUILD_MANIFEST_PATHS),
         "well-known-metadata" => Some(WELL_KNOWN_METADATA_PATHS),
         "sitemaps-and-indexes" => Some(SITEMAP_AND_INDEX_PATHS),
@@ -1761,9 +1941,7 @@ impl AppConfig {
             || self.storage.redis_url.as_deref() == Some(DEFAULT_ANYSCAN_REDIS_URL);
 
         if redis_url_needs_inheritance {
-            self.storage.redis_url = Some(inherited_redis_url_for_anyscan(
-                &credentials.redis_url,
-            )?);
+            self.storage.redis_url = Some(inherited_redis_url_for_anyscan(&credentials.redis_url)?);
         }
         if self.storage.redis_username.is_none() {
             self.storage.redis_username = credentials.redis_username.clone();
@@ -1798,6 +1976,15 @@ impl AppConfig {
                 "server.private_control_plane_only requires a loopback bind address"
             ));
         }
+
+        self.server.worker_only_hosts = self
+            .server
+            .worker_only_hosts
+            .iter()
+            .filter_map(|host| normalize_inventory_host(host))
+            .collect();
+        self.server.worker_only_hosts.sort();
+        self.server.worker_only_hosts.dedup();
 
         self.auth.operators = normalize_operator_configs(&self.auth)?;
         if self.auth.session_ttl_seconds == 0 {
@@ -1960,6 +2147,102 @@ impl AppConfig {
             ));
         }
 
+        self.archive.object_prefix = self.archive.object_prefix.trim().to_string();
+        if self.archive.object_prefix.is_empty() {
+            self.archive.object_prefix = "anyscan/".to_string();
+        }
+        if self.archive.enabled {
+            if self.archive.endpoint.trim().is_empty() {
+                return Err(anyhow!(
+                    "archive.endpoint is required when archive is enabled"
+                ));
+            }
+            if self.archive.region.trim().is_empty() {
+                return Err(anyhow!(
+                    "archive.region is required when archive is enabled"
+                ));
+            }
+            if self.archive.bucket.trim().is_empty() {
+                return Err(anyhow!(
+                    "archive.bucket is required when archive is enabled"
+                ));
+            }
+            if self
+                .archive
+                .key_id
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+            {
+                return Err(anyhow!(
+                    "archive.key_id is required when archive is enabled"
+                ));
+            }
+            if self
+                .archive
+                .application_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+            {
+                return Err(anyhow!(
+                    "archive.application_key is required when archive is enabled"
+                ));
+            }
+            if self
+                .archive
+                .encryption_master_key
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+            {
+                return Err(anyhow!(
+                    "archive.encryption_master_key is required when archive is enabled"
+                ));
+            }
+            if self.archive.cadence_seconds == 0 {
+                return Err(anyhow!("archive.cadence_seconds must be greater than zero"));
+            }
+            if self.archive.target_hot_retention_days == 0
+                || self.archive.soft_hot_retention_days == 0
+                || self.archive.hard_hot_retention_days == 0
+                || self.archive.min_hot_retention_days == 0
+            {
+                return Err(anyhow!(
+                    "archive hot retention day settings must be greater than zero"
+                ));
+            }
+            if !(self.archive.hard_hot_retention_days <= self.archive.soft_hot_retention_days
+                && self.archive.soft_hot_retention_days <= self.archive.target_hot_retention_days)
+            {
+                return Err(anyhow!(
+                    "archive retention days must satisfy hard <= soft <= target"
+                ));
+            }
+            if self.archive.min_hot_retention_days > self.archive.hard_hot_retention_days {
+                return Err(anyhow!(
+                    "archive.min_hot_retention_days must be less than or equal to archive.hard_hot_retention_days"
+                ));
+            }
+            if self.archive.max_records_per_batch == 0 {
+                return Err(anyhow!(
+                    "archive.max_records_per_batch must be greater than zero"
+                ));
+            }
+            if self.archive.soft_max_used_memory_bytes == 0
+                || self.archive.hard_max_used_memory_bytes == 0
+            {
+                return Err(anyhow!(
+                    "archive memory pressure thresholds must be greater than zero"
+                ));
+            }
+            if self.archive.soft_max_used_memory_bytes > self.archive.hard_max_used_memory_bytes {
+                return Err(anyhow!(
+                    "archive.soft_max_used_memory_bytes must be less than or equal to archive.hard_max_used_memory_bytes"
+                ));
+            }
+        }
+
         self.scan.proxy_url = trim_optional_string(self.scan.proxy_url.take());
         self.scan.extension_manifest_paths =
             normalize_config_path_list(&self.scan.extension_manifest_paths);
@@ -1980,9 +2263,11 @@ impl AppConfig {
                 return Err(anyhow!("scan.proxy_url must use http or https"));
             }
         }
+        let merged_extension_dirs =
+            merged_extension_manifest_dirs(&self.scan.extension_manifest_dirs);
         let _ = load_extension_manifests_from_paths(
             &self.scan.extension_manifest_paths,
-            &self.scan.extension_manifest_dirs,
+            &merged_extension_dirs,
         )?;
 
         self.scan.gobuster.wordlist =
@@ -2091,8 +2376,18 @@ impl AppConfig {
                 "storage.redis_run_lease_seconds must be greater than zero"
             ));
         }
+        let worker_api_only_mode = env::var("ANYSCAN_API_BASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .is_some();
         if self.storage.redis_url.is_none() {
-            return Err(anyhow!("Dragonfly requires REDIS_URL or storage.redis_url"));
+            if !worker_api_only_mode {
+                return Err(anyhow!(
+                    "Dragonfly requires REDIS_URL or storage.redis_url; API-backed workers may instead set ANYSCAN_API_BASE_URL"
+                ));
+            }
+            return Ok(());
         }
         let resolved_redis_db = resolved_dragonfly_db(&self.storage)?;
         if resolved_redis_db == RESERVED_ANYGPT_EXPERIMENTAL_REDIS_DB {
@@ -2118,6 +2413,8 @@ impl AppConfig {
             host_backoff_max_ms: self.scan.host_backoff_max_ms,
             poll_interval_seconds: self.scan.poll_interval_seconds,
             allow_invalid_tls: self.scan.allow_invalid_tls,
+            allow_active_authorized_execution: self.scan.allow_active_authorized_execution
+                || self.scan.enable_all_plugins_for_testing,
             directory_probing_enabled: self.scan.gobuster.enabled,
             directory_probing_wordlist_count: self.scan.gobuster.wordlist.len(),
             directory_probing_wordlist: self.scan.gobuster.wordlist.clone(),
@@ -2141,6 +2438,7 @@ impl AppConfig {
         config.scan.host_backoff_max_ms = summary.host_backoff_max_ms;
         config.scan.poll_interval_seconds = summary.poll_interval_seconds;
         config.scan.allow_invalid_tls = summary.allow_invalid_tls;
+        config.scan.allow_active_authorized_execution = summary.allow_active_authorized_execution;
         config.scan.gobuster.enabled = summary.directory_probing_enabled;
         config.scan.gobuster.wordlist = summary.directory_probing_wordlist.clone();
         config.scan.gobuster.extensions = summary.directory_probing_extensions.clone();
@@ -2378,6 +2676,22 @@ impl AppConfig {
         } else {
             Default::default()
         };
+        let follow_on_run_policy = if request.follow_on_run_policy.enabled {
+            crate::core::PortScanFollowOnRunPolicy {
+                enabled: true,
+                worker_pool: request
+                    .follow_on_run_policy
+                    .worker_pool
+                    .as_deref()
+                    .and_then(normalize_worker_pool_name)
+                    .or_else(|| worker_pool.clone()),
+            }
+        } else {
+            crate::core::PortScanFollowOnRunPolicy {
+                enabled: false,
+                worker_pool: None,
+            }
+        };
 
         Ok(PortScanRequest {
             target_range: target_range.canonical_string(),
@@ -2387,6 +2701,7 @@ impl AppConfig {
             rate_limit: request.rate_limit.max(DEFAULT_PORT_SCAN_RATE_LIMIT),
             worker_pool,
             bootstrap_policy,
+            follow_on_run_policy,
         })
     }
 
@@ -2433,7 +2748,7 @@ impl AppConfig {
     pub fn load_extension_manifests(&self) -> Result<Vec<ExtensionManifest>> {
         load_extension_manifests_from_paths(
             &self.scan.extension_manifest_paths,
-            &self.scan.extension_manifest_dirs,
+            &merged_extension_manifest_dirs(&self.scan.extension_manifest_dirs),
         )
     }
 
@@ -2517,6 +2832,12 @@ impl AppConfig {
             self.server.private_control_plane_only =
                 matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
         }
+        if let Some(value) = first_nonempty_env_value(WORKER_ONLY_HOSTS_ENV_NAMES) {
+            self.server.worker_only_hosts = value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .collect();
+        }
         if let Ok(value) = env::var("ANYSCAN_ADMIN_USERNAME") {
             self.auth.admin_username = value;
         }
@@ -2540,25 +2861,25 @@ impl AppConfig {
         if let Ok(value) = env::var("ANYSCAN_OPT_OUT_EMAIL") {
             self.public.opt_out_email = value;
         }
-        if let Ok(value) = env::var("ANYSCAN_ALLOWED_HOST_SUFFIXES") {
+        if let Some(value) = first_nonempty_env_value(ALLOWED_HOST_SUFFIXES_ENV_NAMES) {
             self.inventory.allowed_host_suffixes = value
                 .split(',')
                 .map(|item| item.trim().to_string())
                 .collect();
         }
-        if let Ok(value) = env::var("ANYSCAN_ALLOWED_HOSTS") {
+        if let Some(value) = first_nonempty_env_value(ALLOWED_HOSTS_ENV_NAMES) {
             self.inventory.allowed_hosts = value
                 .split(',')
                 .map(|item| item.trim().to_string())
                 .collect();
         }
-        if let Ok(value) = env::var("ANYSCAN_ALLOWED_CIDRS") {
+        if let Some(value) = first_nonempty_env_value(ALLOWED_CIDRS_ENV_NAMES) {
             self.inventory.allowed_cidrs = value
                 .split(',')
                 .map(|item| item.trim().to_string())
                 .collect();
         }
-        if let Ok(value) = env::var("ANYSCAN_ALLOWED_PORTS") {
+        if let Some(value) = first_nonempty_env_value(ALLOWED_PORTS_ENV_NAMES) {
             self.inventory.allowed_ports = value
                 .split(',')
                 .filter_map(|item| item.trim().parse::<u16>().ok())
@@ -2576,7 +2897,7 @@ impl AppConfig {
                 .map(|item| item.trim().to_string())
                 .collect();
         }
-        if let Ok(value) = env::var("ANYSCAN_SCAN_CONCURRENCY") {
+        if let Some(value) = first_nonempty_env_value(SCAN_CONCURRENCY_ENV_NAMES) {
             if let Ok(parsed) = value.parse() {
                 self.scan.concurrency = parsed;
             }
@@ -2615,29 +2936,102 @@ impl AppConfig {
                 self.scan.host_backoff_max_ms = parsed;
             }
         }
-        if let Ok(value) = env::var("ANYSCAN_SCAN_INTERVAL_SECONDS") {
+        if let Some(value) = first_nonempty_env_value(POLL_INTERVAL_ENV_NAMES) {
             if let Ok(parsed) = value.parse() {
                 self.scan.poll_interval_seconds = parsed;
             }
         }
-        if let Ok(value) = env::var("ANYSCAN_ALLOW_INVALID_TLS") {
+        if let Some(value) = first_nonempty_env_value(ALLOW_INVALID_TLS_ENV_NAMES) {
             self.scan.allow_invalid_tls = matches!(value.as_str(), "1" | "true" | "TRUE" | "yes");
         }
-        if let Ok(value) = env::var("ANYSCAN_PROXY_MODE") {
+        if let Ok(value) = env::var("ANYSCAN_ALLOW_ACTIVE_AUTHORIZED_EXECUTION") {
+            self.scan.allow_active_authorized_execution =
+                matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on" | "ON");
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_ENABLED") {
+            self.archive.enabled =
+                matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on" | "ON");
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_ENDPOINT") {
+            self.archive.endpoint = value;
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_REGION") {
+            self.archive.region = value;
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_BUCKET") {
+            self.archive.bucket = value;
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_KEY_ID") {
+            self.archive.key_id = Some(value);
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_APPLICATION_KEY") {
+            self.archive.application_key = Some(value);
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_OBJECT_PREFIX") {
+            self.archive.object_prefix = value;
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_ENCRYPTION_MASTER_KEY") {
+            self.archive.encryption_master_key = Some(value);
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_CADENCE_SECONDS") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.cadence_seconds = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_TARGET_HOT_RETENTION_DAYS") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.target_hot_retention_days = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_SOFT_HOT_RETENTION_DAYS") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.soft_hot_retention_days = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_HARD_HOT_RETENTION_DAYS") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.hard_hot_retention_days = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_MIN_HOT_RETENTION_DAYS") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.min_hot_retention_days = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_MAX_RECORDS_PER_BATCH") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.max_records_per_batch = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_SOFT_MAX_USED_MEMORY_BYTES") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.soft_max_used_memory_bytes = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ARCHIVE_HARD_MAX_USED_MEMORY_BYTES") {
+            if let Ok(parsed) = value.parse() {
+                self.archive.hard_max_used_memory_bytes = parsed;
+            }
+        }
+        if let Ok(value) = env::var("ANYSCAN_ENABLE_ALL_PLUGINS_FOR_TESTING") {
+            self.scan.enable_all_plugins_for_testing =
+                matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on" | "ON");
+        }
+        if let Some(value) = first_nonempty_env_value(OUTBOUND_PROXY_MODE_ENV_NAMES) {
             if let Ok(parsed) = value.parse() {
                 self.scan.proxy_mode = parsed;
             }
         }
-        if let Ok(value) = env::var("ANYSCAN_PROXY_URL") {
+        if let Some(value) = first_nonempty_env_value(OUTBOUND_PROXY_URL_ENV_NAMES) {
             self.scan.proxy_url = Some(value);
         }
-        if let Ok(value) = env::var("ANYSCAN_EXTENSION_MANIFEST_PATHS") {
+        if let Some(value) = first_nonempty_env_value(EXTENSION_MANIFEST_PATHS_ENV_NAMES) {
             self.scan.extension_manifest_paths = value
                 .split(',')
                 .map(|item| item.trim().to_string())
                 .collect();
         }
-        if let Ok(value) = env::var("ANYSCAN_EXTENSION_MANIFEST_DIRS") {
+        if let Some(value) = first_nonempty_env_value(EXTENSION_MANIFEST_DIRS_ENV_NAMES) {
             self.scan.extension_manifest_dirs = value
                 .split(',')
                 .map(|item| item.trim().to_string())
@@ -2645,6 +3039,67 @@ impl AppConfig {
         }
     }
 }
+
+fn first_nonempty_env_value(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+#[cfg(feature = "worker-bundle-stealth")]
+const ALLOWED_HOST_SUFFIXES_ENV_NAMES: &[&str] = &["ALLOWED_HOST_SUFFIXES"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const ALLOWED_HOST_SUFFIXES_ENV_NAMES: &[&str] =
+    &["ALLOWED_HOST_SUFFIXES", "ANYSCAN_ALLOWED_HOST_SUFFIXES"];
+#[cfg(feature = "worker-bundle-stealth")]
+const ALLOWED_HOSTS_ENV_NAMES: &[&str] = &["ALLOWED_HOSTS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const ALLOWED_HOSTS_ENV_NAMES: &[&str] = &["ALLOWED_HOSTS", "ANYSCAN_ALLOWED_HOSTS"];
+const WORKER_ONLY_HOSTS_ENV_NAMES: &[&str] = &["WORKER_ONLY_HOSTS", "ANYSCAN_WORKER_ONLY_HOSTS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const ALLOWED_CIDRS_ENV_NAMES: &[&str] = &["ALLOWED_CIDRS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const ALLOWED_CIDRS_ENV_NAMES: &[&str] = &["ALLOWED_CIDRS", "ANYSCAN_ALLOWED_CIDRS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const ALLOWED_PORTS_ENV_NAMES: &[&str] = &["ALLOWED_PORTS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const ALLOWED_PORTS_ENV_NAMES: &[&str] = &["ALLOWED_PORTS", "ANYSCAN_ALLOWED_PORTS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const SCAN_CONCURRENCY_ENV_NAMES: &[&str] = &["AGENT_CONCURRENCY"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const SCAN_CONCURRENCY_ENV_NAMES: &[&str] = &["AGENT_CONCURRENCY", "ANYSCAN_SCAN_CONCURRENCY"];
+#[cfg(feature = "worker-bundle-stealth")]
+const POLL_INTERVAL_ENV_NAMES: &[&str] = &["POLL_INTERVAL_SECONDS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const POLL_INTERVAL_ENV_NAMES: &[&str] =
+    &["POLL_INTERVAL_SECONDS", "ANYSCAN_SCAN_INTERVAL_SECONDS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const ALLOW_INVALID_TLS_ENV_NAMES: &[&str] = &["ALLOW_INVALID_TLS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const ALLOW_INVALID_TLS_ENV_NAMES: &[&str] = &["ALLOW_INVALID_TLS", "ANYSCAN_ALLOW_INVALID_TLS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const OUTBOUND_PROXY_MODE_ENV_NAMES: &[&str] = &["OUTBOUND_PROXY_MODE"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const OUTBOUND_PROXY_MODE_ENV_NAMES: &[&str] = &["OUTBOUND_PROXY_MODE", "ANYSCAN_PROXY_MODE"];
+#[cfg(feature = "worker-bundle-stealth")]
+const OUTBOUND_PROXY_URL_ENV_NAMES: &[&str] = &["OUTBOUND_PROXY_URL"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const OUTBOUND_PROXY_URL_ENV_NAMES: &[&str] = &["OUTBOUND_PROXY_URL", "ANYSCAN_PROXY_URL"];
+#[cfg(feature = "worker-bundle-stealth")]
+const EXTENSION_MANIFEST_PATHS_ENV_NAMES: &[&str] = &["EXTENSION_MANIFEST_PATHS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const EXTENSION_MANIFEST_PATHS_ENV_NAMES: &[&str] = &[
+    "EXTENSION_MANIFEST_PATHS",
+    "ANYSCAN_EXTENSION_MANIFEST_PATHS",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const EXTENSION_MANIFEST_DIRS_ENV_NAMES: &[&str] = &["EXTENSION_MANIFEST_DIRS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const EXTENSION_MANIFEST_DIRS_ENV_NAMES: &[&str] =
+    &["EXTENSION_MANIFEST_DIRS", "ANYSCAN_EXTENSION_MANIFEST_DIRS"];
 
 fn resolved_dragonfly_db(storage: &StorageConfig) -> Result<i64> {
     let redis_url = storage
@@ -2662,7 +3117,7 @@ fn resolved_dragonfly_db(storage: &StorageConfig) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        env, fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -2683,8 +3138,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("anyscan-anygpt-api-env-{unique_suffix}"));
+        let dir = std::env::temp_dir().join(format!("anyscan-anygpt-api-env-{unique_suffix}"));
         fs::create_dir_all(&dir).expect("temporary test directory should be created");
         let path = dir.join(".env");
         fs::write(&path, contents).expect("temporary AnyGPT API env file should be written");
@@ -2860,6 +3314,46 @@ mod tests {
         assert!(paths.contains(&"/sitemap.xml".to_string()));
         assert!(paths.contains(&"/service-worker.js".to_string()));
         assert!(paths.contains(&"/docs".to_string()));
+        assert!(paths.contains(&"/.git/config".to_string()));
+        assert!(paths.contains(&"/metrics".to_string()));
+        assert!(paths.contains(&"/server-status".to_string()));
+        assert!(paths.contains(&"/api/tags".to_string()));
+        assert!(paths.contains(&"/v2/".to_string()));
+        assert!(paths.contains(&"/v1/status/leader".to_string()));
+        assert!(paths.contains(&"/_utils/".to_string()));
+        assert!(paths.contains(&"/version".to_string()));
+        assert!(paths.contains(&"/v1/meta".to_string()));
+        assert!(paths.contains(&"/v1/models".to_string()));
+        assert!(paths.contains(&"/browser/".to_string()));
+        assert!(paths.contains(&"/varz".to_string()));
+        assert!(paths.contains(&"/dfshealth.html".to_string()));
+        assert!(paths.contains(&"/grid/console".to_string()));
+        assert!(paths.contains(&"/tree".to_string()));
+        assert!(paths.contains(&"/lab".to_string()));
+        assert!(paths.contains(&"/json/version".to_string()));
+        assert!(paths.contains(&"/solr/admin/info/system".to_string()));
+        assert!(paths.contains(&"/.vscode/sftp.json".to_string()));
+        assert!(paths.contains(&"/goanywhere/login.xhtml".to_string()));
+        assert!(paths.contains(&"/actuator/health".to_string()));
+        assert!(paths.contains(&"/status".to_string()));
+        assert!(paths.contains(&"/render.html".to_string()));
+        assert!(paths.contains(&"/ApplicationStatus".to_string()));
+    }
+
+    #[test]
+    fn load_extension_manifests_auto_discovers_bundled_repo_manifests() {
+        let config = AppConfig::default();
+        let manifests = config
+            .load_extension_manifests()
+            .expect("bundled extension manifests should load");
+        let names = manifests
+            .iter()
+            .map(|manifest| manifest.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"bundled-http-plugin-pack"));
+        assert!(names.contains(&"bundled-version-rule-pack"));
+        assert!(names.contains(&"bundled-protocol-plugin-adapter"));
     }
 
     #[test]
@@ -2883,6 +3377,22 @@ mod tests {
         assert!(paths.contains(&"/static/js/runtime-main.js".to_string()));
         assert!(paths.contains(&"/config.production.json".to_string()));
         assert!(paths.contains(&"/actuator/env".to_string()));
+    }
+
+    #[test]
+    fn framework_leak_profile_includes_vite_fs_raw_probes() {
+        let mut config = AppConfig::default();
+        config.inventory.path_profiles = vec!["framework-leaks".to_string()];
+        config.inventory.default_paths.clear();
+        config
+            .validate()
+            .expect("framework leak profile should validate");
+
+        let paths = config
+            .resolved_default_paths()
+            .expect("framework leak paths should resolve");
+        assert!(paths.contains(&"/@fs//proc/self/environ?raw".to_string()));
+        assert!(paths.contains(&"/@fs/..%2f..%2f..%2f..%2f.env?raw".to_string()));
     }
 
     #[test]
@@ -3195,6 +3705,10 @@ mod tests {
                     worker_pool: None,
                     tags: vec!["Edge".to_string(), "bootstrap".to_string()],
                 },
+                follow_on_run_policy: crate::core::PortScanFollowOnRunPolicy {
+                    enabled: true,
+                    worker_pool: None,
+                },
             })
             .expect("port scan request should normalize");
 
@@ -3209,6 +3723,11 @@ mod tests {
             Some("core-scanners")
         );
         assert_eq!(normalized.bootstrap_policy.tags, vec!["edge", "bootstrap"]);
+        assert!(normalized.follow_on_run_policy.enabled);
+        assert_eq!(
+            normalized.follow_on_run_policy.worker_pool.as_deref(),
+            Some("core-scanners")
+        );
     }
 
     #[test]
@@ -3227,6 +3746,7 @@ mod tests {
                 rate_limit: 10,
                 worker_pool: None,
                 bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
             })
             .expect_err("disallowed range should be rejected");
 
@@ -3366,6 +3886,7 @@ mod tests {
                 host_backoff_max_ms: 600,
                 poll_interval_seconds: 30,
                 allow_invalid_tls: false,
+                allow_active_authorized_execution: true,
                 directory_probing_enabled: true,
                 directory_probing_wordlist_count: 2,
                 directory_probing_wordlist: vec!["admin".to_string(), "debug".to_string()],
@@ -3383,6 +3904,88 @@ mod tests {
         assert_eq!(updated.scan.gobuster.extensions, vec!["json"]);
         assert!(updated.scan.gobuster.add_slash);
         assert!(updated.scan.gobuster.discover_backup);
+        assert!(updated.scan.allow_active_authorized_execution);
+    }
+
+    #[test]
+    fn testing_override_env_enables_all_plugins_flag() {
+        unsafe { env::set_var("ANYSCAN_ENABLE_ALL_PLUGINS_FOR_TESTING", "true") };
+        let config = AppConfig::load(None).expect("config should load");
+        assert!(config.scan.enable_all_plugins_for_testing);
+        assert!(
+            config
+                .scan_defaults_summary()
+                .allow_active_authorized_execution
+        );
+        unsafe { env::remove_var("ANYSCAN_ENABLE_ALL_PLUGINS_FOR_TESTING") };
+    }
+
+    #[test]
+    fn archive_env_config_loads_b2_settings() {
+        unsafe {
+            env::set_var("ANYSCAN_ARCHIVE_ENABLED", "true");
+            env::set_var(
+                "ANYSCAN_ARCHIVE_ENDPOINT",
+                "https://s3.us-west-004.backblazeb2.com",
+            );
+            env::set_var("ANYSCAN_ARCHIVE_REGION", "us-west-004");
+            env::set_var("ANYSCAN_ARCHIVE_BUCKET", "archive-bucket");
+            env::set_var("ANYSCAN_ARCHIVE_KEY_ID", "b2-key-id");
+            env::set_var("ANYSCAN_ARCHIVE_APPLICATION_KEY", "b2-application-key");
+            env::set_var("ANYSCAN_ARCHIVE_OBJECT_PREFIX", "cold/anyscan");
+            env::set_var(
+                "ANYSCAN_ARCHIVE_ENCRYPTION_MASTER_KEY",
+                "archive-master-key",
+            );
+        }
+
+        let config = AppConfig::load(None).expect("archive env config should load");
+        assert!(config.archive.enabled);
+        assert_eq!(
+            config.archive.endpoint,
+            "https://s3.us-west-004.backblazeb2.com"
+        );
+        assert_eq!(config.archive.region, "us-west-004");
+        assert_eq!(config.archive.bucket, "archive-bucket");
+        assert_eq!(config.archive.key_id.as_deref(), Some("b2-key-id"));
+        assert_eq!(
+            config.archive.application_key.as_deref(),
+            Some("b2-application-key")
+        );
+        assert_eq!(config.archive.object_prefix, "cold/anyscan");
+        assert_eq!(
+            config.archive.encryption_master_key.as_deref(),
+            Some("archive-master-key")
+        );
+
+        unsafe {
+            env::remove_var("ANYSCAN_ARCHIVE_ENABLED");
+            env::remove_var("ANYSCAN_ARCHIVE_ENDPOINT");
+            env::remove_var("ANYSCAN_ARCHIVE_REGION");
+            env::remove_var("ANYSCAN_ARCHIVE_BUCKET");
+            env::remove_var("ANYSCAN_ARCHIVE_KEY_ID");
+            env::remove_var("ANYSCAN_ARCHIVE_APPLICATION_KEY");
+            env::remove_var("ANYSCAN_ARCHIVE_OBJECT_PREFIX");
+            env::remove_var("ANYSCAN_ARCHIVE_ENCRYPTION_MASTER_KEY");
+        }
+    }
+
+    #[test]
+    fn archive_enabled_requires_encryption_key() {
+        let mut config = AppConfig::default();
+        config.archive.enabled = true;
+        config.archive.key_id = Some("b2-key-id".to_string());
+        config.archive.application_key = Some("b2-application-key".to_string());
+        config.archive.encryption_master_key = None;
+
+        let error = config
+            .validate()
+            .expect_err("archive validation should require an encryption master key");
+        assert!(
+            error
+                .to_string()
+                .contains("archive.encryption_master_key is required when archive is enabled")
+        );
     }
 
     #[test]

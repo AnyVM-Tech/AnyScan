@@ -1,0 +1,15 @@
+{
+  "name": "bundled-version-rule-pack",
+  "version": "0.1.0",
+  "kind": "detector_pack",
+  "enabled": true,
+  "description": "Bundled version-correlation detector pack scaffold for packaged version rules.",
+  "command": "../scripts/bundled-version-rule-pack.py",
+  "args": [],
+  "tags": [
+    "bundled",
+    "version",
+    "plugins"
+  ],
+  "output_format": "finding_json_lines"
+}

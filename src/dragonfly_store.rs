@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use redis::{Commands, Script, streams::StreamRangeReply};
 use serde::{Deserialize, Serialize};
@@ -16,24 +17,32 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
+    archive::{
+        ArchivePressureDecision, ArchivedObject, PreparedArchivePayload, archive_kind_counts,
+    },
     config::{AppConfig, StorageConfig},
     core::{
-        AbuseReportRecord, AbuseReportRequest, ApiEvent, BinDatasetImportRequest, BinDatasetStatus,
-        BinMetadataRecord, DashboardSnapshot, DetectorFindingStat, DiscoveryProvenanceRecord,
-        FailedTargetRecord, FetchTelemetry, FindingRecord, FindingsQuery, HybridFindingsRanker,
-        JobStatus, NewFinding, OptOutRecord, OptOutRequest, OwnershipClaimRecord,
-        OwnershipClaimRequest, PortScanRecord, PortScanRequest, PublicFindingModerationRecord,
-        PublicFindingModerationRequest, PublicFindingRecord, PublicFindingSearchQuery,
-        PublicFindingStatus, PublicResourceKind, PublicWorkflowStatus, PublicWorkflowStatusUpdate,
-        RecurringScheduleRecord, RepositoryDefinition, RepositoryRecord, RunProgressSnapshot,
-        RunScope, RunStatus, RunSummary, ScanDefaultsSummary, ScanJobRecord, ScanRunRecord,
-        Severity, StoredEvent, TargetDefinition, TargetRecord, WorkerBootstrapCandidateApproval,
-        WorkerBootstrapCandidateApprovalRequest, WorkerBootstrapCandidateInput,
-        WorkerBootstrapCandidateRecord, WorkerBootstrapCandidateRejectionRequest,
-        WorkerBootstrapCandidateStatus, WorkerBootstrapDispatchRequest, WorkerBootstrapJobClaim,
+        AbuseReportRecord, AbuseReportRequest, ActiveAuthorizedPluginExecution, ApiEvent,
+        ArchiveJobRecord, ArchiveJobStatus, ArchivePointerRecord, ArchiveRecordKind,
+        ArchiveStatusSnapshot, BinDatasetImportRequest, BinDatasetStatus, BinMetadataRecord,
+        DashboardSnapshot, DetectorFindingStat, DiscoveryProvenanceRecord, FailedTargetRecord,
+        FetchTelemetry, FindingRecord, FindingsQuery, HybridFindingsRanker, JobStatus, NewFinding,
+        OptOutRecord, OptOutRequest, OwnershipClaimRecord, OwnershipClaimRequest,
+        PortScanProtocolFindingRecord, PortScanRecord, PortScanRequest,
+        PublicFindingModerationRecord, PublicFindingModerationRequest, PublicFindingRecord,
+        PublicFindingSearchQuery, PublicFindingStatus, PublicResourceKind, PublicWorkflowStatus,
+        PublicWorkflowStatusUpdate, RecurringScheduleRecord, RepositoryDefinition,
+        RepositoryRecord, RunProgressSnapshot, RunScope, RunStatus, RunSummary,
+        ScanDefaultsSummary, ScanJobRecord, ScanRunRecord, Severity, StoredEvent, TargetDefinition,
+        TargetRecord, WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
+        WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord,
+        WorkerBootstrapCandidateRejectionRequest, WorkerBootstrapCandidateStatus,
+        WorkerBootstrapCodeExchange, WorkerBootstrapCodeIssueRequest, WorkerBootstrapCodeIssued,
+        WorkerBootstrapCodeRecord, WorkerBootstrapDispatchRequest, WorkerBootstrapJobClaim,
         WorkerBootstrapJobRecord, WorkerBootstrapJobStatus, WorkerEnrollmentTokenIssueRequest,
         WorkerEnrollmentTokenIssued, WorkerEnrollmentTokenRecord, WorkerLifecycleState,
-        WorkerPoolRecord, WorkerRecord, WorkerRegistration, merge_coverage_source_stats,
+        WorkerPoolRecord, WorkerRecord, WorkerRegistration, WorkerRemoteCommandRecord,
+        WorkerRemoteCommandRequest, WorkerRemoteCommandStatus, merge_coverage_source_stats,
         normalize_public_finding_search_query, normalize_run_scope, run_findings_query,
         sort_coverage_source_stats, utc_now,
     },
@@ -51,6 +60,11 @@ pub struct DragonflyAnyScanStore {
 }
 
 const NAMESPACE_KEY_SAMPLE_LIMIT: usize = 5;
+const ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND: usize = 25;
+const ALWAYS_HOT_EVENT_RECORDS: usize = 100;
+const ALWAYS_HOT_BOOTSTRAP_ARTIFACTS: usize = 10;
+const DEFAULT_WORKER_REMOTE_COMMAND_TIMEOUT_SECONDS: u64 = 30;
+const MAX_WORKER_REMOTE_COMMAND_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct DragonflyRuntimeState {
@@ -61,6 +75,8 @@ struct DragonflyRuntimeState {
     next_port_scan_id: i64,
     #[serde(default)]
     next_worker_enrollment_token_id: i64,
+    #[serde(default)]
+    next_worker_bootstrap_code_id: i64,
     #[serde(default)]
     next_bootstrap_candidate_id: i64,
     #[serde(default)]
@@ -76,6 +92,12 @@ struct DragonflyRuntimeState {
     next_finding_id: i64,
     next_event_id: i64,
     next_schedule_id: i64,
+    #[serde(default)]
+    next_archive_pointer_id: i64,
+    #[serde(default)]
+    next_archive_job_id: i64,
+    #[serde(default)]
+    next_worker_remote_command_id: i64,
     targets: Vec<TargetRecord>,
     #[serde(default)]
     repositories: Vec<RepositoryRecord>,
@@ -86,7 +108,11 @@ struct DragonflyRuntimeState {
     #[serde(default)]
     workers: Vec<WorkerRecord>,
     #[serde(default)]
+    worker_remote_commands: Vec<WorkerRemoteCommandRecord>,
+    #[serde(default)]
     worker_enrollment_tokens: Vec<StoredWorkerEnrollmentToken>,
+    #[serde(default)]
+    worker_bootstrap_codes: Vec<StoredWorkerBootstrapCode>,
     #[serde(default)]
     bootstrap_candidates: Vec<WorkerBootstrapCandidateRecord>,
     #[serde(default)]
@@ -108,6 +134,10 @@ struct DragonflyRuntimeState {
     findings: Vec<FindingRecord>,
     events: Vec<StoredEvent>,
     schedules: Vec<RecurringScheduleRecord>,
+    #[serde(default)]
+    archive_pointers: Vec<ArchivePointerRecord>,
+    #[serde(default)]
+    archive_jobs: Vec<ArchiveJobRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +146,12 @@ struct StoredWorkerEnrollmentToken {
     token_hash: String,
     #[serde(default)]
     token_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredWorkerBootstrapCode {
+    record: WorkerBootstrapCodeRecord,
+    code_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +177,21 @@ struct StoredPortScan {
 struct StoredJobClaim {
     claimed_by: String,
     claim_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchivedWorkerEnrollmentToken {
+    record: WorkerEnrollmentTokenRecord,
+    token_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ArchivedBootstrapArtifactRecord {
+    local_artifact_path: String,
+    file_name: String,
+    modified_at: DateTime<Utc>,
+    size_bytes: u64,
+    contents_b64: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,6 +248,13 @@ impl DragonflyRuntimeState {
                 .max()
                 .unwrap_or(0),
         );
+        self.next_worker_bootstrap_code_id = self.next_worker_bootstrap_code_id.max(
+            self.worker_bootstrap_codes
+                .iter()
+                .map(|code| code.record.id)
+                .max()
+                .unwrap_or(0),
+        );
         self.next_bootstrap_candidate_id = self.next_bootstrap_candidate_id.max(
             self.bootstrap_candidates
                 .iter()
@@ -249,6 +307,8 @@ impl DragonflyRuntimeState {
             .sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
         self.worker_enrollment_tokens
             .sort_by(|left, right| left.record.id.cmp(&right.record.id));
+        self.worker_bootstrap_codes
+            .sort_by(|left, right| left.record.id.cmp(&right.record.id));
         self.bootstrap_candidates
             .sort_by(|left, right| left.id.cmp(&right.id));
         self.bootstrap_jobs
@@ -271,6 +331,45 @@ impl DragonflyRuntimeState {
                 .max()
                 .unwrap_or(0),
         );
+        self.next_archive_pointer_id = self.next_archive_pointer_id.max(
+            self.archive_pointers
+                .iter()
+                .map(|pointer| pointer.id)
+                .max()
+                .unwrap_or(0),
+        );
+        self.next_archive_job_id = self.next_archive_job_id.max(
+            self.archive_jobs
+                .iter()
+                .map(|job| job.id)
+                .max()
+                .unwrap_or(0),
+        );
+        self.next_worker_remote_command_id = self.next_worker_remote_command_id.max(
+            self.worker_remote_commands
+                .iter()
+                .map(|command| command.id)
+                .max()
+                .unwrap_or(0),
+        );
+        self.archive_pointers.sort_by(|left, right| {
+            right
+                .archived_at
+                .cmp(&left.archived_at)
+                .then(right.id.cmp(&left.id))
+        });
+        self.archive_jobs.sort_by(|left, right| {
+            right
+                .started_at
+                .cmp(&left.started_at)
+                .then(right.id.cmp(&left.id))
+        });
+        self.worker_remote_commands.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then(right.id.cmp(&left.id))
+        });
     }
 
     fn next_target_id(&mut self) -> i64 {
@@ -291,6 +390,11 @@ impl DragonflyRuntimeState {
     fn next_worker_enrollment_token_id(&mut self) -> i64 {
         self.next_worker_enrollment_token_id += 1;
         self.next_worker_enrollment_token_id
+    }
+
+    fn next_worker_bootstrap_code_id(&mut self) -> i64 {
+        self.next_worker_bootstrap_code_id += 1;
+        self.next_worker_bootstrap_code_id
     }
 
     fn next_bootstrap_candidate_id(&mut self) -> i64 {
@@ -336,6 +440,21 @@ impl DragonflyRuntimeState {
     fn next_schedule_id(&mut self) -> i64 {
         self.next_schedule_id += 1;
         self.next_schedule_id
+    }
+
+    fn next_archive_pointer_id(&mut self) -> i64 {
+        self.next_archive_pointer_id += 1;
+        self.next_archive_pointer_id
+    }
+
+    fn next_archive_job_id(&mut self) -> i64 {
+        self.next_archive_job_id += 1;
+        self.next_archive_job_id
+    }
+
+    fn next_worker_remote_command_id(&mut self) -> i64 {
+        self.next_worker_remote_command_id += 1;
+        self.next_worker_remote_command_id
     }
 }
 
@@ -521,6 +640,19 @@ impl DragonflyAnyScanStore {
         requested_by: Option<&str>,
         request: &PortScanRequest,
     ) -> Result<PortScanRecord> {
+        self.queue_port_scan_with_active_authorized_plugins(
+            requested_by,
+            request,
+            &ActiveAuthorizedPluginExecution::default(),
+        )
+    }
+
+    pub fn queue_port_scan_with_active_authorized_plugins(
+        &self,
+        requested_by: Option<&str>,
+        request: &PortScanRequest,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<PortScanRecord> {
         self.with_state_mut(|state| {
             let now = utc_now();
             let record = PortScanRecord {
@@ -533,6 +665,8 @@ impl DragonflyAnyScanStore {
                 rate_limit: request.rate_limit,
                 worker_pool: request.worker_pool.clone(),
                 bootstrap_policy: request.bootstrap_policy.clone(),
+                follow_on_run_policy: request.follow_on_run_policy.clone(),
+                active_authorized_plugins: active_authorized_plugins.clone(),
                 status: RunStatus::Queued,
                 started_at: now,
                 completed_at: None,
@@ -540,6 +674,7 @@ impl DragonflyAnyScanStore {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                protocol_findings: Vec::new(),
                 notes: None,
             };
             state.port_scans.push(StoredPortScan {
@@ -577,6 +712,91 @@ impl DragonflyAnyScanStore {
         }
         let now = utc_now();
         self.with_state_mut(|state| register_worker_in_state(state, registration, ttl_seconds, now))
+    }
+
+    pub fn authenticate_worker_registration_token(
+        &self,
+        worker_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        let worker_id = worker_id.trim();
+        let token = token.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!("worker_id is required"));
+        }
+        if token.is_empty() {
+            return Err(anyhow!("worker token is required"));
+        }
+
+        self.with_state(|state| {
+            let now = utc_now();
+            let token_hash = hash_worker_enrollment_token(token);
+            let stored = state
+                .worker_enrollment_tokens
+                .iter()
+                .find(|stored| {
+                    stored.token_hash == token_hash && stored.record.revoked_at.is_none()
+                })
+                .ok_or_else(|| anyhow!("invalid or expired worker enrollment token"))?;
+
+            if state.workers.iter().any(|worker| {
+                worker.worker_id == worker_id
+                    && worker.enrollment_token_id == Some(stored.record.id)
+                    && worker.lifecycle_state.accepts_heartbeats()
+            }) {
+                return Ok(());
+            }
+
+            if worker_enrollment_token_is_usable(
+                &stored.record,
+                &stored.token_hash,
+                &token_hash,
+                now,
+            ) {
+                Ok(())
+            } else {
+                Err(anyhow!("invalid or expired worker enrollment token"))
+            }
+        })
+    }
+
+    pub fn authenticate_registered_worker_token(&self, worker_id: &str, token: &str) -> Result<()> {
+        let worker_id = worker_id.trim();
+        let token = token.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!("worker_id is required"));
+        }
+        if token.is_empty() {
+            return Err(anyhow!("worker token is required"));
+        }
+
+        self.with_state(|state| {
+            let worker = state
+                .workers
+                .iter()
+                .find(|worker| worker.worker_id == worker_id)
+                .ok_or_else(|| anyhow!("worker {worker_id} is not registered"))?;
+            if !worker.lifecycle_state.accepts_heartbeats() {
+                return Err(anyhow!("worker {worker_id} has been revoked"));
+            }
+            let token_id = worker
+                .enrollment_token_id
+                .ok_or_else(|| anyhow!("worker {worker_id} is missing an enrollment token"))?;
+            let stored = state
+                .worker_enrollment_tokens
+                .iter()
+                .find(|stored| stored.record.id == token_id)
+                .ok_or_else(|| anyhow!("worker enrollment token {token_id} not found"))?;
+            if stored.token_hash != hash_worker_enrollment_token(token) {
+                return Err(anyhow!("invalid worker token"));
+            }
+            if stored.record.revoked_at.is_some() {
+                return Err(anyhow!(
+                    "worker enrollment token {token_id} has been revoked"
+                ));
+            }
+            Ok(())
+        })
     }
 
     pub fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
@@ -617,6 +837,116 @@ impl DragonflyAnyScanStore {
         })
     }
 
+    pub fn request_worker_remote_update(&self, worker_id: &str) -> Result<WorkerRecord> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!(
+                "worker_id is required to request a worker remote update"
+            ));
+        }
+        self.with_state_mut(|state| {
+            request_worker_remote_update_in_state(state, worker_id, utc_now())
+        })
+    }
+
+    pub fn request_all_worker_remote_updates(&self) -> Result<Vec<WorkerRecord>> {
+        self.with_state_mut(|state| request_all_worker_remote_updates_in_state(state, utc_now()))
+    }
+
+    pub fn acknowledge_worker_remote_update(
+        &self,
+        worker_id: &str,
+        requested_at: DateTime<Utc>,
+    ) -> Result<WorkerRecord> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!(
+                "worker_id is required to acknowledge a worker remote update"
+            ));
+        }
+        self.with_state_mut(|state| {
+            acknowledge_worker_remote_update_in_state(state, worker_id, requested_at)
+        })
+    }
+
+    pub fn list_worker_remote_commands(
+        &self,
+        limit: usize,
+        worker_id: Option<&str>,
+    ) -> Result<Vec<WorkerRemoteCommandRecord>> {
+        let worker_id = worker_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string());
+        let limit = limit.max(1);
+        self.with_state(|state| {
+            Ok(sorted_worker_remote_commands(
+                state.worker_remote_commands.clone(),
+                worker_id.as_deref(),
+                limit,
+            ))
+        })
+    }
+
+    pub fn queue_worker_remote_command(
+        &self,
+        worker_id: &str,
+        requested_by: Option<&str>,
+        request: &WorkerRemoteCommandRequest,
+    ) -> Result<WorkerRemoteCommandRecord> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!("worker_id is required to queue a remote command"));
+        }
+        self.with_state_mut(|state| {
+            queue_worker_remote_command_in_state(state, worker_id, requested_by, request, utc_now())
+        })
+    }
+
+    pub fn claim_next_pending_worker_remote_command(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<WorkerRemoteCommandRecord>> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!("worker_id is required to claim a remote command"));
+        }
+        self.with_state_mut(|state| {
+            claim_next_pending_worker_remote_command_in_state(state, worker_id, utc_now())
+        })
+    }
+
+    pub fn complete_worker_remote_command_if_owned(
+        &self,
+        command_id: i64,
+        worker_id: &str,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<WorkerRemoteCommandRecord>> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(anyhow!(
+                "worker_id is required to complete a remote command"
+            ));
+        }
+        self.with_state_mut(|state| {
+            complete_worker_remote_command_if_owned_in_state(
+                state,
+                command_id,
+                worker_id,
+                exit_code,
+                timed_out,
+                stdout,
+                stderr,
+                error,
+                utc_now(),
+            )
+        })
+    }
+
     pub fn list_worker_enrollment_tokens(&self) -> Result<Vec<WorkerEnrollmentTokenRecord>> {
         self.with_state(|state| {
             Ok(sorted_worker_enrollment_token_records(
@@ -642,6 +972,28 @@ impl DragonflyAnyScanStore {
     ) -> Result<WorkerEnrollmentTokenRecord> {
         self.with_state_mut(|state| {
             revoke_worker_enrollment_token_in_state(state, token_id, utc_now())
+        })
+    }
+
+    pub fn issue_worker_bootstrap_code(
+        &self,
+        created_by: Option<&str>,
+        request: &WorkerBootstrapCodeIssueRequest,
+    ) -> Result<WorkerBootstrapCodeIssued> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            issue_worker_bootstrap_code_in_state(state, created_by, request, now)
+        })
+    }
+
+    pub fn exchange_worker_bootstrap_code(
+        &self,
+        code: &str,
+        worker_id: &str,
+    ) -> Result<WorkerBootstrapCodeExchange> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            exchange_worker_bootstrap_code_in_state(state, code, worker_id, now)
         })
     }
 
@@ -832,6 +1184,7 @@ impl DragonflyAnyScanStore {
         worker_id: &str,
         discovered_endpoints_total: u64,
         imported_targets_total: u64,
+        protocol_findings: &[PortScanProtocolFindingRecord],
         queued_run_id: Option<i64>,
         notes: Option<&str>,
     ) -> Result<Option<PortScanRecord>> {
@@ -853,6 +1206,7 @@ impl DragonflyAnyScanStore {
             record.port_scan.completed_at = Some(now);
             record.port_scan.discovered_endpoints_total = discovered_endpoints_total;
             record.port_scan.imported_targets_total = imported_targets_total;
+            record.port_scan.protocol_findings = protocol_findings.to_vec();
             record.port_scan.queued_run_id = queued_run_id;
             if let Some(notes) = notes {
                 record.port_scan.notes = Some(notes.to_string());
@@ -1020,6 +1374,25 @@ impl DragonflyAnyScanStore {
         requested_by: Option<&str>,
         scope: Option<&RunScope>,
     ) -> Result<RecurringScheduleRecord> {
+        self.upsert_schedule_with_active_authorized_plugins(
+            label,
+            interval_seconds,
+            enabled,
+            requested_by,
+            scope,
+            &ActiveAuthorizedPluginExecution::default(),
+        )
+    }
+
+    pub fn upsert_schedule_with_active_authorized_plugins(
+        &self,
+        label: &str,
+        interval_seconds: u64,
+        enabled: bool,
+        requested_by: Option<&str>,
+        scope: Option<&RunScope>,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<RecurringScheduleRecord> {
         let normalized_label = label.trim();
         if normalized_label.is_empty() {
             return Err(anyhow!("schedule label is required"));
@@ -1044,6 +1417,7 @@ impl DragonflyAnyScanStore {
                     existing.requested_by = Some(requested_by.to_string());
                 }
                 existing.scope = normalized_scope.clone();
+                existing.active_authorized_plugins = active_authorized_plugins.clone();
                 existing.next_run_at = now;
                 existing.last_error = None;
                 existing.updated_at = now;
@@ -1057,6 +1431,7 @@ impl DragonflyAnyScanStore {
                 enabled,
                 requested_by: requested_by.map(|value| value.to_string()),
                 scope: normalized_scope.clone(),
+                active_authorized_plugins: active_authorized_plugins.clone(),
                 next_run_at: now,
                 last_run_at: None,
                 last_queued_run_id: None,
@@ -1155,6 +1530,7 @@ impl DragonflyAnyScanStore {
                     Some(selected_schedule.id),
                     Some(requested_by),
                     selected_schedule.scope.clone(),
+                    selected_schedule.active_authorized_plugins.clone(),
                     &targets,
                     now,
                 );
@@ -1182,6 +1558,19 @@ impl DragonflyAnyScanStore {
         requested_by: Option<&str>,
         scope: Option<&RunScope>,
     ) -> Result<ScanRunRecord> {
+        self.queue_run_with_active_authorized_plugins(
+            requested_by,
+            scope,
+            &ActiveAuthorizedPluginExecution::default(),
+        )
+    }
+
+    pub fn queue_run_with_active_authorized_plugins(
+        &self,
+        requested_by: Option<&str>,
+        scope: Option<&RunScope>,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<ScanRunRecord> {
         let normalized_scope = normalize_run_scope(scope.cloned());
         self.with_state_mut(|state| {
             let targets = filter_targets_by_scope(
@@ -1203,6 +1592,7 @@ impl DragonflyAnyScanStore {
                 None,
                 requested_by.map(|value| value.to_string()),
                 normalized_scope.clone(),
+                active_authorized_plugins.clone(),
                 &targets,
                 now,
             );
@@ -1253,28 +1643,7 @@ impl DragonflyAnyScanStore {
             ));
         }
 
-        self.with_state(|state| {
-            let now = utc_now();
-            if !worker_allows_new_runs(state, worker_id, now) {
-                return Ok(None);
-            }
-            let mut runs = state
-                .runs
-                .iter()
-                .filter(|run| {
-                    matches!(run.run.status, RunStatus::InProgress)
-                        && has_claimable_jobs(state, run.run.id, now)
-                        && run_claim_is_active(run, now)
-                        && run
-                            .claimed_by
-                            .as_deref()
-                            .is_some_and(|owner| owner != worker_id)
-                })
-                .map(|run| run.run.clone())
-                .collect::<Vec<_>>();
-            runs.sort_by(|left, right| left.id.cmp(&right.id));
-            Ok(runs.into_iter().next())
-        })
+        self.with_state(|state| Ok(next_assistable_run_in_state(state, worker_id, utc_now())))
     }
 
     pub fn renew_run_claim(&self, run_id: i64, worker_id: &str, lease_seconds: u64) -> Result<()> {
@@ -1609,6 +1978,37 @@ impl DragonflyAnyScanStore {
                 {
                     return None;
                 }
+                if query.plugin_id.as_ref().is_some_and(|plugin_id| {
+                    record.plugin_metadata.as_ref().is_none_or(|metadata| {
+                        metadata.plugin_id.to_ascii_lowercase() != *plugin_id
+                    })
+                }) {
+                    return None;
+                }
+                if query.plugin_family.is_some_and(|family| {
+                    record
+                        .plugin_metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.plugin_family != family)
+                }) {
+                    return None;
+                }
+                if query.execution_mode.is_some_and(|mode| {
+                    record
+                        .plugin_metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.execution_mode != mode)
+                }) {
+                    return None;
+                }
+                if query.leakix_label.is_some_and(|label| {
+                    record
+                        .plugin_metadata
+                        .as_ref()
+                        .is_none_or(|metadata| metadata.leakix_label != label)
+                }) {
+                    return None;
+                }
                 if query.path_prefix.as_ref().is_some_and(|path_prefix| {
                     !record.path.to_ascii_lowercase().starts_with(path_prefix)
                 }) {
@@ -1616,8 +2016,31 @@ impl DragonflyAnyScanStore {
                 }
                 if query.q.as_ref().is_some_and(|term| {
                     let searchable = format!(
-                        "{} {} {} {}",
-                        record.detector, record.target_base_url, record.path, record.public_summary
+                        "{} {} {} {} {} {} {} {}",
+                        record.detector,
+                        record.target_base_url,
+                        record.path,
+                        record.public_summary,
+                        record
+                            .plugin_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.plugin_id.as_str())
+                            .unwrap_or_default(),
+                        record
+                            .plugin_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.plugin_display_name.as_str())
+                            .unwrap_or_default(),
+                        record
+                            .plugin_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.plugin_family.as_str())
+                            .unwrap_or_default(),
+                        record
+                            .plugin_metadata
+                            .as_ref()
+                            .map(|metadata| metadata.execution_mode.as_str())
+                            .unwrap_or_default(),
                     )
                     .to_ascii_lowercase();
                     !searchable.contains(term)
@@ -1631,6 +2054,7 @@ impl DragonflyAnyScanStore {
                     target_base_url: record.target_base_url.clone(),
                     path: record.path.clone(),
                     summary: record.public_summary.clone(),
+                    plugin_metadata: record.plugin_metadata.clone(),
                     observed_at: record.observed_at,
                     published_at,
                 })
@@ -1860,10 +2284,17 @@ impl DragonflyAnyScanStore {
                     .collect(),
                 targets: sorted_targets(state.targets.clone()),
                 scan_defaults: Default::default(),
+                active_authorized_execution_policy: Default::default(),
+                archive_status: None,
                 repositories: sorted_repositories(state.repositories.clone()),
                 operators: Vec::new(),
                 workers: active_worker_records(&state.workers, now),
                 worker_pools: compute_worker_pool_records(state, now),
+                recent_worker_remote_commands: sorted_worker_remote_commands(
+                    state.worker_remote_commands.clone(),
+                    None,
+                    20,
+                ),
                 worker_enrollment_tokens: sorted_worker_enrollment_token_records(
                     &state.worker_enrollment_tokens,
                 ),
@@ -1880,6 +2311,368 @@ impl DragonflyAnyScanStore {
                 schedules,
             })
         })
+    }
+
+    pub fn archive_due(&self, cadence_seconds: u64, now: DateTime<Utc>) -> Result<bool> {
+        self.with_state(|state| {
+            let Some(latest_job) = state.archive_jobs.first() else {
+                return Ok(true);
+            };
+            let reference_time = latest_job.completed_at.unwrap_or(latest_job.started_at);
+            let cadence = ChronoDuration::seconds(cadence_seconds.min(i64::MAX as u64) as i64);
+            Ok(reference_time + cadence <= now)
+        })
+    }
+
+    pub fn used_memory_bytes(&self) -> Result<u64> {
+        let mut connection = self.open_connection()?;
+        let info: String = redis::cmd("INFO")
+            .arg("MEMORY")
+            .query(&mut connection)
+            .context("failed to read Dragonfly INFO MEMORY output")?;
+        Ok(parse_info_used_memory_bytes(&info).unwrap_or(0))
+    }
+
+    pub fn namespace_storage_estimate_bytes(&self) -> Result<u64> {
+        let mut connection = self.open_connection()?;
+        self.namespace_storage_estimate_bytes_with_connection(&mut connection)
+    }
+
+    pub fn archive_status(&self, config: &AppConfig) -> Result<ArchiveStatusSnapshot> {
+        let used_memory_bytes = self.used_memory_bytes()?;
+        let namespace_estimated_bytes = self.namespace_storage_estimate_bytes()?;
+        let decision = crate::archive::decide_archive_pressure(
+            &config.archive,
+            used_memory_bytes,
+            namespace_estimated_bytes,
+        );
+
+        self.with_state(|state| {
+            Ok(ArchiveStatusSnapshot {
+                enabled: config.archive.enabled,
+                backend: config.archive.enabled.then_some(config.archive.backend),
+                pressure_mode: decision.pressure_mode,
+                current_hot_retention_days: decision.hot_retention_days,
+                target_hot_retention_days: config.archive.target_hot_retention_days,
+                soft_hot_retention_days: config.archive.soft_hot_retention_days,
+                hard_hot_retention_days: config.archive.hard_hot_retention_days,
+                used_memory_bytes,
+                namespace_estimated_bytes,
+                pointers_total: state.archive_pointers.len(),
+                recent_archive_jobs: state.archive_jobs.iter().take(10).cloned().collect(),
+                pointer_counts: archive_kind_counts(
+                    state
+                        .archive_pointers
+                        .iter()
+                        .map(|pointer| (pointer.kind, pointer.record_count)),
+                ),
+            })
+        })
+    }
+
+    pub fn list_archive_jobs(&self, limit: usize) -> Result<Vec<ArchiveJobRecord>> {
+        self.with_state(|state| {
+            let mut jobs = state.archive_jobs.clone();
+            if limit > 0 {
+                jobs.truncate(limit);
+            }
+            Ok(jobs)
+        })
+    }
+
+    pub fn list_archive_pointers(
+        &self,
+        limit: usize,
+        kind: Option<ArchiveRecordKind>,
+    ) -> Result<Vec<ArchivePointerRecord>> {
+        self.with_state(|state| {
+            let mut pointers = state
+                .archive_pointers
+                .iter()
+                .filter(|pointer| kind.is_none_or(|expected| pointer.kind == expected))
+                .cloned()
+                .collect::<Vec<_>>();
+            if limit > 0 {
+                pointers.truncate(limit);
+            }
+            Ok(pointers)
+        })
+    }
+
+    pub fn get_archive_pointer(&self, pointer_id: i64) -> Result<Option<ArchivePointerRecord>> {
+        self.with_state(|state| {
+            Ok(state
+                .archive_pointers
+                .iter()
+                .find(|pointer| pointer.id == pointer_id)
+                .cloned())
+        })
+    }
+
+    pub fn begin_archive_job(
+        &self,
+        decision: &ArchivePressureDecision,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.with_state_mut(|state| {
+            let record = ArchiveJobRecord {
+                id: state.next_archive_job_id(),
+                status: ArchiveJobStatus::Running,
+                pressure_mode: decision.pressure_mode,
+                hot_retention_days: decision.hot_retention_days,
+                archived_record_count: 0,
+                archived_object_count: 0,
+                kinds: Vec::new(),
+                error: None,
+                started_at: now,
+                completed_at: None,
+            };
+            state.archive_jobs.push(record.clone());
+            state.archive_jobs.sort_by(|left, right| {
+                right
+                    .started_at
+                    .cmp(&left.started_at)
+                    .then(right.id.cmp(&left.id))
+            });
+            Ok(record)
+        })
+    }
+
+    pub fn complete_archive_job(
+        &self,
+        job_id: i64,
+        archived_counts: &BTreeMap<ArchiveRecordKind, usize>,
+        archived_object_count: usize,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.with_state_mut(|state| {
+            let job = state
+                .archive_jobs
+                .iter_mut()
+                .find(|record| record.id == job_id)
+                .ok_or_else(|| anyhow!("archive job {job_id} not found"))?;
+            job.status = ArchiveJobStatus::Completed;
+            job.archived_record_count = archived_counts.values().copied().sum();
+            job.archived_object_count = archived_object_count;
+            job.kinds =
+                archive_kind_counts(archived_counts.iter().map(|(kind, count)| (*kind, *count)));
+            job.error = None;
+            job.completed_at = Some(now);
+            Ok(job.clone())
+        })
+    }
+
+    pub fn fail_archive_job(
+        &self,
+        job_id: i64,
+        archived_counts: &BTreeMap<ArchiveRecordKind, usize>,
+        archived_object_count: usize,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.with_state_mut(|state| {
+            let job = state
+                .archive_jobs
+                .iter_mut()
+                .find(|record| record.id == job_id)
+                .ok_or_else(|| anyhow!("archive job {job_id} not found"))?;
+            job.status = ArchiveJobStatus::Failed;
+            job.archived_record_count = archived_counts.values().copied().sum();
+            job.archived_object_count = archived_object_count;
+            job.kinds =
+                archive_kind_counts(archived_counts.iter().map(|(kind, count)| (*kind, *count)));
+            job.error = Some(error.trim().to_string());
+            job.completed_at = Some(now);
+            Ok(job.clone())
+        })
+    }
+
+    pub fn plan_archive_payloads(
+        &self,
+        hot_retention_days: u64,
+        max_records_per_batch: usize,
+        bootstrap_artifact_dir: Option<&Path>,
+    ) -> Result<Vec<PreparedArchivePayload>> {
+        if max_records_per_batch == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut connection = self.open_connection()?;
+        let state = self.load_state(&mut connection)?;
+        let now = utc_now();
+        let cutoff = archive_cutoff(now, hot_retention_days);
+        let namespace = self.key_prefix.clone();
+        let mut payloads = Vec::new();
+
+        if let Some(payload) =
+            prepare_runs_archive_payload(&state, &namespace, cutoff, max_records_per_batch)?
+        {
+            payloads.push(payload);
+        }
+        if let Some(payload) =
+            prepare_jobs_archive_payload(&state, &namespace, cutoff, max_records_per_batch)?
+        {
+            payloads.push(payload);
+        }
+        if let Some(payload) =
+            prepare_findings_archive_payload(&state, &namespace, cutoff, max_records_per_batch)?
+        {
+            payloads.push(payload);
+        }
+        if let Some(payload) =
+            prepare_port_scans_archive_payload(&state, &namespace, cutoff, max_records_per_batch)?
+        {
+            payloads.push(payload);
+        }
+        if let Some(payload) = prepare_worker_enrollment_tokens_archive_payload(
+            &state,
+            &namespace,
+            cutoff,
+            max_records_per_batch,
+        )? {
+            payloads.push(payload);
+        }
+        if let Some(payload) = prepare_bootstrap_jobs_archive_payload(
+            &state,
+            &namespace,
+            cutoff,
+            max_records_per_batch,
+        )? {
+            payloads.push(payload);
+        }
+        if let Some(payload) = prepare_ownership_claims_archive_payload(
+            &state,
+            &namespace,
+            cutoff,
+            max_records_per_batch,
+        )? {
+            payloads.push(payload);
+        }
+        if let Some(payload) =
+            prepare_opt_outs_archive_payload(&state, &namespace, cutoff, max_records_per_batch)?
+        {
+            payloads.push(payload);
+        }
+        if let Some(payload) = prepare_abuse_reports_archive_payload(
+            &state,
+            &namespace,
+            cutoff,
+            max_records_per_batch,
+        )? {
+            payloads.push(payload);
+        }
+        if let Some(payload) = prepare_events_archive_payload(
+            &mut connection,
+            &state,
+            &namespace,
+            &self.events_key(),
+            cutoff,
+            max_records_per_batch,
+        )? {
+            payloads.push(payload);
+        }
+        if let Some(directory) = bootstrap_artifact_dir {
+            let mut artifact_payloads = prepare_bootstrap_artifact_archive_payloads(
+                &namespace,
+                directory,
+                cutoff,
+                max_records_per_batch,
+                &state.archive_pointers,
+            )?;
+            payloads.append(&mut artifact_payloads);
+        }
+
+        Ok(payloads)
+    }
+
+    pub fn record_archived_payload(
+        &self,
+        payload: &PreparedArchivePayload,
+        archived: &ArchivedObject,
+    ) -> Result<ArchivePointerRecord> {
+        let mut connection = self.open_connection_for_write("recording archived payload")?;
+        let token = self.acquire_lock(&mut connection)?;
+        let result = (|| {
+            let mut state = self.load_state(&mut connection)?;
+            self.prepare_state_locked(&mut connection, &mut state)?;
+            let pointer = add_archive_pointer_to_state(&mut state, payload, archived);
+            self.save_state(&mut connection, &state)?;
+
+            prune_archived_payload_from_state(&mut state, payload)?;
+            self.save_state(&mut connection, &state)?;
+            prune_archived_events_from_stream(&mut connection, &self.events_key(), payload)?;
+            remove_archived_local_artifacts(payload)?;
+
+            Ok(pointer)
+        })();
+        let release_result = self.release_lock(&mut connection, &token);
+        match (result, release_result) {
+            (Ok(pointer), Ok(())) => Ok(pointer),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => Err(error)
+                .with_context(|| format!("also failed to release Dragonfly lock: {release_error}")),
+        }
+    }
+
+    pub fn hydrate_archive_records(
+        &self,
+        kind: ArchiveRecordKind,
+        records: &[serde_json::Value],
+    ) -> Result<usize> {
+        let mut connection = self.open_connection_for_write("hydrating archive records")?;
+        let token = self.acquire_lock(&mut connection)?;
+        let result = (|| {
+            let mut state = self.load_state(&mut connection)?;
+            self.prepare_state_locked(&mut connection, &mut state)?;
+            let restored = hydrate_archive_records_into_state(
+                self,
+                &mut connection,
+                &mut state,
+                kind,
+                records,
+            )?;
+            self.save_state(&mut connection, &state)?;
+            Ok(restored)
+        })();
+        let release_result = self.release_lock(&mut connection, &token);
+        match (result, release_result) {
+            (Ok(restored), Ok(())) => Ok(restored),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(release_error)) => Err(error)
+                .with_context(|| format!("also failed to release Dragonfly lock: {release_error}")),
+        }
+    }
+
+    pub fn try_acquire_archive_lease(&self, token: &str, ttl_ms: u64) -> Result<bool> {
+        let mut connection = self.open_connection_for_write("acquiring archive lease")?;
+        let response: Option<String> = redis::cmd("SET")
+            .arg(self.archive_lease_key())
+            .arg(token)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl_ms.max(1))
+            .query(&mut connection)
+            .context("failed to acquire archive lease")?;
+        Ok(response.is_some())
+    }
+
+    pub fn release_archive_lease(&self, token: &str) -> Result<()> {
+        let mut connection = self.open_connection_for_write("releasing archive lease")?;
+        Script::new(
+            r#"
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+                return redis.call('DEL', KEYS[1])
+            end
+            return 0
+            "#,
+        )
+        .key(self.archive_lease_key())
+        .arg(token)
+        .invoke::<i32>(&mut connection)
+        .context("failed to release archive lease")?;
+        Ok(())
     }
 
     pub fn load_scan_settings(&self) -> Result<Option<ScanDefaultsSummary>> {
@@ -2149,6 +2942,10 @@ impl DragonflyAnyScanStore {
         format!("{}runtime_lock", self.key_prefix)
     }
 
+    fn archive_lease_key(&self) -> String {
+        format!("{}archive_lease", self.key_prefix)
+    }
+
     fn events_key(&self) -> String {
         format!("{}run_events", self.key_prefix)
     }
@@ -2163,6 +2960,27 @@ impl DragonflyAnyScanStore {
 
     fn bin_dataset_status_key(&self) -> String {
         format!("{}bin_dataset_status", self.key_prefix)
+    }
+
+    fn namespace_storage_estimate_bytes_with_connection(
+        &self,
+        connection: &mut redis::Connection,
+    ) -> Result<u64> {
+        let mut total = 0u64;
+        for key in scan_namespace_keys(connection, &self.namespace_pattern())? {
+            let usage = redis::cmd("MEMORY")
+                .arg("USAGE")
+                .arg(&key)
+                .query::<Option<u64>>(connection);
+            match usage {
+                Ok(Some(bytes)) => total = total.saturating_add(bytes),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::debug!(key = %key, %error, "failed to estimate Dragonfly key memory usage");
+                }
+            }
+        }
+        Ok(total)
     }
 
     fn resolve_bin_dataset_source(
@@ -2677,17 +3495,62 @@ fn register_worker_in_state(
         .filter(|value| !value.is_empty());
     let requested_pool = normalize_worker_pool_name(registration.worker_pool.as_deref());
     let requested_tags = normalize_worker_values(&registration.tags);
+    let operating_system = registration
+        .operating_system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let architecture = registration
+        .architecture
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let platform = registration
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
     let scanner_adapters = normalize_worker_values(&registration.scanner_adapters);
     let provisioners = normalize_worker_values(&registration.provisioners);
+    let local_ip_addresses = normalize_worker_values(&registration.local_ip_addresses);
+    let public_ip_address = registration
+        .public_ip_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let public_ip_checked_at = registration.public_ip_checked_at;
+    let remote_update_status = registration.remote_update_status;
+    let remote_update_status_message = registration
+        .remote_update_status_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let remote_update_status_updated_at = registration.remote_update_status_updated_at;
+    let presented_token_index = registration
+        .enrollment_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|token| find_usable_worker_enrollment_token_index(state, token, now));
 
     if let Some(index) = state
         .workers
         .iter()
         .position(|worker| worker.worker_id == worker_id)
     {
-        let enrollment_token = state.workers[index]
-            .enrollment_token_id
-            .and_then(|token_id| find_worker_enrollment_token_record(state, token_id));
+        let enrollment_token = presented_token_index
+            .and_then(|token_index| state.worker_enrollment_tokens.get(token_index))
+            .map(|token| token.record.clone())
+            .or_else(|| {
+                state.workers[index]
+                    .enrollment_token_id
+                    .and_then(|token_id| find_worker_enrollment_token_record(state, token_id))
+            });
         if !state.workers[index].lifecycle_state.accepts_heartbeats() {
             return Err(anyhow!("worker {worker_id} has been revoked"));
         }
@@ -2698,16 +3561,37 @@ fn register_worker_in_state(
             enrollment_token.as_ref(),
         )?;
         let resolved_tags = merge_worker_tags(requested_tags, enrollment_token.as_ref());
+        let rebind_token_id = presented_token_index
+            .and_then(|token_index| state.worker_enrollment_tokens.get(token_index))
+            .map(|token| token.record.id)
+            .filter(|token_id| state.workers[index].enrollment_token_id != Some(*token_id));
+        if let Some(token_id) = rebind_token_id {
+            mark_worker_enrollment_token_used_in_state(state, token_id, worker_id, now)?;
+        }
 
         let existing = &mut state.workers[index];
         existing.display_name = display_name;
         existing.worker_pool = resolved_pool;
         existing.tags = resolved_tags;
+        existing.operating_system = operating_system;
+        existing.architecture = architecture;
+        existing.platform = platform;
+        if let Some(token_id) = rebind_token_id {
+            existing.enrollment_token_id = Some(token_id);
+        }
         existing.supports_runs = registration.supports_runs;
         existing.supports_port_scans = registration.supports_port_scans;
         existing.supports_bootstrap = registration.supports_bootstrap;
+        existing.supports_remote_updates = registration.supports_remote_updates;
+        existing.supports_remote_debug_commands = registration.supports_remote_debug_commands;
         existing.scanner_adapters = scanner_adapters;
         existing.provisioners = provisioners;
+        existing.local_ip_addresses = local_ip_addresses;
+        existing.public_ip_address = public_ip_address;
+        existing.public_ip_checked_at = public_ip_checked_at;
+        existing.remote_update_status = remote_update_status;
+        existing.remote_update_status_message = remote_update_status_message;
+        existing.remote_update_status_updated_at = remote_update_status_updated_at;
         existing.last_seen_at = now;
         existing.expires_at = expires_at;
         return Ok(existing.clone());
@@ -2731,12 +3615,24 @@ fn register_worker_in_state(
         display_name,
         worker_pool,
         tags,
+        operating_system,
+        architecture,
+        platform,
         supports_runs: registration.supports_runs,
         supports_port_scans: registration.supports_port_scans,
         supports_bootstrap: registration.supports_bootstrap,
+        supports_remote_updates: registration.supports_remote_updates,
+        supports_remote_debug_commands: registration.supports_remote_debug_commands,
         scanner_adapters,
         provisioners,
+        local_ip_addresses,
+        public_ip_address,
+        public_ip_checked_at,
+        remote_update_status,
+        remote_update_status_message,
+        remote_update_status_updated_at,
         lifecycle_state: WorkerLifecycleState::Active,
+        remote_update_requested_at: None,
         enrollment_token_id: Some(token_record.id),
         registered_at: now,
         last_seen_at: now,
@@ -2764,6 +3660,224 @@ fn update_worker_lifecycle_state_in_state(
         .ok_or_else(|| anyhow!("worker {worker_id} not found"))?;
     worker.lifecycle_state = lifecycle_state;
     Ok(worker.clone())
+}
+
+fn request_worker_remote_update_in_state(
+    state: &mut DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Result<WorkerRecord> {
+    let worker = state
+        .workers
+        .iter_mut()
+        .find(|worker| worker.worker_id == worker_id)
+        .ok_or_else(|| anyhow!("worker {worker_id} not found"))?;
+    if !worker.supports_remote_updates {
+        return Err(anyhow!(
+            "worker {worker_id} does not advertise remote-update support"
+        ));
+    }
+    if !worker.lifecycle_state.accepts_heartbeats() {
+        return Err(anyhow!("worker {worker_id} has been revoked"));
+    }
+    worker.remote_update_requested_at = Some(now);
+    Ok(worker.clone())
+}
+
+fn request_all_worker_remote_updates_in_state(
+    state: &mut DragonflyRuntimeState,
+    now: DateTime<Utc>,
+) -> Result<Vec<WorkerRecord>> {
+    let mut updated_workers = Vec::new();
+    for worker in &mut state.workers {
+        if !worker.supports_remote_updates {
+            continue;
+        }
+        if !worker.lifecycle_state.accepts_heartbeats() {
+            continue;
+        }
+        if worker.remote_update_requested_at.is_some() {
+            continue;
+        }
+        worker.remote_update_requested_at = Some(now);
+        updated_workers.push(worker.clone());
+    }
+    Ok(updated_workers)
+}
+
+fn acknowledge_worker_remote_update_in_state(
+    state: &mut DragonflyRuntimeState,
+    worker_id: &str,
+    requested_at: DateTime<Utc>,
+) -> Result<WorkerRecord> {
+    let worker = state
+        .workers
+        .iter_mut()
+        .find(|worker| worker.worker_id == worker_id)
+        .ok_or_else(|| anyhow!("worker {worker_id} not found"))?;
+    let pending_requested_at = worker
+        .remote_update_requested_at
+        .ok_or_else(|| anyhow!("worker {worker_id} has no pending remote update request"))?;
+    if pending_requested_at != requested_at {
+        return Err(anyhow!(
+            "worker {worker_id} remote update request changed before it was acknowledged"
+        ));
+    }
+    worker.remote_update_requested_at = None;
+    Ok(worker.clone())
+}
+
+fn sorted_worker_remote_commands(
+    mut commands: Vec<WorkerRemoteCommandRecord>,
+    worker_id: Option<&str>,
+    limit: usize,
+) -> Vec<WorkerRemoteCommandRecord> {
+    if let Some(worker_id) = worker_id {
+        commands.retain(|command| command.worker_id == worker_id);
+    }
+    commands.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then(right.id.cmp(&left.id))
+    });
+    commands.truncate(limit);
+    commands
+}
+
+fn queue_worker_remote_command_in_state(
+    state: &mut DragonflyRuntimeState,
+    worker_id: &str,
+    requested_by: Option<&str>,
+    request: &WorkerRemoteCommandRequest,
+    now: DateTime<Utc>,
+) -> Result<WorkerRemoteCommandRecord> {
+    let worker = state
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)
+        .ok_or_else(|| anyhow!("worker {worker_id} not found"))?;
+    if !worker.supports_remote_debug_commands {
+        return Err(anyhow!(
+            "worker {worker_id} does not advertise remote debug-command support"
+        ));
+    }
+    if !worker.lifecycle_state.accepts_heartbeats() {
+        return Err(anyhow!("worker {worker_id} has been revoked"));
+    }
+
+    let command = request.command.trim();
+    if command.is_empty() {
+        return Err(anyhow!("remote command is required"));
+    }
+
+    let timeout_seconds = request
+        .timeout_seconds
+        .unwrap_or(DEFAULT_WORKER_REMOTE_COMMAND_TIMEOUT_SECONDS)
+        .clamp(1, MAX_WORKER_REMOTE_COMMAND_TIMEOUT_SECONDS);
+
+    let record = WorkerRemoteCommandRecord {
+        id: state.next_worker_remote_command_id(),
+        worker_id: worker_id.to_string(),
+        requested_by: requested_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string()),
+        command: command.to_string(),
+        timeout_seconds,
+        status: WorkerRemoteCommandStatus::Queued,
+        claimed_by_worker_id: None,
+        started_at: None,
+        completed_at: None,
+        exit_code: None,
+        timed_out: false,
+        stdout: None,
+        stderr: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    state.worker_remote_commands.push(record.clone());
+    Ok(record)
+}
+
+fn claim_next_pending_worker_remote_command_in_state(
+    state: &mut DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<WorkerRemoteCommandRecord>> {
+    for command in &mut state.worker_remote_commands {
+        if command.worker_id != worker_id {
+            continue;
+        }
+        if command.status != WorkerRemoteCommandStatus::Running {
+            continue;
+        }
+        let stale_after = command.timeout_seconds.saturating_add(30) as i64;
+        if command
+            .started_at
+            .is_some_and(|started_at| started_at + ChronoDuration::seconds(stale_after) < now)
+        {
+            command.status = WorkerRemoteCommandStatus::Failed;
+            command.completed_at = Some(now);
+            command.updated_at = now;
+            command.claimed_by_worker_id = None;
+            command.error =
+                Some("remote command timed out waiting for worker completion".to_string());
+        }
+    }
+
+    let Some(command) = state.worker_remote_commands.iter_mut().find(|command| {
+        command.worker_id == worker_id && command.status == WorkerRemoteCommandStatus::Queued
+    }) else {
+        return Ok(None);
+    };
+
+    command.status = WorkerRemoteCommandStatus::Running;
+    command.claimed_by_worker_id = Some(worker_id.to_string());
+    command.started_at = Some(now);
+    command.updated_at = now;
+    Ok(Some(command.clone()))
+}
+
+fn complete_worker_remote_command_if_owned_in_state(
+    state: &mut DragonflyRuntimeState,
+    command_id: i64,
+    worker_id: &str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+    error: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<WorkerRemoteCommandRecord>> {
+    let Some(command) = state
+        .worker_remote_commands
+        .iter_mut()
+        .find(|command| command.id == command_id)
+    else {
+        return Ok(None);
+    };
+
+    if command.claimed_by_worker_id.as_deref() != Some(worker_id) {
+        return Ok(None);
+    }
+
+    let failed = timed_out || error.is_some() || exit_code.unwrap_or(0) != 0;
+    command.status = if failed {
+        WorkerRemoteCommandStatus::Failed
+    } else {
+        WorkerRemoteCommandStatus::Completed
+    };
+    command.exit_code = exit_code;
+    command.timed_out = timed_out;
+    command.stdout = normalize_optional_text(stdout.map(str::to_string));
+    command.stderr = normalize_optional_text(stderr.map(str::to_string));
+    command.error = normalize_optional_text(error.map(str::to_string));
+    command.completed_at = Some(now);
+    command.updated_at = now;
+    command.claimed_by_worker_id = None;
+    Ok(Some(command.clone()))
 }
 
 fn issue_worker_enrollment_token_in_state(
@@ -2825,6 +3939,104 @@ fn revoke_worker_enrollment_token_in_state(
     }
     token.token_value = None;
     Ok(token.record.clone())
+}
+
+fn issue_worker_bootstrap_code_in_state(
+    state: &mut DragonflyRuntimeState,
+    created_by: Option<&str>,
+    request: &WorkerBootstrapCodeIssueRequest,
+    now: DateTime<Utc>,
+) -> Result<WorkerBootstrapCodeIssued> {
+    let label = request.label.trim();
+    if label.is_empty() {
+        return Err(anyhow!("worker bootstrap code label is required"));
+    }
+    let worker_id = request.worker_id.trim();
+    if worker_id.is_empty() {
+        return Err(anyhow!("worker bootstrap code worker_id is required"));
+    }
+
+    let code_id = state.next_worker_bootstrap_code_id();
+    let code = generate_worker_bootstrap_code(code_id, label, worker_id, now)?;
+    let record = WorkerBootstrapCodeRecord {
+        id: code_id,
+        label: label.to_string(),
+        worker_id: worker_id.to_string(),
+        worker_name: request
+            .worker_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string()),
+        worker_pool: normalize_worker_pool_name(request.worker_pool.as_deref()),
+        tags: normalize_worker_values(&request.tags),
+        allow_runs: request.allow_runs,
+        allow_port_scans: request.allow_port_scans,
+        allow_bootstrap: request.allow_bootstrap,
+        created_by: created_by
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string()),
+        created_at: now,
+        expires_at: optional_expires_at(now, request.expires_in_seconds)?,
+        consumed_at: None,
+        consumed_by_worker_id: None,
+    };
+    state
+        .worker_bootstrap_codes
+        .push(StoredWorkerBootstrapCode {
+            record: record.clone(),
+            code_hash: hash_worker_enrollment_token(&code),
+        });
+    state
+        .worker_bootstrap_codes
+        .sort_by(|left, right| left.record.id.cmp(&right.record.id));
+    Ok(WorkerBootstrapCodeIssued { record, code })
+}
+
+fn exchange_worker_bootstrap_code_in_state(
+    state: &mut DragonflyRuntimeState,
+    code: &str,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Result<WorkerBootstrapCodeExchange> {
+    let code = code.trim();
+    let worker_id = worker_id.trim();
+    if code.is_empty() {
+        return Err(anyhow!("worker bootstrap code is required"));
+    }
+    if worker_id.is_empty() {
+        return Err(anyhow!("worker_id is required"));
+    }
+
+    let code_index = find_usable_worker_bootstrap_code_index(state, code, worker_id, now)
+        .ok_or_else(|| anyhow!("invalid, expired, or already-consumed worker bootstrap code"))?;
+    let snapshot = state.worker_bootstrap_codes[code_index].record.clone();
+    let token_request = WorkerEnrollmentTokenIssueRequest {
+        label: format!("worker:{}", snapshot.worker_id),
+        worker_pool: snapshot.worker_pool.clone(),
+        tags: snapshot.tags.clone(),
+        allow_runs: snapshot.allow_runs,
+        allow_port_scans: snapshot.allow_port_scans,
+        allow_bootstrap: snapshot.allow_bootstrap,
+        single_use: false,
+        expires_in_seconds: None,
+    };
+    let issued = issue_worker_enrollment_token_in_state(
+        state,
+        snapshot.created_by.as_deref(),
+        &token_request,
+        now,
+    )?;
+
+    let stored = &mut state.worker_bootstrap_codes[code_index];
+    stored.record.consumed_at = Some(now);
+    stored.record.consumed_by_worker_id = Some(worker_id.to_string());
+
+    Ok(WorkerBootstrapCodeExchange {
+        bootstrap_code: stored.record.clone(),
+        token: issued,
+    })
 }
 
 fn create_bootstrap_candidates_in_state(
@@ -3361,7 +4573,7 @@ fn claim_next_pending_port_scan_in_state(
             ) && !port_scan_claim_is_active(record, now)
                 && port_scan_matches_worker_pool(&record.port_scan, worker_pool.as_deref())
         })
-        .min_by_key(|record| record.port_scan.id)
+        .min_by_key(|record| port_scan_claim_priority(&record.port_scan, worker_pool.as_deref()))
     else {
         return Ok(None);
     };
@@ -3410,6 +4622,23 @@ fn port_scan_matches_worker_pool(port_scan: &PortScanRecord, worker_pool: Option
         Some(required_pool) => worker_pool.is_some_and(|pool| pool == required_pool),
         None => true,
     }
+}
+
+fn port_scan_claim_priority(
+    port_scan: &PortScanRecord,
+    worker_pool: Option<&str>,
+) -> (u8, u8, i64) {
+    let pool_priority = match (port_scan.worker_pool.as_deref(), worker_pool) {
+        (Some(required_pool), Some(pool)) if required_pool == pool => 0u8,
+        (None, _) => 1u8,
+        _ => 2u8,
+    };
+    let status_priority = match port_scan.status {
+        RunStatus::Queued => 0u8,
+        RunStatus::InProgress => 1u8,
+        _ => 2u8,
+    };
+    (pool_priority, status_priority, port_scan.id)
 }
 
 fn validate_worker_registration_capabilities(
@@ -3528,6 +4757,27 @@ fn generate_worker_enrollment_token(
     Ok(format!("ewt_{}_{:x}", token_id, hasher.finalize()))
 }
 
+fn generate_worker_bootstrap_code(
+    code_id: i64,
+    label: &str,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Result<String> {
+    let mut random = [0u8; 32];
+    fs::File::open("/dev/urandom")
+        .context("failed to open /dev/urandom for worker bootstrap code generation")?
+        .read_exact(&mut random)
+        .context("failed to read /dev/urandom for worker bootstrap code generation")?;
+    let mut hasher = Sha256::new();
+    hasher.update(random);
+    hasher.update(code_id.to_le_bytes());
+    hasher.update(label.as_bytes());
+    hasher.update(worker_id.as_bytes());
+    hasher.update(now.timestamp().to_le_bytes());
+    hasher.update(now.timestamp_subsec_nanos().to_le_bytes());
+    Ok(format!("wbc_{}_{:x}", code_id, hasher.finalize()))
+}
+
 fn hash_worker_enrollment_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
@@ -3542,6 +4792,20 @@ fn find_usable_worker_enrollment_token_index(
     let token_hash = hash_worker_enrollment_token(token);
     state.worker_enrollment_tokens.iter().position(|stored| {
         worker_enrollment_token_is_usable(&stored.record, &stored.token_hash, &token_hash, now)
+    })
+}
+
+fn find_usable_worker_bootstrap_code_index(
+    state: &DragonflyRuntimeState,
+    code: &str,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Option<usize> {
+    let code_hash = hash_worker_enrollment_token(code);
+    state.worker_bootstrap_codes.iter().position(|stored| {
+        stored.code_hash == code_hash
+            && stored.record.worker_id == worker_id
+            && worker_bootstrap_code_is_usable(&stored.record, now)
     })
 }
 
@@ -3564,6 +4828,19 @@ fn worker_enrollment_token_is_usable(
         return false;
     }
     if record.single_use && record.used_by_worker_id.is_some() {
+        return false;
+    }
+    true
+}
+
+fn worker_bootstrap_code_is_usable(record: &WorkerBootstrapCodeRecord, now: DateTime<Utc>) -> bool {
+    if record.consumed_at.is_some() {
+        return false;
+    }
+    if record
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
         return false;
     }
     true
@@ -3789,6 +5066,10 @@ fn build_finding_record(
         redacted_value: finding.redacted_value.clone(),
         evidence: finding.evidence.clone(),
         fingerprint: finding.fingerprint.clone(),
+        confidence: finding.confidence,
+        matched_signals: finding.matched_signals.clone(),
+        review_labels: finding.review_labels.clone(),
+        plugin_metadata: finding.plugin_metadata.clone(),
         discovered_at: utc_now(),
     })
 }
@@ -3816,7 +5097,11 @@ fn titleize_detector_name(detector: &str) -> String {
 
 fn default_public_finding_summary(finding: &FindingRecord) -> String {
     let severity = titleize_detector_name(finding.severity.as_str());
-    let detector = titleize_detector_name(&finding.detector);
+    let detector = finding
+        .plugin_metadata
+        .as_ref()
+        .map(|metadata| metadata.plugin_display_name.clone())
+        .unwrap_or_else(|| titleize_detector_name(&finding.detector));
     format!(
         "{severity} {detector} exposure observed at {}{}",
         finding.target_base_url, finding.path
@@ -3869,6 +5154,7 @@ fn upsert_public_finding_moderation_in_state(
         existing.severity = finding.severity.clone();
         existing.target_base_url = finding.target_base_url.clone();
         existing.path = finding.path.clone();
+        existing.plugin_metadata = finding.plugin_metadata.clone();
         existing.observed_at = finding.discovered_at;
         existing.public_summary = public_summary;
         existing.status = request.status;
@@ -3889,6 +5175,7 @@ fn upsert_public_finding_moderation_in_state(
         target_base_url: finding.target_base_url,
         path: finding.path,
         public_summary,
+        plugin_metadata: finding.plugin_metadata,
         status: request.status,
         reviewed_by,
         reviewer_notes,
@@ -4408,6 +5695,1036 @@ fn stored_event_from_stream_entry(entry: redis::streams::StreamId) -> Result<Sto
     })
 }
 
+fn parse_info_used_memory_bytes(info: &str) -> Option<u64> {
+    info.lines().find_map(|line| {
+        line.strip_prefix("used_memory:")
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
+fn scan_namespace_keys(connection: &mut redis::Connection, pattern: &str) -> Result<Vec<String>> {
+    connection
+        .keys(pattern)
+        .with_context(|| format!("failed to enumerate Dragonfly namespace keys for {pattern}"))
+}
+
+fn archive_cutoff(now: DateTime<Utc>, hot_retention_days: u64) -> DateTime<Utc> {
+    now - ChronoDuration::days(hot_retention_days.min(i64::MAX as u64) as i64)
+}
+
+fn is_terminal_run_status(status: &RunStatus) -> bool {
+    matches!(status, RunStatus::Completed | RunStatus::Failed)
+}
+
+fn is_terminal_job_status(status: &JobStatus) -> bool {
+    matches!(status, JobStatus::Completed | JobStatus::Failed)
+}
+
+fn is_terminal_bootstrap_job_status(status: &WorkerBootstrapJobStatus) -> bool {
+    matches!(
+        status,
+        WorkerBootstrapJobStatus::Completed | WorkerBootstrapJobStatus::Failed
+    )
+}
+
+fn is_terminal_public_workflow_status(status: &PublicWorkflowStatus) -> bool {
+    matches!(
+        status,
+        PublicWorkflowStatus::Completed | PublicWorkflowStatus::Rejected
+    )
+}
+
+fn effective_run_timestamp(run: &StoredRun) -> Option<DateTime<Utc>> {
+    run.run.completed_at.or(Some(run.run.started_at))
+}
+
+fn job_terminal_timestamp(job: &ScanJobRecord) -> Option<DateTime<Utc>> {
+    job.completed_at.or(job.started_at)
+}
+
+fn effective_port_scan_timestamp(port_scan: &StoredPortScan) -> Option<DateTime<Utc>> {
+    port_scan
+        .port_scan
+        .completed_at
+        .or(Some(port_scan.port_scan.started_at))
+}
+
+fn effective_bootstrap_job_timestamp(job: &WorkerBootstrapJobRecord) -> Option<DateTime<Utc>> {
+    job.completed_at.or(Some(job.updated_at))
+}
+
+fn effective_ownership_claim_timestamp(record: &OwnershipClaimRecord) -> Option<DateTime<Utc>> {
+    Some(record.updated_at)
+}
+
+fn effective_opt_out_timestamp(record: &OptOutRecord) -> Option<DateTime<Utc>> {
+    record.completed_at.or(Some(record.updated_at))
+}
+
+fn effective_abuse_report_timestamp(record: &AbuseReportRecord) -> Option<DateTime<Utc>> {
+    record.resolved_at.or(Some(record.updated_at))
+}
+
+fn effective_worker_enrollment_token_timestamp(
+    token: &StoredWorkerEnrollmentToken,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    token
+        .record
+        .revoked_at
+        .or_else(|| {
+            token.record.expires_at.and_then(|expires_at| {
+                if expires_at <= now {
+                    Some(expires_at)
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| {
+            if token.record.single_use {
+                token.record.used_at
+            } else {
+                None
+            }
+        })
+}
+
+fn terminal_run_ids(state: &DragonflyRuntimeState) -> HashSet<i64> {
+    state
+        .runs
+        .iter()
+        .filter(|run| is_terminal_run_status(&run.run.status))
+        .map(|run| run.run.id)
+        .collect()
+}
+
+fn active_run_ids(state: &DragonflyRuntimeState) -> HashSet<i64> {
+    state
+        .runs
+        .iter()
+        .filter(|run| !is_terminal_run_status(&run.run.status))
+        .map(|run| run.run.id)
+        .collect()
+}
+
+fn select_records_for_archive<T: Clone, FTs, FId, FArchive>(
+    items: &[T],
+    cutoff: DateTime<Utc>,
+    preserve_count: usize,
+    max_records: usize,
+    timestamp: FTs,
+    id: FId,
+    is_archivable: FArchive,
+) -> Vec<T>
+where
+    FTs: Fn(&T) -> Option<DateTime<Utc>>,
+    FId: Fn(&T) -> i64,
+    FArchive: Fn(&T) -> bool,
+{
+    let mut newest_archivable = items
+        .iter()
+        .filter_map(|item| {
+            if !is_archivable(item) {
+                return None;
+            }
+            timestamp(item).map(|ts| (ts, id(item)))
+        })
+        .collect::<Vec<_>>();
+    newest_archivable.sort_by(|(left_ts, left_id), (right_ts, right_id)| {
+        right_ts.cmp(left_ts).then(right_id.cmp(left_id))
+    });
+    let keep_ids = newest_archivable
+        .into_iter()
+        .take(preserve_count)
+        .map(|(_, item_id)| item_id)
+        .collect::<HashSet<_>>();
+
+    let mut selected = items
+        .iter()
+        .filter_map(|item| {
+            if !is_archivable(item) {
+                return None;
+            }
+            let item_id = id(item);
+            let item_timestamp = timestamp(item)?;
+            if item_timestamp >= cutoff || keep_ids.contains(&item_id) {
+                return None;
+            }
+            Some((item_timestamp, item_id, item.clone()))
+        })
+        .collect::<Vec<_>>();
+    selected.sort_by(|(left_ts, left_id, _), (right_ts, right_id, _)| {
+        left_ts.cmp(right_ts).then(left_id.cmp(right_id))
+    });
+    if max_records > 0 {
+        selected.truncate(max_records);
+    }
+    selected
+        .into_iter()
+        .map(|(_, _, item)| item)
+        .collect::<Vec<_>>()
+}
+
+fn build_archive_payload_from_items<T, FId, FTs, FValue>(
+    kind: ArchiveRecordKind,
+    namespace: &str,
+    items: Vec<T>,
+    id: FId,
+    timestamp: FTs,
+    to_value: FValue,
+) -> Result<Option<PreparedArchivePayload>>
+where
+    FId: Fn(&T) -> Option<i64>,
+    FTs: Fn(&T) -> Option<DateTime<Utc>>,
+    FValue: Fn(&T) -> Result<serde_json::Value>,
+{
+    if items.is_empty() {
+        return Ok(None);
+    }
+
+    let mut records = Vec::with_capacity(items.len());
+    let mut min_record_id = None;
+    let mut max_record_id = None;
+    let mut min_timestamp = None;
+    let mut max_timestamp = None;
+
+    for item in &items {
+        if let Some(record_id) = id(item) {
+            min_record_id =
+                Some(min_record_id.map_or(record_id, |value: i64| value.min(record_id)));
+            max_record_id =
+                Some(max_record_id.map_or(record_id, |value: i64| value.max(record_id)));
+        }
+        if let Some(record_timestamp) = timestamp(item) {
+            min_timestamp = Some(
+                min_timestamp.map_or(record_timestamp, |value: DateTime<Utc>| {
+                    value.min(record_timestamp)
+                }),
+            );
+            max_timestamp = Some(
+                max_timestamp.map_or(record_timestamp, |value: DateTime<Utc>| {
+                    value.max(record_timestamp)
+                }),
+            );
+        }
+        records.push(to_value(item)?);
+    }
+
+    Ok(Some(PreparedArchivePayload {
+        kind,
+        namespace: namespace.to_string(),
+        records,
+        min_record_id,
+        max_record_id,
+        min_timestamp,
+        max_timestamp,
+    }))
+}
+
+fn prepare_runs_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.runs,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_run_timestamp,
+        |run| run.run.id,
+        |run| is_terminal_run_status(&run.run.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::Runs,
+        namespace,
+        selected,
+        |run| Some(run.run.id),
+        effective_run_timestamp,
+        |run| serde_json::to_value(run).context("failed to serialize archived run"),
+    )
+}
+
+fn prepare_jobs_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let terminal_runs = terminal_run_ids(state);
+    let selected = select_records_for_archive(
+        &state.jobs,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        job_terminal_timestamp,
+        |job| job.id,
+        |job| is_terminal_job_status(&job.status) && terminal_runs.contains(&job.run_id),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::Jobs,
+        namespace,
+        selected,
+        |job| Some(job.id),
+        job_terminal_timestamp,
+        |job| serde_json::to_value(job).context("failed to serialize archived job"),
+    )
+}
+
+fn prepare_findings_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let terminal_runs = terminal_run_ids(state);
+    let selected = select_records_for_archive(
+        &state.findings,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        |finding| Some(finding.discovered_at),
+        |finding| finding.id,
+        |finding| terminal_runs.contains(&finding.run_id),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::Findings,
+        namespace,
+        selected,
+        |finding| Some(finding.id),
+        |finding| Some(finding.discovered_at),
+        |finding| serde_json::to_value(finding).context("failed to serialize archived finding"),
+    )
+}
+
+fn prepare_port_scans_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.port_scans,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_port_scan_timestamp,
+        |record| record.port_scan.id,
+        |record| is_terminal_run_status(&record.port_scan.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::PortScans,
+        namespace,
+        selected,
+        |record| Some(record.port_scan.id),
+        effective_port_scan_timestamp,
+        |record| serde_json::to_value(record).context("failed to serialize archived port scan"),
+    )
+}
+
+fn prepare_worker_enrollment_tokens_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let now = utc_now();
+    let selected = select_records_for_archive(
+        &state.worker_enrollment_tokens,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        |token| effective_worker_enrollment_token_timestamp(token, now),
+        |token| token.record.id,
+        |token| effective_worker_enrollment_token_timestamp(token, now).is_some(),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::WorkerEnrollmentTokens,
+        namespace,
+        selected,
+        |token| Some(token.record.id),
+        |token| effective_worker_enrollment_token_timestamp(token, now),
+        |token| {
+            serde_json::to_value(ArchivedWorkerEnrollmentToken {
+                record: token.record.clone(),
+                token_hash: token.token_hash.clone(),
+            })
+            .context("failed to serialize archived worker enrollment token")
+        },
+    )
+}
+
+fn prepare_bootstrap_jobs_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.bootstrap_jobs,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_bootstrap_job_timestamp,
+        |job| job.id,
+        |job| is_terminal_bootstrap_job_status(&job.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::BootstrapJobs,
+        namespace,
+        selected,
+        |job| Some(job.id),
+        effective_bootstrap_job_timestamp,
+        |job| serde_json::to_value(job).context("failed to serialize archived bootstrap job"),
+    )
+}
+
+fn prepare_ownership_claims_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.ownership_claims,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_ownership_claim_timestamp,
+        |record| record.id,
+        |record| is_terminal_public_workflow_status(&record.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::OwnershipClaims,
+        namespace,
+        selected,
+        |record| Some(record.id),
+        effective_ownership_claim_timestamp,
+        |record| {
+            serde_json::to_value(record).context("failed to serialize archived ownership claim")
+        },
+    )
+}
+
+fn prepare_opt_outs_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.opt_out_requests,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_opt_out_timestamp,
+        |record| record.id,
+        |record| is_terminal_public_workflow_status(&record.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::OptOutRequests,
+        namespace,
+        selected,
+        |record| Some(record.id),
+        effective_opt_out_timestamp,
+        |record| {
+            serde_json::to_value(record).context("failed to serialize archived opt-out record")
+        },
+    )
+}
+
+fn prepare_abuse_reports_archive_payload(
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let selected = select_records_for_archive(
+        &state.abuse_reports,
+        cutoff,
+        ALWAYS_HOT_RECOVERY_RECORDS_PER_KIND,
+        max_records,
+        effective_abuse_report_timestamp,
+        |record| record.id,
+        |record| is_terminal_public_workflow_status(&record.status),
+    );
+    build_archive_payload_from_items(
+        ArchiveRecordKind::AbuseReports,
+        namespace,
+        selected,
+        |record| Some(record.id),
+        effective_abuse_report_timestamp,
+        |record| serde_json::to_value(record).context("failed to serialize archived abuse report"),
+    )
+}
+
+fn prepare_events_archive_payload(
+    connection: &mut redis::Connection,
+    state: &DragonflyRuntimeState,
+    namespace: &str,
+    events_key: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+) -> Result<Option<PreparedArchivePayload>> {
+    let active_runs = active_run_ids(state);
+    let selected = load_archiveable_events_from_stream(
+        connection,
+        events_key,
+        cutoff,
+        max_records,
+        &active_runs,
+    )?;
+    build_archive_payload_from_items(
+        ArchiveRecordKind::Events,
+        namespace,
+        selected,
+        |event| Some(event.id),
+        |event| Some(event.created_at),
+        |event| serde_json::to_value(event).context("failed to serialize archived event"),
+    )
+}
+
+fn load_archiveable_events_from_stream(
+    connection: &mut redis::Connection,
+    events_key: &str,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+    active_run_ids: &HashSet<i64>,
+) -> Result<Vec<StoredEvent>> {
+    if max_records == 0 {
+        return Ok(Vec::new());
+    }
+
+    let keep_events: StreamRangeReply = redis::cmd("XREVRANGE")
+        .arg(events_key)
+        .arg("+")
+        .arg("-")
+        .arg("COUNT")
+        .arg(ALWAYS_HOT_EVENT_RECORDS)
+        .query(connection)
+        .context("failed to read Dragonfly event stream tail for archive planning")?;
+    let keep_ids = keep_events
+        .ids
+        .into_iter()
+        .map(|entry| parse_stream_event_id(&entry.id))
+        .collect::<Result<HashSet<_>>>()?;
+
+    let mut selected = Vec::new();
+    let mut cursor = "-".to_string();
+    let batch_size = 256usize;
+
+    loop {
+        let batch: StreamRangeReply = redis::cmd("XRANGE")
+            .arg(events_key)
+            .arg(&cursor)
+            .arg("+")
+            .arg("COUNT")
+            .arg(batch_size)
+            .query(connection)
+            .context("failed to read Dragonfly event stream batch for archive planning")?;
+        if batch.ids.is_empty() {
+            break;
+        }
+
+        let mut next_cursor = None;
+        let batch_len = batch.ids.len();
+        for entry in batch.ids {
+            let stored = stored_event_from_stream_entry(entry)?;
+            next_cursor = Some(stream_entry_id(stored.id.saturating_add(1)));
+            if keep_ids.contains(&stored.id) {
+                continue;
+            }
+            if stored
+                .run_id
+                .is_some_and(|run_id| active_run_ids.contains(&run_id))
+            {
+                continue;
+            }
+            if stored.created_at >= cutoff {
+                return Ok(selected);
+            }
+            selected.push(stored);
+            if selected.len() >= max_records {
+                return Ok(selected);
+            }
+        }
+
+        let Some(next_cursor) = next_cursor else {
+            break;
+        };
+        if next_cursor == cursor || batch_len < batch_size {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    Ok(selected)
+}
+
+fn prepare_bootstrap_artifact_archive_payloads(
+    namespace: &str,
+    directory: &Path,
+    cutoff: DateTime<Utc>,
+    max_records: usize,
+    pointers: &[ArchivePointerRecord],
+) -> Result<Vec<PreparedArchivePayload>> {
+    if max_records == 0 || !directory.exists() {
+        return Ok(Vec::new());
+    }
+
+    let archived_paths = pointers
+        .iter()
+        .filter(|pointer| pointer.kind == ArchiveRecordKind::BootstrapArtifacts)
+        .filter_map(|pointer| pointer.local_artifact_path.clone())
+        .collect::<HashSet<_>>();
+
+    let mut files = fs::read_dir(directory)
+        .with_context(|| {
+            format!(
+                "failed to read bootstrap artifact directory {}",
+                directory.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = entry.metadata().ok()?;
+            if !metadata.is_file() {
+                return None;
+            }
+            let modified = metadata.modified().ok()?;
+            let modified_at = DateTime::<Utc>::from(modified);
+            Some((path, modified_at, metadata.len()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|(left_path, left_ts, _), (right_path, right_ts, _)| {
+        right_ts.cmp(left_ts).then(right_path.cmp(left_path))
+    });
+
+    let keep_paths = files
+        .iter()
+        .take(ALWAYS_HOT_BOOTSTRAP_ARTIFACTS)
+        .map(|(path, _, _)| path.to_string_lossy().into_owned())
+        .collect::<HashSet<_>>();
+
+    let mut payloads = Vec::new();
+    for (path, modified_at, size_bytes) in files {
+        let path_string = path.to_string_lossy().into_owned();
+        if modified_at >= cutoff
+            || keep_paths.contains(&path_string)
+            || archived_paths.contains(&path_string)
+        {
+            continue;
+        }
+
+        let contents = fs::read(&path)
+            .with_context(|| format!("failed to read bootstrap artifact {}", path.display()))?;
+        let record = ArchivedBootstrapArtifactRecord {
+            local_artifact_path: path_string,
+            file_name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "artifact".to_string()),
+            modified_at,
+            size_bytes,
+            contents_b64: base64::engine::general_purpose::STANDARD.encode(contents),
+        };
+        if let Some(payload) = build_archive_payload_from_items(
+            ArchiveRecordKind::BootstrapArtifacts,
+            namespace,
+            vec![record],
+            |_| None,
+            |record| Some(record.modified_at),
+            |record| {
+                serde_json::to_value(record)
+                    .context("failed to serialize archived bootstrap artifact")
+            },
+        )? {
+            payloads.push(payload);
+        }
+        if payloads.len() >= max_records {
+            break;
+        }
+    }
+
+    Ok(payloads)
+}
+
+fn add_archive_pointer_to_state(
+    state: &mut DragonflyRuntimeState,
+    payload: &PreparedArchivePayload,
+    archived: &ArchivedObject,
+) -> ArchivePointerRecord {
+    let local_artifact_path = extract_local_artifact_paths(payload)
+        .ok()
+        .and_then(|mut paths| paths.drain(..).next());
+    let pointer = ArchivePointerRecord {
+        id: state.next_archive_pointer_id(),
+        kind: payload.kind,
+        manifest_object_key: archived.manifest_object_key.clone(),
+        data_object_key: archived.data_object_key.clone(),
+        object_prefix: Some(archived.manifest.object_prefix.clone()),
+        source_namespace: Some(payload.namespace.clone()),
+        local_artifact_path,
+        record_count: payload.records.len(),
+        min_record_id: payload.min_record_id,
+        max_record_id: payload.max_record_id,
+        min_timestamp: payload.min_timestamp,
+        max_timestamp: payload.max_timestamp,
+        size_bytes: archived.manifest.size_bytes,
+        archived_at: archived.manifest.created_at,
+    };
+    state.archive_pointers.push(pointer.clone());
+    state.archive_pointers.sort_by(|left, right| {
+        right
+            .archived_at
+            .cmp(&left.archived_at)
+            .then(right.id.cmp(&left.id))
+    });
+    pointer
+}
+
+fn prune_archived_payload_from_state(
+    state: &mut DragonflyRuntimeState,
+    payload: &PreparedArchivePayload,
+) -> Result<()> {
+    match payload.kind {
+        ArchiveRecordKind::Runs => {
+            let ids = archive_record_ids(payload, |record: &StoredRun| record.run.id)?;
+            state.runs.retain(|record| !ids.contains(&record.run.id));
+        }
+        ArchiveRecordKind::Jobs => {
+            let ids = archive_record_ids(payload, |record: &ScanJobRecord| record.id)?;
+            state.jobs.retain(|record| !ids.contains(&record.id));
+            state.job_claims.retain(|job_id, _| !ids.contains(job_id));
+        }
+        ArchiveRecordKind::Findings => {
+            let ids = archive_record_ids(payload, |record: &FindingRecord| record.id)?;
+            state.findings.retain(|record| !ids.contains(&record.id));
+        }
+        ArchiveRecordKind::Events => {
+            let ids = archive_record_ids(payload, |record: &StoredEvent| record.id)?;
+            state.events.retain(|record| !ids.contains(&record.id));
+        }
+        ArchiveRecordKind::PortScans => {
+            let ids = archive_record_ids(payload, |record: &StoredPortScan| record.port_scan.id)?;
+            state
+                .port_scans
+                .retain(|record| !ids.contains(&record.port_scan.id));
+        }
+        ArchiveRecordKind::WorkerEnrollmentTokens => {
+            let ids = archive_record_ids(payload, |record: &ArchivedWorkerEnrollmentToken| {
+                record.record.id
+            })?;
+            state
+                .worker_enrollment_tokens
+                .retain(|record| !ids.contains(&record.record.id));
+        }
+        ArchiveRecordKind::BootstrapJobs => {
+            let ids = archive_record_ids(payload, |record: &WorkerBootstrapJobRecord| record.id)?;
+            state
+                .bootstrap_jobs
+                .retain(|record| !ids.contains(&record.id));
+            state
+                .bootstrap_job_claims
+                .retain(|job_id, _| !ids.contains(job_id));
+        }
+        ArchiveRecordKind::OwnershipClaims => {
+            let ids = archive_record_ids(payload, |record: &OwnershipClaimRecord| record.id)?;
+            state
+                .ownership_claims
+                .retain(|record| !ids.contains(&record.id));
+        }
+        ArchiveRecordKind::OptOutRequests => {
+            let ids = archive_record_ids(payload, |record: &OptOutRecord| record.id)?;
+            state
+                .opt_out_requests
+                .retain(|record| !ids.contains(&record.id));
+        }
+        ArchiveRecordKind::AbuseReports => {
+            let ids = archive_record_ids(payload, |record: &AbuseReportRecord| record.id)?;
+            state
+                .abuse_reports
+                .retain(|record| !ids.contains(&record.id));
+        }
+        ArchiveRecordKind::BootstrapArtifacts => {}
+    }
+    Ok(())
+}
+
+fn archive_record_ids<T, F>(payload: &PreparedArchivePayload, id: F) -> Result<HashSet<i64>>
+where
+    T: for<'de> Deserialize<'de>,
+    F: Fn(&T) -> i64,
+{
+    payload
+        .records
+        .iter()
+        .map(|value| {
+            let record = serde_json::from_value::<T>(value.clone())
+                .context("failed to decode archived payload record id")?;
+            Ok(id(&record))
+        })
+        .collect()
+}
+
+fn extract_local_artifact_paths(payload: &PreparedArchivePayload) -> Result<Vec<String>> {
+    if payload.kind != ArchiveRecordKind::BootstrapArtifacts {
+        return Ok(Vec::new());
+    }
+    payload
+        .records
+        .iter()
+        .map(|value| {
+            let record = serde_json::from_value::<ArchivedBootstrapArtifactRecord>(value.clone())
+                .context("failed to decode archived bootstrap artifact record")?;
+            Ok(record.local_artifact_path)
+        })
+        .collect()
+}
+
+fn prune_archived_events_from_stream(
+    connection: &mut redis::Connection,
+    events_key: &str,
+    payload: &PreparedArchivePayload,
+) -> Result<()> {
+    if payload.kind != ArchiveRecordKind::Events {
+        return Ok(());
+    }
+    let ids = archive_record_ids(payload, |record: &StoredEvent| record.id)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    for chunk in ids.chunks(128) {
+        let mut command = redis::cmd("XDEL");
+        command.arg(events_key);
+        for event_id in chunk {
+            command.arg(stream_entry_id(*event_id));
+        }
+        command
+            .query::<i64>(connection)
+            .context("failed to prune archived Dragonfly events from the stream")?;
+    }
+    Ok(())
+}
+
+fn remove_archived_local_artifacts(payload: &PreparedArchivePayload) -> Result<()> {
+    if payload.kind != ArchiveRecordKind::BootstrapArtifacts {
+        return Ok(());
+    }
+    for path in extract_local_artifact_paths(payload)? {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove archived bootstrap artifact {path}")
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_archive_records_into_state(
+    store: &DragonflyAnyScanStore,
+    connection: &mut redis::Connection,
+    state: &mut DragonflyRuntimeState,
+    kind: ArchiveRecordKind,
+    records: &[serde_json::Value],
+) -> Result<usize> {
+    let mut restored = 0usize;
+
+    match kind {
+        ArchiveRecordKind::Runs => {
+            for value in records {
+                let mut record = serde_json::from_value::<StoredRun>(value.clone())
+                    .context("failed to decode archived run record")?;
+                if state
+                    .runs
+                    .iter()
+                    .any(|existing| existing.run.id == record.run.id)
+                {
+                    continue;
+                }
+                clear_run_claim(&mut record);
+                state.runs.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::Jobs => {
+            for value in records {
+                let record = serde_json::from_value::<ScanJobRecord>(value.clone())
+                    .context("failed to decode archived job record")?;
+                if state.jobs.iter().any(|existing| existing.id == record.id) {
+                    continue;
+                }
+                state.jobs.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::Findings => {
+            for value in records {
+                let record = serde_json::from_value::<FindingRecord>(value.clone())
+                    .context("failed to decode archived finding record")?;
+                if state
+                    .findings
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    continue;
+                }
+                state.findings.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::Events => {
+            for value in records {
+                let record = serde_json::from_value::<StoredEvent>(value.clone())
+                    .context("failed to decode archived event record")?;
+                store.append_event_to_stream(
+                    connection,
+                    record.run_id,
+                    &record.payload,
+                    record.created_at,
+                )?;
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::PortScans => {
+            for value in records {
+                let mut record = serde_json::from_value::<StoredPortScan>(value.clone())
+                    .context("failed to decode archived port scan record")?;
+                if state
+                    .port_scans
+                    .iter()
+                    .any(|existing| existing.port_scan.id == record.port_scan.id)
+                {
+                    continue;
+                }
+                clear_port_scan_claim(&mut record);
+                state.port_scans.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::WorkerEnrollmentTokens => {
+            for value in records {
+                let record = serde_json::from_value::<ArchivedWorkerEnrollmentToken>(value.clone())
+                    .context("failed to decode archived worker enrollment token")?;
+                if state
+                    .worker_enrollment_tokens
+                    .iter()
+                    .any(|existing| existing.record.id == record.record.id)
+                {
+                    continue;
+                }
+                state
+                    .worker_enrollment_tokens
+                    .push(StoredWorkerEnrollmentToken {
+                        record: record.record,
+                        token_hash: record.token_hash,
+                        token_value: None,
+                    });
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::BootstrapJobs => {
+            for value in records {
+                let record = serde_json::from_value::<WorkerBootstrapJobRecord>(value.clone())
+                    .context("failed to decode archived bootstrap job record")?;
+                if state
+                    .bootstrap_jobs
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    continue;
+                }
+                state.bootstrap_jobs.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::OwnershipClaims => {
+            for value in records {
+                let record = serde_json::from_value::<OwnershipClaimRecord>(value.clone())
+                    .context("failed to decode archived ownership claim record")?;
+                if state
+                    .ownership_claims
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    continue;
+                }
+                state.ownership_claims.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::OptOutRequests => {
+            for value in records {
+                let record = serde_json::from_value::<OptOutRecord>(value.clone())
+                    .context("failed to decode archived opt-out record")?;
+                if state
+                    .opt_out_requests
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    continue;
+                }
+                state.opt_out_requests.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::AbuseReports => {
+            for value in records {
+                let record = serde_json::from_value::<AbuseReportRecord>(value.clone())
+                    .context("failed to decode archived abuse report record")?;
+                if state
+                    .abuse_reports
+                    .iter()
+                    .any(|existing| existing.id == record.id)
+                {
+                    continue;
+                }
+                state.abuse_reports.push(record);
+                restored += 1;
+            }
+        }
+        ArchiveRecordKind::BootstrapArtifacts => {
+            for value in records {
+                let record =
+                    serde_json::from_value::<ArchivedBootstrapArtifactRecord>(value.clone())
+                        .context("failed to decode archived bootstrap artifact record")?;
+                let path = PathBuf::from(&record.local_artifact_path);
+                if path.exists() {
+                    continue;
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!(
+                            "failed to create bootstrap artifact directory {}",
+                            parent.display()
+                        )
+                    })?;
+                }
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(record.contents_b64)
+                    .context("failed to decode archived bootstrap artifact contents")?;
+                fs::write(&path, bytes).with_context(|| {
+                    format!("failed to restore bootstrap artifact {}", path.display())
+                })?;
+                restored += 1;
+            }
+        }
+    }
+
+    state.repair_counters();
+    Ok(restored)
+}
+
 fn is_stream_id_conflict_error(error: &anyhow::Error) -> bool {
     error.to_string().contains("equal or smaller")
 }
@@ -4495,6 +6812,7 @@ fn create_run(
     schedule_id: Option<i64>,
     requested_by: Option<String>,
     scope: Option<RunScope>,
+    active_authorized_plugins: ActiveAuthorizedPluginExecution,
     targets: &[TargetRecord],
     now: DateTime<Utc>,
 ) -> ScanRunRecord {
@@ -4502,6 +6820,7 @@ fn create_run(
         id: state.next_run_id(),
         requested_by,
         scope,
+        active_authorized_plugins,
         status: RunStatus::Queued,
         started_at: now,
         completed_at: None,
@@ -4661,6 +6980,11 @@ fn claim_next_runnable_run_in_state(
     now: DateTime<Utc>,
     lease_seconds: u64,
 ) -> Result<Option<ScanRunRecord>> {
+    let worker_pool = match claimable_worker_run_pool(state, worker_id, now) {
+        Some(worker_pool) => worker_pool,
+        None => return Ok(None),
+    };
+
     if !worker_allows_new_runs(state, worker_id, now) {
         return Ok(None);
     }
@@ -4672,9 +6996,10 @@ fn claim_next_runnable_run_in_state(
             matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress)
                 && has_runnable_jobs(state, run.run.id)
                 && !run_claim_is_active(run, now)
+                && run_matches_worker_pool(&run.run, worker_pool.as_deref())
         })
-        .map(|run| run.run.id)
-        .min();
+        .min_by_key(|run| run_claim_priority(&run.run, worker_pool.as_deref()))
+        .map(|run| run.run.id);
 
     let Some(run_id) = run_id else {
         return Ok(None);
@@ -4689,6 +7014,146 @@ fn claim_next_runnable_run_in_state(
     run.claimed_by = Some(worker_id.to_string());
     run.claim_expires_at = Some(lease_expires_at);
     Ok(Some(run.run.clone()))
+}
+
+fn next_assistable_run_in_state(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Option<ScanRunRecord> {
+    let worker_pool = claimable_worker_run_pool(state, worker_id, now)?;
+    if !worker_allows_new_runs(state, worker_id, now) {
+        return None;
+    }
+    let online_workers = online_run_worker_count(state, now);
+    let distinct_run_slots =
+        active_claimed_assistable_run_count(state, now) + unclaimed_runnable_run_count(state, now);
+    if online_workers <= distinct_run_slots {
+        return None;
+    }
+
+    let mut runs = state
+        .runs
+        .iter()
+        .filter(|run| {
+            matches!(run.run.status, RunStatus::InProgress)
+                && has_claimable_jobs(state, run.run.id, now)
+                && run_claim_is_active(run, now)
+                && run_matches_worker_pool(&run.run, worker_pool.as_deref())
+                && run
+                    .claimed_by
+                    .as_deref()
+                    .is_some_and(|owner| owner != worker_id)
+        })
+        .map(|run| run.run.clone())
+        .collect::<Vec<_>>();
+    runs.sort_by(|left, right| {
+        claimable_job_count_for_run(state, right.id, now)
+            .cmp(&claimable_job_count_for_run(state, left.id, now))
+            .then(left.id.cmp(&right.id))
+    });
+    runs.into_iter().next()
+}
+
+fn claimable_worker_run_pool(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Option<Option<String>> {
+    let worker = state
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)?;
+    if !worker.supports_runs
+        || !worker.lifecycle_state.allows_new_work()
+        || !worker_is_online(worker, now)
+    {
+        return None;
+    }
+    Some(worker.worker_pool.clone())
+}
+
+fn run_matches_worker_pool(run: &ScanRunRecord, worker_pool: Option<&str>) -> bool {
+    match run
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.worker_pool.as_deref())
+    {
+        Some(required_pool) => worker_pool.is_some_and(|pool| pool == required_pool),
+        None => true,
+    }
+}
+
+fn run_claim_priority(run: &ScanRunRecord, worker_pool: Option<&str>) -> (u8, u8, i64) {
+    let pool_priority = match (
+        run.scope
+            .as_ref()
+            .and_then(|scope| scope.worker_pool.as_deref()),
+        worker_pool,
+    ) {
+        (Some(required_pool), Some(pool)) if required_pool == pool => 0u8,
+        (None, _) => 1u8,
+        _ => 2u8,
+    };
+    let status_priority = match run.status {
+        RunStatus::Queued => 0u8,
+        RunStatus::InProgress => 1u8,
+        _ => 2u8,
+    };
+    (pool_priority, status_priority, run.id)
+}
+
+fn online_run_worker_count(state: &DragonflyRuntimeState, now: DateTime<Utc>) -> usize {
+    state
+        .workers
+        .iter()
+        .filter(|worker| {
+            worker.supports_runs
+                && worker.lifecycle_state.allows_new_work()
+                && worker_is_online(worker, now)
+        })
+        .count()
+}
+
+fn unclaimed_runnable_run_count(state: &DragonflyRuntimeState, now: DateTime<Utc>) -> usize {
+    state
+        .runs
+        .iter()
+        .filter(|run| {
+            matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress)
+                && has_runnable_jobs(state, run.run.id)
+                && !run_claim_is_active(run, now)
+        })
+        .count()
+}
+
+fn active_claimed_assistable_run_count(state: &DragonflyRuntimeState, now: DateTime<Utc>) -> usize {
+    state
+        .runs
+        .iter()
+        .filter(|run| {
+            matches!(run.run.status, RunStatus::InProgress)
+                && has_claimable_jobs(state, run.run.id, now)
+                && run_claim_is_active(run, now)
+        })
+        .count()
+}
+
+fn claimable_job_count_for_run(
+    state: &DragonflyRuntimeState,
+    run_id: i64,
+    now: DateTime<Utc>,
+) -> usize {
+    state
+        .jobs
+        .iter()
+        .filter(|job| {
+            job.run_id == run_id
+                && (matches!(job.status, JobStatus::Pending)
+                    || (matches!(job.status, JobStatus::InProgress)
+                        && !job_claim_is_active(state, job.id, now)))
+        })
+        .count()
 }
 
 fn run_claim_is_active(run: &StoredRun, now: DateTime<Utc>) -> bool {
@@ -5011,18 +7476,20 @@ fn schedule_next_run_at(now: DateTime<Utc>, interval_seconds: u64) -> Result<Dat
 mod tests {
     use super::{
         DragonflyAnyScanStore, DragonflyRuntimeState, StoredJobClaim, build_redis_connection_url,
-        claim_next_pending_job_in_state, insert_finding_if_new_in_state, lease_expires_at,
+        claim_next_pending_job_in_state, claim_next_pending_port_scan_in_state,
+        insert_finding_if_new_in_state, lease_expires_at, next_assistable_run_in_state,
         occupied_namespace_keys, requeue_in_progress_jobs_in_state,
     };
     use crate::{
+        archive::ArchiveManifest,
         config::{AppConfig, StorageConfig},
         core::{
-            CoverageSourceStat, FetchTelemetry, FindingRecord, FindingsQuery, JobStatus,
-            PublicFindingModerationRequest, PublicFindingSearchQuery, PublicFindingStatus,
-            RunScope, RunStatus, ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
-            TargetRecord, TargetStrategy, WorkerBootstrapCandidateRecord,
-            WorkerBootstrapCandidateStatus, WorkerEnrollmentTokenRecord, WorkerLifecycleState,
-            WorkerRecord,
+            ActiveAuthorizedPluginExecution, CoverageSourceStat, FetchTelemetry, FindingRecord,
+            FindingsQuery, JobStatus, PublicFindingModerationRequest, PublicFindingSearchQuery,
+            PublicFindingStatus, RecurringScheduleRecord, RunScope, RunStatus, ScanJobRecord,
+            ScanRunRecord, Severity, TargetDefinition, TargetRecord, TargetStrategy,
+            WorkerBootstrapCandidateRecord, WorkerBootstrapCandidateStatus,
+            WorkerEnrollmentTokenRecord, WorkerLifecycleState, WorkerRecord,
         },
     };
     use anyhow::{Context, Result};
@@ -5384,6 +7851,10 @@ mod tests {
             redacted_value: "ghp_****prod".to_string(),
             evidence: "prod admin token".to_string(),
             fingerprint: format!("public-fp-{id}"),
+            confidence: None,
+            matched_signals: Vec::new(),
+            review_labels: Vec::new(),
+            plugin_metadata: None,
             discovered_at: Utc::now(),
         }
     }
@@ -5396,6 +7867,7 @@ mod tests {
                 id: run_id,
                 requested_by: Some("test".to_string()),
                 scope: None,
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
                 status: RunStatus::InProgress,
                 started_at: now,
                 completed_at: None,
@@ -5430,17 +7902,115 @@ mod tests {
             display_name: Some(worker_id.to_string()),
             worker_pool: Some(worker_pool.to_string()),
             tags: vec!["test".to_string()],
+            operating_system: Some("linux".to_string()),
+            architecture: Some("x86_64".to_string()),
+            platform: Some("linux-x86_64".to_string()),
             supports_runs: true,
             supports_port_scans: true,
             supports_bootstrap: false,
+            supports_remote_updates: false,
+            supports_remote_debug_commands: false,
             scanner_adapters: Vec::new(),
             provisioners: Vec::new(),
+            local_ip_addresses: Vec::new(),
+            public_ip_address: None,
+            public_ip_checked_at: None,
+            remote_update_status: None,
+            remote_update_status_message: None,
+            remote_update_status_updated_at: None,
             lifecycle_state,
+            remote_update_requested_at: None,
             enrollment_token_id: None,
             registered_at,
             last_seen_at: registered_at,
             expires_at,
         }
+    }
+
+    #[test]
+    fn request_worker_remote_update_marks_pending_request() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let mut worker = sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        worker.supports_remote_updates = true;
+        state.workers.push(worker);
+
+        let updated = super::request_worker_remote_update_in_state(&mut state, "edge-1", now)
+            .expect("remote update should be requested");
+        assert_eq!(updated.remote_update_requested_at, Some(now));
+    }
+
+    #[test]
+    fn acknowledge_worker_remote_update_clears_matching_request() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let mut worker = sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        worker.supports_remote_updates = true;
+        worker.remote_update_requested_at = Some(now);
+        state.workers.push(worker);
+
+        let updated = super::acknowledge_worker_remote_update_in_state(&mut state, "edge-1", now)
+            .expect("remote update should be acknowledged");
+        assert_eq!(updated.remote_update_requested_at, None);
+    }
+
+    #[test]
+    fn request_all_worker_remote_updates_marks_only_eligible_workers() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+
+        let mut eligible = sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        eligible.supports_remote_updates = true;
+        state.workers.push(eligible);
+
+        let mut already_pending = sample_worker(
+            "edge-2",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        already_pending.supports_remote_updates = true;
+        already_pending.remote_update_requested_at = Some(now - ChronoDuration::seconds(5));
+        state.workers.push(already_pending);
+
+        let mut unsupported = sample_worker(
+            "edge-3",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        unsupported.supports_remote_updates = false;
+        state.workers.push(unsupported);
+
+        let mut revoked = sample_worker(
+            "edge-4",
+            "edge",
+            WorkerLifecycleState::Revoked,
+            now + ChronoDuration::seconds(30),
+        );
+        revoked.supports_remote_updates = true;
+        state.workers.push(revoked);
+
+        let updated = super::request_all_worker_remote_updates_in_state(&mut state, now)
+            .expect("bulk remote update request should succeed");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].worker_id, "edge-1");
+        assert_eq!(updated[0].remote_update_requested_at, Some(now));
     }
 
     #[test]
@@ -5516,6 +8086,8 @@ mod tests {
                 rate_limit: 100,
                 worker_pool: Some("edge".to_string()),
                 bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
                 status: RunStatus::Queued,
                 started_at: now,
                 completed_at: None,
@@ -5523,6 +8095,7 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                protocol_findings: Vec::new(),
                 notes: None,
             },
             claimed_by: None,
@@ -5539,6 +8112,8 @@ mod tests {
                 rate_limit: 100,
                 worker_pool: Some("edge".to_string()),
                 bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
                 status: RunStatus::InProgress,
                 started_at: now,
                 completed_at: None,
@@ -5546,6 +8121,7 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                protocol_findings: Vec::new(),
                 notes: None,
             },
             claimed_by: Some("edge-1".to_string()),
@@ -5584,7 +8160,12 @@ mod tests {
         let scope = RunScope {
             target_ids: vec![target.id],
             tags: vec!["test".to_string()],
+            worker_pool: None,
             failed_only: false,
+        };
+        let active_authorized_plugins = ActiveAuthorizedPluginExecution {
+            global_gate_enabled: true,
+            request_opt_in_enabled: true,
         };
 
         let run = super::create_run(
@@ -5592,15 +8173,58 @@ mod tests {
             Some(12),
             Some("tester".to_string()),
             Some(scope.clone()),
+            active_authorized_plugins.clone(),
             &[target],
             now,
         );
 
         assert_eq!(run.scope, Some(scope));
+        assert_eq!(run.active_authorized_plugins, active_authorized_plugins);
         assert_eq!(run.total_targets, 1);
         assert_eq!(state.runs.len(), 1);
         assert_eq!(state.runs[0].schedule_id, Some(12));
         assert_eq!(state.runs[0].run.id, run.id);
+        assert_eq!(
+            state.runs[0].run.active_authorized_plugins,
+            active_authorized_plugins
+        );
+    }
+
+    #[test]
+    fn materialize_schedule_preserves_active_authorized_plugins_without_run() {
+        let now = Utc::now();
+        let schedule = RecurringScheduleRecord {
+            id: 7,
+            label: "nightly".to_string(),
+            interval_seconds: 3600,
+            enabled: true,
+            requested_by: Some("tester".to_string()),
+            scope: None,
+            active_authorized_plugins: ActiveAuthorizedPluginExecution {
+                global_gate_enabled: false,
+                request_opt_in_enabled: true,
+            },
+            next_run_at: now,
+            last_run_at: None,
+            last_queued_run_id: None,
+            last_queued_run_status: Some(RunStatus::Completed),
+            last_queued_run_started_at: Some(now),
+            last_queued_run_completed_at: Some(now),
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let materialized = super::materialize_schedule(schedule, &DragonflyRuntimeState::default());
+
+        assert!(materialized.last_queued_run_status.is_none());
+        assert_eq!(
+            materialized
+                .active_authorized_plugins
+                .request_opt_in_enabled,
+            true
+        );
+        assert!(!materialized.active_authorized_plugins.global_gate_enabled);
     }
 
     #[test]
@@ -5639,6 +8263,7 @@ mod tests {
             Some(&RunScope {
                 target_ids: Vec::new(),
                 tags: vec!["worker".to_string()],
+                worker_pool: None,
                 failed_only: true,
             }),
         );
@@ -5671,6 +8296,10 @@ mod tests {
             redacted_value: "AKIA****INT".to_string(),
             evidence: "internal worker config".to_string(),
             fingerprint: "search-fp-1".to_string(),
+            confidence: None,
+            matched_signals: Vec::new(),
+            review_labels: Vec::new(),
+            plugin_metadata: None,
             discovered_at: now,
         });
         state.findings.push(FindingRecord {
@@ -5687,6 +8316,10 @@ mod tests {
             redacted_value: "ghp_****prod".to_string(),
             evidence: "prod admin token".to_string(),
             fingerprint: "search-fp-2".to_string(),
+            confidence: None,
+            matched_signals: Vec::new(),
+            review_labels: Vec::new(),
+            plugin_metadata: None,
             discovered_at: now,
         });
         state.findings.push(FindingRecord {
@@ -5703,6 +8336,10 @@ mod tests {
             redacted_value: "sk_l****1234".to_string(),
             evidence: "prod billing bundle".to_string(),
             fingerprint: "search-fp-3".to_string(),
+            confidence: None,
+            matched_signals: Vec::new(),
+            review_labels: Vec::new(),
+            plugin_metadata: None,
             discovered_at: now,
         });
 
@@ -5899,6 +8536,10 @@ mod tests {
             redacted_value: "sk-****1234".to_string(),
             evidence: "sk-test-1234".to_string(),
             fingerprint: "fingerprint-1".to_string(),
+            confidence: None,
+            matched_signals: Vec::new(),
+            review_labels: Vec::new(),
+            plugin_metadata: None,
         };
 
         let first = insert_finding_if_new_in_state(&mut state, &finding)?;
@@ -5936,6 +8577,295 @@ mod tests {
                 .map(|claim| claim.claimed_by.as_str()),
             Some("worker-b")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn next_assistable_run_only_uses_spare_run_capacity() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.workers.push(sample_worker(
+            "edge-2",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.workers.push(sample_worker(
+            "edge-3",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 10,
+                requested_by: Some("test".to_string()),
+                scope: None,
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+        });
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 11,
+                requested_by: Some("test".to_string()),
+                scope: None,
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+        state.jobs.push(sample_job(1, 10, JobStatus::Pending));
+        state.jobs.push(sample_job(2, 10, JobStatus::Pending));
+        state.jobs.push(sample_job(3, 11, JobStatus::Pending));
+
+        let assist = next_assistable_run_in_state(&state, "edge-3", now);
+        assert_eq!(assist.as_ref().map(|run| run.id), Some(10));
+
+        state.workers.pop();
+        let no_assist = next_assistable_run_in_state(&state, "edge-2", now);
+        assert!(no_assist.is_none());
+    }
+
+    #[test]
+    fn claim_next_pending_port_scan_prioritizes_pool_specific_work() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 1,
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.0.0/24".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 100,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                protocol_findings: Vec::new(),
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 2,
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.1.0/24".to_string(),
+                ports: "443".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 100,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                protocol_findings: Vec::new(),
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+
+        let claimed = claim_next_pending_port_scan_in_state(&mut state, "edge-1", now, 60)?
+            .expect("expected a port scan claim");
+        assert_eq!(claimed.id, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn claim_next_runnable_run_prioritizes_pool_scoped_runs() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 20,
+                requested_by: Some("test".to_string()),
+                scope: Some(RunScope {
+                    target_ids: Vec::new(),
+                    tags: Vec::new(),
+                    worker_pool: None,
+                    failed_only: false,
+                }),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 21,
+                requested_by: Some("test".to_string()),
+                scope: Some(RunScope {
+                    target_ids: Vec::new(),
+                    tags: Vec::new(),
+                    worker_pool: Some("edge".to_string()),
+                    failed_only: false,
+                }),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+        state.jobs.push(sample_job(1, 20, JobStatus::Pending));
+        state.jobs.push(sample_job(2, 21, JobStatus::Pending));
+
+        let claimed = super::claim_next_runnable_run_in_state(&mut state, "edge-1", now, 60)?
+            .expect("expected a runnable run");
+        assert_eq!(claimed.id, 21);
+        Ok(())
+    }
+
+    #[test]
+    fn claim_next_runnable_run_rejects_mismatched_pool_runs() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "core-1",
+            "core",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 30,
+                requested_by: Some("test".to_string()),
+                scope: Some(RunScope {
+                    target_ids: Vec::new(),
+                    tags: Vec::new(),
+                    worker_pool: Some("edge".to_string()),
+                    failed_only: false,
+                }),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Queued,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: None,
+            claim_expires_at: None,
+        });
+        state.jobs.push(sample_job(1, 30, JobStatus::Pending));
+
+        let claimed = super::claim_next_runnable_run_in_state(&mut state, "core-1", now, 60)?;
+        assert!(claimed.is_none());
         Ok(())
     }
 
@@ -6076,6 +9006,143 @@ mod tests {
             super::default_public_finding_summary(&finding)
         );
         assert!(updated.published_at.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn archive_runs_preserve_hot_floor_and_skip_active_state() -> Result<()> {
+        let now = Utc::now();
+        let cutoff = now - ChronoDuration::days(30);
+        let mut state = DragonflyRuntimeState::default();
+
+        for id in 1..=30 {
+            let completed_at = now - ChronoDuration::days(60 + id);
+            let mut run = sample_run(id);
+            run.run.status = RunStatus::Completed;
+            run.run.started_at = completed_at - ChronoDuration::minutes(30);
+            run.run.completed_at = Some(completed_at);
+            state.runs.push(run);
+        }
+
+        let mut active_run = sample_run(500);
+        active_run.run.status = RunStatus::InProgress;
+        active_run.run.started_at = now - ChronoDuration::days(90);
+        state.runs.push(active_run);
+
+        let mut recent_completed = sample_run(501);
+        recent_completed.run.status = RunStatus::Completed;
+        recent_completed.run.started_at = now - ChronoDuration::days(5);
+        recent_completed.run.completed_at = Some(now - ChronoDuration::days(5));
+        state.runs.push(recent_completed);
+
+        let payload = super::prepare_runs_archive_payload(&state, "anyscan:test", cutoff, 100)?
+            .expect("expected an archive payload for old runs");
+        let archived_ids = payload
+            .records
+            .iter()
+            .map(|value| {
+                serde_json::from_value::<super::StoredRun>(value.clone())
+                    .expect("archived run record should decode")
+                    .run
+                    .id
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(archived_ids.len(), 6);
+        assert!(!archived_ids.contains(&500));
+        assert!(!archived_ids.contains(&501));
+        Ok(())
+    }
+
+    #[test]
+    fn archive_pointer_is_recorded_before_state_prune() -> Result<()> {
+        let now = Utc::now();
+        let target = sample_target(42);
+        let finding = sample_finding(7, 9, &target);
+        let mut state = DragonflyRuntimeState::default();
+        state.targets.push(target);
+        state.findings.push(finding.clone());
+
+        let payload = super::PreparedArchivePayload {
+            kind: super::ArchiveRecordKind::Findings,
+            namespace: "anyscan:test".to_string(),
+            records: vec![
+                serde_json::to_value(&finding).expect("finding should serialize into payload"),
+            ],
+            min_record_id: Some(finding.id),
+            max_record_id: Some(finding.id),
+            min_timestamp: Some(finding.discovered_at),
+            max_timestamp: Some(finding.discovered_at),
+        };
+        let archived = super::ArchivedObject {
+            manifest: ArchiveManifest {
+                schema_version: 1,
+                kind: super::ArchiveRecordKind::Findings,
+                source_namespace: "anyscan:test".to_string(),
+                count: 1,
+                min_record_id: Some(finding.id),
+                max_record_id: Some(finding.id),
+                min_timestamp: Some(finding.discovered_at),
+                max_timestamp: Some(finding.discovered_at),
+                created_at: now,
+                sha256_hex: "deadbeef".to_string(),
+                size_bytes: 128,
+                compression: "zstd".to_string(),
+                encryption: "aes_256_gcm".to_string(),
+                nonce_b64: "nonce".to_string(),
+                object_prefix: "anyscan/".to_string(),
+            },
+            data_object_key: "anyscan/findings/2026/04/17/1.data".to_string(),
+            manifest_object_key: "anyscan/findings/2026/04/17/1.manifest.json".to_string(),
+        };
+
+        let pointer = super::add_archive_pointer_to_state(&mut state, &payload, &archived);
+        assert_eq!(state.archive_pointers.len(), 1);
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(pointer.record_count, 1);
+
+        super::prune_archived_payload_from_state(&mut state, &payload)?;
+        assert!(state.findings.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_artifact_archive_payloads_keep_recent_hot_files() -> Result<()> {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("anyscan-bootstrap-archive-test-{unique_suffix}"));
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+
+        for index in 0..12 {
+            let path = directory.join(format!("artifact-{index}.json"));
+            fs::write(&path, format!("{{\"index\":{index}}}"))
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let payloads = super::prepare_bootstrap_artifact_archive_payloads(
+            "anyscan:test",
+            &directory,
+            Utc::now() + ChronoDuration::days(1),
+            20,
+            &[],
+        )?;
+        let payload_paths = payloads
+            .iter()
+            .flat_map(|payload| {
+                super::extract_local_artifact_paths(payload)
+                    .expect("artifact payload paths should decode")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payload_paths.len(), 2);
+
+        let _ = fs::remove_dir_all(&directory);
         Ok(())
     }
 

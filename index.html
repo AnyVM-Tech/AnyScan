@@ -678,6 +678,15 @@
 				</section>
 
 				<section class="card wide-card">
+					<h2>Archive status</h2>
+					<div class="metrics" id="archive-metrics"></div>
+					<p id="archive-note" class="subtle-note">
+						Cold archive status will appear after the first dashboard
+						refresh.
+					</p>
+				</section>
+
+				<section class="card wide-card">
 					<h2>Directory probing defaults</h2>
 					<div id="gobuster-defaults-pills" class="pill-row"></div>
 					<p id="gobuster-defaults-note" class="subtle-note"></p>
@@ -857,6 +866,13 @@
 					</article>
 					<article class="card wide-card">
 						<h2>Recent runs</h2>
+						<label>
+							Filter by worker pool
+							<input
+								id="runs-worker-pool-filter"
+								placeholder="edge-scanners or unassigned"
+							/>
+						</label>
 						<ul id="runs-list" class="list"></ul>
 						<p id="runs-empty" class="empty hidden">
 							No scan runs recorded yet.
@@ -974,9 +990,41 @@
 								/>
 							</label>
 							<label>
+								Worker pool
+								<input
+									id="run-worker-pool"
+									placeholder="edge-scanners"
+								/>
+							</label>
+							<label>
 								<input id="run-failed-only" type="checkbox" />
 								Failed targets only
 							</label>
+							<div class="subform">
+								<div class="section-heading">
+									<h3>Active-authorized plugins</h3>
+									<span
+										id="run-active-authorized-gate"
+										class="subtle-note"
+										>Gate pending</span
+									>
+								</div>
+								<label class="toggle">
+									<input
+										id="run-active-authorized-enabled"
+										type="checkbox"
+									/>
+									Allow active-authorized plugins for this run
+								</label>
+								<p
+									id="run-active-authorized-note"
+									class="subtle-note"
+								>
+									Disabled by default. This opt-in only takes
+									effect when the server-side active-authorized
+									gate is enabled.
+								</p>
+							</div>
 							<button type="submit" class="primary">
 								Queue scoped run
 							</button>
@@ -1039,14 +1087,192 @@
 								/>
 							</label>
 							<label>
+								Worker pool
+								<input
+									id="schedule-worker-pool"
+									placeholder="edge-scanners"
+								/>
+							</label>
+							<label>
 								<input
 									id="schedule-failed-only"
 									type="checkbox"
 								/>
 								Retry failed targets only
 							</label>
+							<div class="subform">
+								<div class="section-heading">
+									<h3>Active-authorized plugins</h3>
+									<span
+										id="schedule-active-authorized-gate"
+										class="subtle-note"
+										>Gate pending</span
+									>
+								</div>
+								<label class="toggle">
+									<input
+										id="schedule-active-authorized-enabled"
+										type="checkbox"
+									/>
+									Allow active-authorized plugins for scheduled runs
+								</label>
+								<p
+									id="schedule-active-authorized-note"
+									class="subtle-note"
+								>
+									Disabled by default. Scheduled runs only execute
+									active-authorized plugins when this opt-in is
+									checked and the global gate is enabled.
+								</p>
+							</div>
 							<button type="submit">Save schedule</button>
 							<p id="schedule-error" class="error hidden"></p>
+						</form>
+					</article>
+					<article class="card wide-card">
+						<h2>Queue port scan</h2>
+						<form id="port-scan-form">
+							<div class="grid two-up">
+								<label>
+									Target range
+									<input
+										id="port-scan-target-range"
+										required
+										placeholder="10.0.0.0/24"
+									/>
+								</label>
+								<label>
+									Ports
+									<input
+										id="port-scan-ports"
+										required
+										placeholder="80,443,8080-8090"
+									/>
+								</label>
+								<label>
+									Schemes
+									<select id="port-scan-schemes">
+										<option value="auto" selected>Auto</option>
+										<option value="http">HTTP</option>
+										<option value="https">HTTPS</option>
+										<option value="both">Both</option>
+									</select>
+								</label>
+								<label>
+									Rate limit
+									<input
+										id="port-scan-rate-limit"
+										type="number"
+										min="0"
+										step="1"
+										placeholder="0"
+									/>
+								</label>
+								<label>
+									Worker pool (optional)
+									<input
+										id="port-scan-worker-pool"
+										placeholder="edge-scanners"
+									/>
+								</label>
+								<label>
+									Tags (comma separated)
+									<input
+										id="port-scan-tags"
+										placeholder="external, quarterly"
+									/>
+								</label>
+							</div>
+							<div class="subform">
+								<div class="section-heading">
+									<h3>Follow-on scanning</h3>
+									<span class="subtle-note"
+										>Queue a scan run for imported hosts</span
+									>
+								</div>
+								<label class="toggle">
+									<input
+										id="port-scan-follow-on-enabled"
+										type="checkbox"
+										checked
+									/>
+									Scan discovered hosts after the port scan completes
+								</label>
+								<div
+									id="port-scan-follow-on-fields"
+									class="grid two-up"
+								>
+									<label>
+										Follow-on worker pool (optional)
+										<input
+											id="port-scan-follow-on-pool"
+											placeholder="edge-scanners"
+										/>
+									</label>
+								</div>
+							</div>
+							<div class="subform">
+								<div class="section-heading">
+									<h3>Bootstrap candidates</h3>
+									<span class="subtle-note"
+										>Optional follow-on worker enrollment</span
+									>
+								</div>
+								<label class="toggle">
+									<input
+										id="port-scan-bootstrap-enabled"
+										type="checkbox"
+									/>
+									Create bootstrap candidates from discovered
+									endpoints
+								</label>
+								<div
+									id="port-scan-bootstrap-fields"
+									class="grid two-up hidden"
+								>
+									<label>
+										Bootstrap worker pool (optional)
+										<input
+											id="port-scan-bootstrap-pool"
+											placeholder="branch-office"
+										/>
+									</label>
+									<label>
+										Bootstrap tags (comma separated)
+										<input
+											id="port-scan-bootstrap-tags"
+											placeholder="bootstrap, linux"
+										/>
+									</label>
+								</div>
+							</div>
+							<div class="subform">
+								<div class="section-heading">
+									<h3>Active-authorized plugins</h3>
+									<span
+										id="port-scan-active-authorized-gate"
+										class="subtle-note"
+										>Gate pending</span
+									>
+								</div>
+								<label class="toggle">
+									<input
+										id="port-scan-active-authorized-enabled"
+										type="checkbox"
+									/>
+									Allow active-authorized plugins for this port scan
+								</label>
+								<p
+									id="port-scan-active-authorized-note"
+									class="subtle-note"
+								>
+									Disabled by default. Checked opt-ins remain
+									suppressed until the global active-authorized
+									gate is enabled.
+								</p>
+							</div>
+							<button type="submit">Queue port scan</button>
+							<p id="port-scan-error" class="error hidden"></p>
 						</form>
 					</article>
 				</section>
@@ -1079,10 +1305,35 @@
 
 				<section class="grid two-up">
 					<article class="card wide-card">
-						<h2>Workers</h2>
+						<div class="section-heading">
+							<h2>Workers</h2>
+							<button
+								id="workers-remote-update-all"
+								type="button"
+								class="hidden"
+							>
+								Update all
+							</button>
+						</div>
+						<p class="subtle-note">
+							Remote debug commands run as the worker service user
+							and capture recent stdout/stderr for review.
+						</p>
+						<label>
+							Filter by worker pool
+							<input
+								id="workers-worker-pool-filter"
+								placeholder="edge-scanners or unassigned"
+							/>
+						</label>
 						<ul id="workers-list" class="list"></ul>
 						<p id="workers-empty" class="empty hidden">
 							No workers have registered yet.
+						</p>
+						<h3>Recent remote debug</h3>
+						<ul id="worker-remote-commands-list" class="list"></ul>
+						<p id="worker-remote-commands-empty" class="empty hidden">
+							No remote debug commands have been queued yet.
 						</p>
 					</article>
 					<article class="card wide-card">
@@ -1438,11 +1689,60 @@
 								</select>
 							</label>
 							<label>
+								Confidence
+								<select id="findings-confidence">
+									<option value="">Any confidence</option>
+									<option value="high">High</option>
+									<option value="medium">Medium</option>
+									<option value="low">Low</option>
+								</select>
+							</label>
+							<label>
 								Detector
 								<input
 									id="findings-detector"
 									placeholder="github_pat"
 								/>
+							</label>
+							<label>
+								Plugin ID
+								<input
+									id="findings-plugin-id"
+									placeholder="GrafanaOpenPlugin"
+								/>
+							</label>
+							<label>
+								Plugin family
+								<select id="findings-plugin-family">
+									<option value="">Any family</option>
+									<option value="ai_llm_vector">AI / LLM / vector</option>
+									<option value="databases_search">Databases / search</option>
+									<option value="enterprise_web_apps">Enterprise / web apps</option>
+									<option value="infra_platform_data">Infra / platform / data</option>
+									<option value="leakage_debug_config">Leakage / debug / config</option>
+									<option value="network_security_appliances">Network / security appliances</option>
+									<option value="ot_ics_iot">OT / ICS / IoT</option>
+									<option value="ops_observability">Ops / observability</option>
+									<option value="exposure_vulnerability_misc">Exposure / vulnerability misc</option>
+								</select>
+							</label>
+							<label>
+								Execution mode
+								<select id="findings-execution-mode">
+									<option value="">Any mode</option>
+									<option value="passive_http">Passive HTTP</option>
+									<option value="authless_protocol">Authless protocol</option>
+									<option value="version_correlation">Version correlation</option>
+									<option value="active_authorized">Active authorized</option>
+								</select>
+							</label>
+							<label>
+								LeakIX label
+								<select id="findings-leakix-label">
+									<option value="">Any label</option>
+									<option value="public">Public</option>
+									<option value="trusted_pro">Trusted / Pro</option>
+								</select>
 							</label>
 							<label>
 								Path prefix
@@ -1456,6 +1756,13 @@
 								<input
 									id="findings-tags"
 									placeholder="prod, internal"
+								/>
+							</label>
+							<label>
+								Review labels (comma separated)
+								<input
+									id="findings-review-labels"
+									placeholder="best_effort, rce_surface"
 								/>
 							</label>
 							<label>
@@ -1534,6 +1841,106 @@
 						</article>
 					</section>
 
+				<section class="grid">
+					<article class="card wide-card">
+						<h2>LeakIX-style plugin catalog</h2>
+						<p id="plugin-catalog-note" class="management-note">
+							Modeled AnyScan plugin registry with phase-1 implementation status and execution-lane metadata.
+						</p>
+						<p
+							id="plugin-catalog-gate-note"
+							class="management-note"
+						>
+							Active-authorized gate state pending server support.
+						</p>
+						<form id="plugins-search-form">
+							<label>
+								Free-text query
+								<input
+									id="plugins-query"
+									placeholder="jenkins passive_http public"
+								/>
+							</label>
+							<label>
+								Family
+								<select id="plugins-family">
+									<option value="">Any family</option>
+									<option value="ai_llm_vector">AI / LLM / vector</option>
+									<option value="databases_search">Databases / search</option>
+									<option value="enterprise_web_apps">Enterprise / web apps</option>
+									<option value="infra_platform_data">Infra / platform / data</option>
+									<option value="leakage_debug_config">Leakage / debug / config</option>
+									<option value="network_security_appliances">Network / security appliances</option>
+									<option value="ot_ics_iot">OT / ICS / IoT</option>
+									<option value="ops_observability">Ops / observability</option>
+									<option value="exposure_vulnerability_misc">Exposure / vulnerability misc</option>
+								</select>
+							</label>
+							<label>
+								LeakIX label
+								<select id="plugins-label">
+									<option value="">Any label</option>
+									<option value="public">Public</option>
+									<option value="trusted_pro">Trusted / Pro</option>
+								</select>
+							</label>
+							<label>
+								Execution mode
+								<select id="plugins-execution-mode">
+									<option value="">Any mode</option>
+									<option value="passive_http">Passive HTTP</option>
+									<option value="authless_protocol">Authless protocol</option>
+									<option value="version_correlation">Version correlation</option>
+									<option value="active_authorized">Active authorized</option>
+								</select>
+							</label>
+							<label>
+								Status
+								<select id="plugins-status">
+									<option value="">Any status</option>
+									<option value="implemented">Implemented</option>
+									<option value="planned">Planned</option>
+									<option value="not_supported">Not supported</option>
+								</select>
+							</label>
+							<label>
+								Coverage
+								<select id="plugins-coverage-status">
+									<option value="">Any coverage</option>
+									<option value="first_class">First class</option>
+									<option value="external_scanner_only">External scanner only</option>
+									<option value="declared_but_inactive">Declared but inactive</option>
+								</select>
+							</label>
+							<label>
+								Limit
+								<input
+									id="plugins-limit"
+									type="number"
+									min="1"
+									max="500"
+									step="1"
+									placeholder="250"
+								/>
+							</label>
+							<div class="actions">
+								<button type="submit">Filter catalog</button>
+								<button id="plugins-reset-button" type="button">
+									Clear filters
+								</button>
+							</div>
+							<small id="plugins-search-status" class="muted"
+								>Loading plugin catalog.</small
+							>
+							<p id="plugins-search-error" class="error hidden"></p>
+						</form>
+						<ul id="plugin-catalog-list" class="list"></ul>
+						<p id="plugin-catalog-empty" class="empty hidden">
+							No plugin entries matched the current filters.
+						</p>
+					</article>
+				</section>
+
 
 				<section class="grid three-up">
 					<article class="card wide-card">
@@ -1572,13 +1979,19 @@
 				dashboardSnapshot: null,
 				findingsQuery: null,
 				visibleFindings: [],
+				pluginCatalog: null,
+				pluginCatalogQuery: null,
 				findingPublications: [],
+				runWorkerPoolFilter: '',
+				workerPoolFilter: '',
 				authenticated: false,
 				session: null
 			};
 
 			const elements = {
 				app: document.getElementById('app'),
+				archiveMetrics: document.getElementById('archive-metrics'),
+				archiveNote: document.getElementById('archive-note'),
 				authCard: document.getElementById('auth-card'),
 				authError: document.getElementById('auth-error'),
 				bootstrapApprovalAccessNote: document.getElementById(
@@ -1716,8 +2129,50 @@
 				findingsQueryStatus: document.getElementById(
 					'findings-search-status'
 				),
+				pluginCatalogGateNote: document.getElementById(
+					'plugin-catalog-gate-note'
+				),
+				pluginCatalogEmpty: document.getElementById(
+					'plugin-catalog-empty'
+				),
+				pluginCatalogList: document.getElementById(
+					'plugin-catalog-list'
+				),
+				pluginCatalogNote: document.getElementById(
+					'plugin-catalog-note'
+				),
+				pluginQueryError: document.getElementById(
+					'plugins-search-error'
+				),
+				pluginQueryForm: document.getElementById('plugins-search-form'),
+				pluginQueryResetButton: document.getElementById(
+					'plugins-reset-button'
+				),
+				pluginQueryStatus: document.getElementById(
+					'plugins-search-status'
+				),
 				loginForm: document.getElementById('login-form'),
 				logoutButton: document.getElementById('logout-button'),
+				portScanBootstrapEnabled: document.getElementById(
+					'port-scan-bootstrap-enabled'
+				),
+				portScanBootstrapFields: document.getElementById(
+					'port-scan-bootstrap-fields'
+				),
+				portScanFollowOnEnabled: document.getElementById(
+					'port-scan-follow-on-enabled'
+				),
+				portScanFollowOnFields: document.getElementById(
+					'port-scan-follow-on-fields'
+				),
+				portScanError: document.getElementById('port-scan-error'),
+				portScanForm: document.getElementById('port-scan-form'),
+				portScanActiveAuthorizedGate: document.getElementById(
+					'port-scan-active-authorized-gate'
+				),
+				portScanActiveAuthorizedNote: document.getElementById(
+					'port-scan-active-authorized-note'
+				),
 				portScansEmpty: document.getElementById('port-scans-empty'),
 				portScansList: document.getElementById('port-scans-list'),
 				queueButton: document.getElementById('queue-button'),
@@ -1727,6 +2182,15 @@
 				repositoriesList: document.getElementById('repositories-list'),
 				runError: document.getElementById('run-error'),
 				runForm: document.getElementById('run-form'),
+				runActiveAuthorizedGate: document.getElementById(
+					'run-active-authorized-gate'
+				),
+				runActiveAuthorizedNote: document.getElementById(
+					'run-active-authorized-note'
+				),
+				runsWorkerPoolFilter: document.getElementById(
+					'runs-worker-pool-filter'
+				),
 				runsEmpty: document.getElementById('runs-empty'),
 				runsList: document.getElementById('runs-list'),
 				scanSettingsError: document.getElementById(
@@ -1735,6 +2199,12 @@
 				scanSettingsForm: document.getElementById('scan-settings-form'),
 				scheduleError: document.getElementById('schedule-error'),
 				scheduleForm: document.getElementById('schedule-form'),
+				scheduleActiveAuthorizedGate: document.getElementById(
+					'schedule-active-authorized-gate'
+				),
+				scheduleActiveAuthorizedNote: document.getElementById(
+					'schedule-active-authorized-note'
+				),
 				schedulesEmpty: document.getElementById('schedules-empty'),
 				schedulesList: document.getElementById('schedules-list'),
 				sessionUser: document.getElementById('session-user'),
@@ -1768,6 +2238,18 @@
 				),
 				workerTokenSecretValue: document.getElementById(
 					'worker-token-secret-value'
+				),
+				workerRemoteCommandsEmpty: document.getElementById(
+					'worker-remote-commands-empty'
+				),
+				workerRemoteCommandsList: document.getElementById(
+					'worker-remote-commands-list'
+				),
+				workersRemoteUpdateAll: document.getElementById(
+					'workers-remote-update-all'
+				),
+				workersWorkerPoolFilter: document.getElementById(
+					'workers-worker-pool-filter'
 				),
 				workersEmpty: document.getElementById('workers-empty'),
 				workersList: document.getElementById('workers-list')
@@ -1815,6 +2297,7 @@
 				elements.app.classList.remove('hidden');
 				elements.authError.classList.add('hidden');
 				applyWorkerManagementVisibility();
+				syncActiveAuthorizedGateUi();
 			}
 
 			function setUnauthenticated(message = '') {
@@ -1822,10 +2305,14 @@
 				state.dashboardSnapshot = null;
 				state.findingsQuery = null;
 				state.visibleFindings = [];
+				state.pluginCatalog = null;
+				state.pluginCatalogQuery = null;
 				state.findingPublications = [];
 				state.session = null;
 				renderFindings([]);
+				renderPluginCatalog(null);
 				renderFindingPublications([]);
+				syncActiveAuthorizedGateUi();
 				closeEvents();
 				elements.app.classList.add('hidden');
 				elements.authCard.classList.remove('hidden');
@@ -1839,12 +2326,20 @@
 				elements.findingsQueryError.classList.add('hidden');
 				elements.findingsQueryStatus.textContent =
 					'Showing recent findings from the latest dashboard snapshot.';
+				elements.pluginQueryForm.reset();
+				elements.pluginQueryError.classList.add('hidden');
+				elements.pluginQueryStatus.textContent =
+					'Loading plugin catalog.';
 				elements.connectionState.textContent =
 					'Sign in to view dashboard data.';
 				elements.workerTokenForm.reset();
 				elements.bootstrapApprovalForm.reset();
+				elements.runForm.reset();
+				elements.scheduleForm.reset();
+				elements.portScanForm?.reset();
 				resetWorkerTokenFormDefaults();
 				resetBootstrapApprovalFormDefaults();
+				resetPortScanFormDefaults();
 				clearSecretPanel(
 					elements.workerTokenSecretPanel,
 					elements.workerTokenSecretTitle,
@@ -1914,6 +2409,60 @@
 				syncBootstrapDispatchVisibility();
 			}
 
+			function syncPortScanBootstrapVisibility() {
+				const enabled = Boolean(
+					elements.portScanBootstrapEnabled?.checked
+				);
+				elements.portScanBootstrapFields?.classList.toggle(
+					'hidden',
+					!enabled
+				);
+				['port-scan-bootstrap-pool', 'port-scan-bootstrap-tags']
+					.map(id => document.getElementById(id))
+					.filter(Boolean)
+					.forEach(element => {
+						element.disabled = !enabled;
+					});
+			}
+
+			function syncPortScanFollowOnVisibility() {
+				const enabled = Boolean(
+					elements.portScanFollowOnEnabled?.checked
+				);
+				elements.portScanFollowOnFields?.classList.toggle(
+					'hidden',
+					!enabled
+				);
+				['port-scan-follow-on-pool']
+					.map(id => document.getElementById(id))
+					.filter(Boolean)
+					.forEach(element => {
+						element.disabled = !enabled;
+					});
+			}
+
+			function resetPortScanFormDefaults() {
+				if (!elements.portScanForm) {
+					return;
+				}
+				document.getElementById('port-scan-schemes').value = 'auto';
+				document.getElementById('port-scan-rate-limit').value = '';
+				document.getElementById('port-scan-worker-pool').value = '';
+				document.getElementById('port-scan-tags').value = '';
+				document.getElementById('port-scan-follow-on-enabled').checked =
+					true;
+				document.getElementById('port-scan-follow-on-pool').value = '';
+				document.getElementById('port-scan-bootstrap-enabled').checked =
+					false;
+				document.getElementById('port-scan-bootstrap-pool').value = '';
+				document.getElementById('port-scan-bootstrap-tags').value = '';
+				document.getElementById(
+					'port-scan-active-authorized-enabled'
+				).checked = false;
+				syncPortScanFollowOnVisibility();
+				syncPortScanBootstrapVisibility();
+			}
+
 			function clearSecretPanel(
 				panel,
 				titleElement,
@@ -1952,6 +2501,10 @@
 				elements.workerTokenReadonlyNote.classList.toggle(
 					'hidden',
 					manageWorkers
+				);
+				elements.workersRemoteUpdateAll.classList.toggle(
+					'hidden',
+					!manageWorkers
 				);
 
 				elements.bootstrapApprovalAccessNote.textContent =
@@ -2062,6 +2615,22 @@
 					return value;
 				}
 				return date.toLocaleString();
+			}
+
+			function formatBytes(value) {
+				const bytes = Number(value) || 0;
+				if (!Number.isFinite(bytes) || bytes <= 0) {
+					return '0 B';
+				}
+				const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+				let size = bytes;
+				let unitIndex = 0;
+				while (size >= 1024 && unitIndex < units.length - 1) {
+					size /= 1024;
+					unitIndex += 1;
+				}
+				const precision = size >= 10 || unitIndex === 0 ? 0 : 1;
+				return `${size.toFixed(precision)} ${units[unitIndex]}`;
 			}
 
 			function formatDuration(totalSeconds) {
@@ -2752,6 +3321,71 @@
 				elements.binDatasetStatusList.appendChild(item);
 			}
 
+			function renderArchiveStatus(status) {
+				const archiveStatus = status || null;
+				if (!archiveStatus?.enabled) {
+					renderMetrics(elements.archiveMetrics, [
+						['Backend', 'Disabled'],
+						['Hot window', '—'],
+						['Pressure', 'normal'],
+						['Pointers', '0']
+					]);
+					elements.archiveNote.textContent =
+						'Cold archive is disabled. Hot history remains entirely in Dragonfly.';
+					return;
+				}
+
+				const latestJob = Array.isArray(archiveStatus.recent_archive_jobs)
+					? archiveStatus.recent_archive_jobs[0]
+					: null;
+				renderMetrics(elements.archiveMetrics, [
+					[
+						'Backend',
+						String(archiveStatus.backend || 'b2_s3')
+							.replace(/_/g, ' ')
+							.toUpperCase()
+					],
+					[
+						'Hot window',
+						`${archiveStatus.current_hot_retention_days || 0} days`
+					],
+					[
+						'Pressure',
+						formatHumanLabel(archiveStatus.pressure_mode || 'normal')
+					],
+					['Pointers', `${archiveStatus.pointers_total || 0}`],
+					[
+						'Used memory',
+						formatBytes(archiveStatus.used_memory_bytes || 0)
+					],
+					[
+						'Namespace size',
+						formatBytes(archiveStatus.namespace_estimated_bytes || 0)
+					]
+				]);
+
+				if (!latestJob) {
+					elements.archiveNote.textContent =
+						`Archive is enabled with a target hot window of ${archiveStatus.target_hot_retention_days || 0} days, but no archive pass has completed yet.`;
+					return;
+				}
+
+				const archivedKinds = Array.isArray(latestJob.kinds)
+					? latestJob.kinds
+							.filter(entry => entry && entry.record_count)
+							.map(
+								entry =>
+									`${entry.kind}: ${entry.record_count}`
+							)
+					: [];
+				const jobStatus = formatHumanLabel(latestJob.status || 'completed');
+				const archivedSummary = archivedKinds.length
+					? `Kinds ${archivedKinds.join(' • ')}.`
+					: 'No records moved during the last pass.';
+				elements.archiveNote.textContent =
+					`Last archive job #${latestJob.id} finished ${jobStatus.toLowerCase()} at ${formatTimestamp(latestJob.completed_at || latestJob.started_at)} with ${latestJob.archived_record_count || 0} records across ${latestJob.archived_object_count || 0} object(s). ${archivedSummary}`;
+			}
+
 			function renderBinLookupResults(response) {
 				elements.binLookupResults.replaceChildren();
 				const matches = Array.isArray(response?.matches)
@@ -2828,13 +3462,22 @@
 
 			function renderRuns(runs) {
 				elements.runsList.replaceChildren();
-				const hasRuns = Array.isArray(runs) && runs.length > 0;
+				const entries = (Array.isArray(runs) ? runs : []).filter(run =>
+					matchesWorkerPoolFilter(
+						run?.scope?.worker_pool || null,
+						state.runWorkerPoolFilter
+					)
+				);
+				const hasRuns = entries.length > 0;
 				elements.runsEmpty.classList.toggle('hidden', hasRuns);
 				if (!hasRuns) {
+					elements.runsEmpty.textContent = state.runWorkerPoolFilter
+						? 'No scan runs matched the current worker-pool filter.'
+						: 'No scan runs recorded yet.';
 					return;
 				}
 
-				runs.forEach(run => {
+				entries.forEach(run => {
 					const item = document.createElement('li');
 					item.className = 'list-item';
 
@@ -2855,6 +3498,16 @@
 					footer.textContent = `Requested by ${run.requested_by || 'system'} • Started ${formatTimestamp(run.started_at)} • Completed ${formatTimestamp(run.completed_at)}`;
 
 					item.append(heading, body, scope, footer);
+					const activeAuthorizedExecution =
+						describeActiveAuthorizedExecution(run);
+					if (activeAuthorizedExecution) {
+						const executionDetail =
+							document.createElement('small');
+						executionDetail.className = 'muted';
+						executionDetail.textContent =
+							activeAuthorizedExecution;
+						item.appendChild(executionDetail);
+					}
 					elements.runsList.appendChild(item);
 				});
 			}
@@ -2906,6 +3559,16 @@
 					}
 
 					item.append(heading, body, scope, detail);
+					const activeAuthorizedExecution =
+						describeActiveAuthorizedExecution(schedule);
+					if (activeAuthorizedExecution) {
+						const executionDetail =
+							document.createElement('small');
+						executionDetail.className = 'muted';
+						executionDetail.textContent =
+							activeAuthorizedExecution;
+						item.appendChild(executionDetail);
+					}
 
 					if (schedule.last_error) {
 						const errorDetail = document.createElement('small');
@@ -2943,9 +3606,15 @@
 					heading.className = 'finding-heading';
 					const label = document.createElement('strong');
 					label.textContent = `${finding.target_label} • ${finding.detector}`;
+					heading.append(label, severityBadge(finding.severity));
+					if (finding.confidence) {
+						heading.append(
+							statusBadge(
+								formatFindingConfidence(finding.confidence)
+							)
+						);
+					}
 					heading.append(
-						label,
-						severityBadge(finding.severity),
 						statusBadge(
 							formatTargetStrategy(finding.target_strategy)
 						),
@@ -2964,6 +3633,22 @@
 					evidence.className = 'muted';
 					evidence.textContent = `${finding.evidence} • ${formatTimestamp(finding.discovered_at)}`;
 
+					const matchedSignals = document.createElement('small');
+					matchedSignals.className = 'muted';
+					matchedSignals.textContent =
+						Array.isArray(finding.matched_signals) &&
+						finding.matched_signals.length
+							? `Matched signals: ${finding.matched_signals.join(', ')}`
+							: 'Matched signals unavailable';
+
+					const reviewLabels = document.createElement('small');
+					reviewLabels.className = 'muted';
+					reviewLabels.textContent =
+						Array.isArray(finding.review_labels) &&
+						finding.review_labels.length
+							? `Review labels: ${finding.review_labels.join(', ')}`
+							: 'Review labels unavailable';
+
 					const publicationState = document.createElement('small');
 					publicationState.className = 'muted';
 					publicationState.textContent =
@@ -2980,9 +3665,56 @@
 						heading,
 						body,
 						evidence,
+						matchedSignals,
+						reviewLabels,
 						publicationState,
 						publicationSummary
 					);
+
+					if (finding.plugin_metadata) {
+						const pluginMeta = document.createElement('small');
+						pluginMeta.className = 'muted';
+						const details = [
+							`Plugin ${finding.plugin_metadata.plugin_id}`,
+							formatPluginCatalogValue(
+								finding.plugin_metadata.plugin_family
+							),
+							formatPluginCatalogValue(
+								finding.plugin_metadata.leakix_label
+							),
+							formatPluginCatalogValue(
+								finding.plugin_metadata.execution_mode
+							)
+						];
+						if (finding.plugin_metadata.product_name) {
+							details.push(finding.plugin_metadata.product_name);
+						}
+						if (finding.plugin_metadata.product_version) {
+							details.push(
+								`version ${finding.plugin_metadata.product_version}`
+							);
+						}
+						if (
+							Array.isArray(finding.plugin_metadata.cve_ids) &&
+							finding.plugin_metadata.cve_ids.length
+						) {
+							details.push(
+								`CVEs ${finding.plugin_metadata.cve_ids.join(', ')}`
+							);
+						}
+						if (finding.plugin_metadata.kev_matched === true) {
+							details.push('KEV');
+						}
+						if (finding.plugin_metadata.implementation_source) {
+							details.push(
+								formatImplementationSource(
+									finding.plugin_metadata.implementation_source
+								)
+							);
+						}
+						pluginMeta.textContent = details.join(' • ');
+						item.appendChild(pluginMeta);
+					}
 
 					if (
 						canViewPrivatePublicationNotes() &&
@@ -3282,6 +4014,17 @@
 				return parts.join(' • ');
 			}
 
+			function formatFollowOnRunPolicy(policy) {
+				if (!policy || !policy.enabled) {
+					return 'Follow-on scan disabled';
+				}
+				const parts = ['Follow-on scan enabled'];
+				if (policy.worker_pool) {
+					parts.push(`pool ${policy.worker_pool}`);
+				}
+				return parts.join(' • ');
+			}
+
 			function defaultBootstrapTokenLabel(candidate) {
 				const normalizedHost = String(candidate?.discovered_host || '')
 					.trim()
@@ -3557,6 +4300,52 @@
 				return updated;
 			}
 
+			async function requestWorkerRemoteUpdate(worker) {
+				const updated = await request(
+					`/api/workers/${encodeURIComponent(worker.worker_id)}/remote-update`,
+					{
+						method: 'POST'
+					}
+				);
+				prependEvent(
+					`Queued a remote update for ${worker.display_name || worker.worker_id}.`
+				);
+				await loadDashboard();
+				return updated;
+			}
+
+			async function requestAllWorkerRemoteUpdates() {
+				const updated = await request('/api/workers/remote-update-all', {
+					method: 'POST'
+				});
+				const count = Array.isArray(updated) ? updated.length : 0;
+				prependEvent(
+					count
+						? `Queued remote updates for ${count} worker${count === 1 ? '' : 's'}.`
+						: 'No eligible workers needed a remote update.'
+				);
+				await loadDashboard();
+				return updated;
+			}
+
+			async function queueWorkerRemoteCommand(worker, command, timeoutSeconds) {
+				const queued = await request(
+					`/api/workers/${encodeURIComponent(worker.worker_id)}/remote-commands`,
+					{
+						method: 'POST',
+						body: JSON.stringify({
+							command,
+							timeout_seconds: timeoutSeconds || null
+						})
+					}
+				);
+				prependEvent(
+					`Queued remote debug command on ${worker.display_name || worker.worker_id}.`
+				);
+				await loadDashboard();
+				return queued;
+			}
+
 			async function revokeWorkerEnrollmentToken(token) {
 				const revoked = await request(
 					`/api/worker-enrollment-tokens/${token.id}/revoke`,
@@ -3631,7 +4420,21 @@
 				const approvals = canApproveBootstrapCandidates()
 					? 'Bootstrap candidate approvals are enabled.'
 					: 'Bootstrap approvals are read-only.';
-				elements.workerFleetNote.textContent = `${visibility} ${approvals}`;
+				const platformCounts = new Map();
+				workers.forEach(worker => {
+					const platform = formatWorkerPlatform(worker);
+					platformCounts.set(
+						platform,
+						(platformCounts.get(platform) || 0) + 1
+					);
+				});
+				const platformSummary = Array.from(platformCounts.entries())
+					.sort((left, right) => left[0].localeCompare(right[0]))
+					.map(([platform, count]) => `${platform} × ${count}`)
+					.join(' • ');
+				elements.workerFleetNote.textContent = `${visibility} ${approvals}${
+					platformSummary ? ` Platforms: ${platformSummary}.` : ''
+				}`;
 			}
 
 			function renderWorkerPools(pools) {
@@ -3725,6 +4528,9 @@
 					if (scan.bootstrap_policy?.enabled) {
 						heading.appendChild(createPill('Bootstrap enabled'));
 					}
+					if (scan.follow_on_run_policy?.enabled) {
+						heading.appendChild(createPill('Follow-on scan'));
+					}
 					if (scan.queued_run_id) {
 						heading.appendChild(
 							createPill(`Run #${scan.queued_run_id}`)
@@ -3752,6 +4558,7 @@
 						`Requested by ${scan.requested_by || 'system'}`,
 						`Rate ${scan.rate_limit || 0}`,
 						`Tags ${formatList(scan.tags, 'none')}`,
+						formatFollowOnRunPolicy(scan.follow_on_run_policy),
 						formatBootstrapPolicy(scan.bootstrap_policy)
 					].join(' • ');
 
@@ -3759,12 +4566,42 @@
 					totals.className = 'muted';
 					totals.textContent = [
 						`${scan.discovered_endpoints_total || 0} endpoints`,
+						`${(scan.protocol_findings || []).length} protocol matches`,
 						`${scan.imported_targets_total || 0} imported targets`,
 						`${scan.bootstrap_candidates_total || 0} bootstrap candidates`,
 						`Completed ${formatTimestamp(scan.completed_at)}`
 					].join(' • ');
 
 					item.append(heading, target, detail, totals);
+					const activeAuthorizedExecution =
+						describeActiveAuthorizedExecution(scan);
+					if (activeAuthorizedExecution) {
+						const executionDetail =
+							document.createElement('small');
+						executionDetail.className = 'muted';
+						executionDetail.textContent =
+							activeAuthorizedExecution;
+						item.appendChild(executionDetail);
+					}
+					if (Array.isArray(scan.protocol_findings) && scan.protocol_findings.length) {
+						const protocolFindings = document.createElement('small');
+						protocolFindings.className = 'muted';
+						protocolFindings.textContent = `Protocol findings: ${scan.protocol_findings
+							.slice(0, 6)
+							.map(match =>
+								`${match.plugin_metadata?.plugin_id || 'plugin'}${
+									match.plugin_metadata?.implementation_source
+										? ` (${formatImplementationSource(match.plugin_metadata.implementation_source)})`
+										: ''
+								} ${match.host}:${match.port}`
+							)
+							.join(' • ')}${
+							scan.protocol_findings.length > 6
+								? ` • +${scan.protocol_findings.length - 6} more`
+								: ''
+						}`;
+						item.appendChild(protocolFindings);
+					}
 					if (scan.notes) {
 						const notes = document.createElement('small');
 						notes.className = 'muted';
@@ -3775,29 +4612,118 @@
 				});
 			}
 
-			function renderWorkers(workers) {
-				elements.workersList.replaceChildren();
-				const entries = (Array.isArray(workers) ? workers : []).filter(
+			function renderWorkerRemoteCommands(commands) {
+				elements.workerRemoteCommandsList.replaceChildren();
+				const entries = (Array.isArray(commands) ? commands : []).filter(
 					Boolean
 				);
+				const hasCommands = entries.length > 0;
+				elements.workerRemoteCommandsEmpty.classList.toggle(
+					'hidden',
+					hasCommands
+				);
+				if (!hasCommands) {
+					return;
+				}
+
+				entries.forEach(command => {
+					const item = document.createElement('li');
+					item.className = 'list-item';
+
+					const heading = document.createElement('div');
+					heading.className = 'finding-heading';
+					const label = document.createElement('strong');
+					label.textContent = `#${command.id} • ${command.worker_id}`;
+					heading.append(label, statusBadge(command.status));
+
+					const shell = document.createElement('code');
+					shell.textContent = command.command || '—';
+
+					const detail = document.createElement('small');
+					detail.className = 'muted';
+					detail.textContent = [
+						`Requested by ${command.requested_by || 'operator'}`,
+						`Timeout ${command.timeout_seconds || 0}s`,
+						`Started ${formatTimestamp(command.started_at)}`,
+						`Finished ${formatTimestamp(command.completed_at)}`
+					].join(' • ');
+
+					item.append(heading, shell, detail);
+
+					if (command.stdout) {
+						const stdout = document.createElement('pre');
+						stdout.textContent = `stdout:\n${command.stdout}`;
+						item.appendChild(stdout);
+					}
+					if (command.stderr) {
+						const stderr = document.createElement('pre');
+						stderr.textContent = `stderr:\n${command.stderr}`;
+						item.appendChild(stderr);
+					}
+					if (command.error) {
+						const error = document.createElement('small');
+						error.className = 'error';
+						error.textContent = command.error;
+						item.appendChild(error);
+					}
+
+					elements.workerRemoteCommandsList.appendChild(item);
+				});
+			}
+
+			function renderWorkers(workers) {
+				elements.workersList.replaceChildren();
+				const entries = (Array.isArray(workers) ? workers : [])
+					.filter(Boolean)
+					.filter(worker =>
+						matchesWorkerPoolFilter(
+							worker?.worker_pool || null,
+							state.workerPoolFilter
+						)
+					);
+				const eligibleRemoteUpdateWorkers = entries.filter(
+					worker =>
+						worker &&
+						worker.supports_remote_updates &&
+						worker.lifecycle_state !== 'revoked' &&
+						!worker.remote_update_requested_at
+				);
+				elements.workersRemoteUpdateAll.disabled =
+					eligibleRemoteUpdateWorkers.length === 0;
+				elements.workersRemoteUpdateAll.textContent =
+					eligibleRemoteUpdateWorkers.length > 0
+						? `Update all (${eligibleRemoteUpdateWorkers.length})`
+						: 'Update all';
 				const hasWorkers = entries.length > 0;
 				elements.workersEmpty.classList.toggle('hidden', hasWorkers);
 				if (!hasWorkers) {
+					elements.workersEmpty.textContent = state.workerPoolFilter
+						? 'No workers matched the current worker-pool filter.'
+						: 'No workers have registered yet.';
 					return;
 				}
+
+				let currentPlatformGroup = null;
 
 				entries
 					.slice()
 					.sort((left, right) =>
-						(
-							left.display_name ||
-							left.worker_id ||
-							''
-						).localeCompare(
-							right.display_name || right.worker_id || ''
+						`${formatWorkerPlatform(left)}::${left.display_name || left.worker_id || ''}`.localeCompare(
+							`${formatWorkerPlatform(right)}::${right.display_name || right.worker_id || ''}`
 						)
 					)
 					.forEach(worker => {
+						const platformGroup = formatWorkerPlatform(worker);
+						if (platformGroup !== currentPlatformGroup) {
+							currentPlatformGroup = platformGroup;
+							const groupItem = document.createElement('li');
+							groupItem.className = 'list-item';
+							const groupLabel = document.createElement('strong');
+							groupLabel.textContent = `Platform ${platformGroup}`;
+							groupItem.appendChild(groupLabel);
+							elements.workersList.appendChild(groupItem);
+						}
+
 						const item = document.createElement('li');
 						item.className = 'list-item';
 
@@ -3820,6 +4746,18 @@
 								createPill(`Pool ${worker.worker_pool}`)
 							);
 						}
+						heading.appendChild(
+							createPill(formatWorkerPlatform(worker))
+						);
+						if (worker.supports_remote_updates) {
+							heading.appendChild(createPill('Remote updates'));
+						}
+						if (worker.supports_remote_debug_commands) {
+							heading.appendChild(createPill('Remote debug'));
+						}
+						if (worker.remote_update_requested_at) {
+							heading.appendChild(createPill('Update queued'));
+						}
 
 						const identity = document.createElement('p');
 						identity.className = 'muted';
@@ -3836,6 +4774,19 @@
 						adapters.className = 'muted';
 						adapters.textContent = `Scanner adapters: ${formatList(worker.scanner_adapters, 'none')}`;
 
+						const network = document.createElement('small');
+						network.className = 'muted';
+						const localIps =
+							Array.isArray(worker.local_ip_addresses) &&
+							worker.local_ip_addresses.length > 0
+								? worker.local_ip_addresses.join(', ')
+								: 'none';
+						const publicIp = worker.public_ip_address || 'unknown';
+						const publicCheckedAt = worker.public_ip_checked_at
+							? ` (${formatTimestamp(worker.public_ip_checked_at)})`
+							: '';
+						network.textContent = `Local IPs: ${localIps} • Public IP: ${publicIp}${publicCheckedAt}`;
+
 						const timing = document.createElement('small');
 						timing.className = 'muted';
 						timing.textContent = [
@@ -3849,8 +4800,26 @@
 							identity,
 							capabilities,
 							adapters,
+							network,
 							timing
 						);
+						if (worker.remote_update_requested_at) {
+							const remoteUpdate = document.createElement('small');
+							remoteUpdate.className = 'muted';
+							remoteUpdate.textContent = `Remote update requested ${formatTimestamp(worker.remote_update_requested_at)}`;
+							item.appendChild(remoteUpdate);
+						}
+						if (worker.remote_update_status) {
+							const remoteUpdateStatus =
+								document.createElement('small');
+							remoteUpdateStatus.className = 'muted';
+							remoteUpdateStatus.textContent = `Update status: ${formatHumanLabel(worker.remote_update_status)} • ${formatTimestamp(worker.remote_update_status_updated_at)}${
+								worker.remote_update_status_message
+									? ` • ${worker.remote_update_status_message}`
+									: ''
+							}`;
+							item.appendChild(remoteUpdateStatus);
+						}
 						if (worker.enrollment_token_id) {
 							const enrollment = document.createElement('small');
 							enrollment.className = 'muted';
@@ -3940,11 +4909,86 @@
 								actions.appendChild(button);
 							});
 
+							if (worker.supports_remote_updates) {
+								const updateButton = document.createElement('button');
+								updateButton.type = 'button';
+								updateButton.textContent = worker.remote_update_requested_at
+									? 'Update queued'
+									: 'Update';
+								updateButton.disabled = Boolean(
+									worker.remote_update_requested_at
+								);
+								updateButton.addEventListener('click', async () => {
+									try {
+										if (
+											!window.confirm(
+												`Queue a remote self-update for ${worker.display_name || worker.worker_id}?`
+											)
+										) {
+											return;
+										}
+										await requestWorkerRemoteUpdate(worker);
+									} catch (error) {
+										handleRequestError(
+											error,
+											`Failed to queue a remote update for ${worker.worker_id}.`
+										);
+									}
+								});
+								actions.appendChild(updateButton);
+							}
+
+							if (worker.supports_remote_debug_commands) {
+								const commandButton = document.createElement('button');
+								commandButton.type = 'button';
+								commandButton.textContent = 'Run cmd';
+								commandButton.addEventListener('click', async () => {
+									const command = window.prompt(
+										`Run a remote debug command on ${worker.display_name || worker.worker_id}:`,
+										'id; uname -a; ip a'
+									);
+									if (!command || !command.trim()) {
+										return;
+									}
+									const timeoutRaw = window.prompt(
+										'Timeout in seconds',
+										'30'
+									);
+									const timeoutSeconds = normalizePositiveInteger(
+										String(timeoutRaw || '').trim()
+									);
+									try {
+										await queueWorkerRemoteCommand(
+											worker,
+											command.trim(),
+											timeoutSeconds
+										);
+									} catch (error) {
+										handleRequestError(
+											error,
+											`Failed to queue a remote debug command for ${worker.worker_id}.`
+										);
+									}
+								});
+								actions.appendChild(commandButton);
+							}
+
 							item.appendChild(actions);
 						}
 
 						elements.workersList.appendChild(item);
 					});
+			}
+
+			function formatWorkerPlatform(worker) {
+				const operatingSystem =
+					String(worker?.operating_system || '').trim() || 'unknown-os';
+				const architecture =
+					String(worker?.architecture || '').trim() || 'unknown-arch';
+				const platform =
+					String(worker?.platform || '').trim() ||
+					`${operatingSystem}-${architecture}`;
+				return platform;
 			}
 
 			function renderWorkerEnrollmentTokens(tokens) {
@@ -4296,12 +5340,28 @@
 						const queuedRun = event.queued_run?.id
 							? ` • queued run #${event.queued_run.id}`
 							: '';
-						return `Port scan #${event.port_scan.id} completed with ${event.port_scan.discovered_endpoints_total || 0} endpoints${queuedRun}`;
+						const protocolMatches = (event.port_scan.protocol_findings || []).length;
+						const protocolNote = protocolMatches
+							? ` • ${protocolMatches} protocol match${
+									protocolMatches === 1 ? '' : 'es'
+							  }`
+							: '';
+						return `Port scan #${event.port_scan.id} completed with ${event.port_scan.discovered_endpoints_total || 0} endpoints${protocolNote}${queuedRun}`;
 					}
 					case 'port_scan_failed':
 						return `Port scan #${event.port_scan.id} failed: ${event.error}`;
 					case 'worker_state_changed':
 						return `Worker ${event.worker.display_name || event.worker.worker_id} is now ${formatHumanLabel(event.worker.lifecycle_state)}`;
+					case 'worker_remote_update_requested':
+						return `Worker ${event.worker.display_name || event.worker.worker_id} queued for a remote update`;
+					case 'worker_remote_command_queued':
+						return `Queued remote command #${event.command.id} for ${event.command.worker_id}`;
+					case 'worker_remote_command_started':
+						return `Remote command #${event.command.id} started on ${event.command.worker_id}`;
+					case 'worker_remote_command_completed':
+						return `Remote command #${event.command.id} completed on ${event.command.worker_id}`;
+					case 'worker_remote_command_failed':
+						return `Remote command #${event.command.id} failed on ${event.command.worker_id}: ${event.error}`;
 					case 'worker_enrollment_token_issued':
 						return `Enrollment token ${event.token.label} issued`;
 					case 'worker_enrollment_token_revoked':
@@ -4356,6 +5416,9 @@
 				renderWorkerPools(snapshot.worker_pools || []);
 				renderPortScans(snapshot.recent_port_scans || []);
 				renderWorkers(snapshot.workers || []);
+				renderWorkerRemoteCommands(
+					snapshot.recent_worker_remote_commands || []
+				);
 				renderWorkerEnrollmentTokens(
 					snapshot.worker_enrollment_tokens || []
 				);
@@ -4380,7 +5443,10 @@
 				);
 				renderGobusterDefaults(snapshot.scan_defaults || {});
 				renderBinDatasetStatus(snapshot.bin_dataset_status || null);
+				renderArchiveStatus(snapshot.archive_status || null);
 				await loadFindings();
+				await loadPluginCatalog();
+				syncActiveAuthorizedGateUi();
 				elements.connectionState.textContent =
 					'Dashboard updated successfully.';
 			}
@@ -4473,6 +5539,24 @@
 				return normalized ? normalized : null;
 			}
 
+			function normalizeWorkerPoolFilterValue(value) {
+				return String(value || '').trim().toLowerCase();
+			}
+
+			function matchesWorkerPoolFilter(workerPool, filterValue) {
+				const filter = normalizeWorkerPoolFilterValue(filterValue);
+				if (!filter) {
+					return true;
+				}
+				const normalizedPool = normalizeWorkerPoolFilterValue(
+					workerPool || ''
+				);
+				if (['unassigned', 'none', 'global', 'any'].includes(filter)) {
+					return !normalizedPool;
+				}
+				return normalizedPool.includes(filter);
+			}
+
 			function hasActiveFindingsQuery(query) {
 				if (!query || typeof query !== 'object') {
 					return false;
@@ -4480,10 +5564,19 @@
 				return Boolean(
 					normalizeOptionalText(query.q) ||
 						normalizeOptionalText(query.severity) ||
+						normalizeOptionalText(query.confidence) ||
 						normalizeOptionalText(query.detector) ||
+						normalizeOptionalText(query.plugin_id) ||
+						normalizeOptionalText(query.plugin_family) ||
+						normalizeOptionalText(query.execution_mode) ||
+						normalizeOptionalText(query.leakix_label) ||
 						normalizeOptionalText(query.path_prefix) ||
 						(Array.isArray(query.tags) &&
 							query.tags.some(tag => normalizeOptionalText(tag))) ||
+						(Array.isArray(query.review_labels) &&
+							query.review_labels.some(label =>
+								normalizeOptionalText(label)
+							)) ||
 						normalizePositiveInteger(query.run_id) ||
 						normalizePositiveInteger(query.target_id) ||
 						normalizePositiveInteger(query.limit)
@@ -4496,14 +5589,34 @@
 					severity: document
 						.getElementById('findings-severity')
 						.value.trim(),
+					confidence: document
+						.getElementById('findings-confidence')
+						.value.trim(),
 					detector: document
 						.getElementById('findings-detector')
+						.value.trim(),
+					plugin_id: document
+						.getElementById('findings-plugin-id')
+						.value.trim(),
+					plugin_family: document
+						.getElementById('findings-plugin-family')
+						.value.trim(),
+					execution_mode: document
+						.getElementById('findings-execution-mode')
+						.value.trim(),
+					leakix_label: document
+						.getElementById('findings-leakix-label')
 						.value.trim(),
 					path_prefix: document
 						.getElementById('findings-path-prefix')
 						.value.trim(),
 					tags: splitList(
 						document.getElementById('findings-tags').value.trim()
+					),
+					review_labels: splitList(
+						document
+							.getElementById('findings-review-labels')
+							.value.trim()
 					),
 					run_id: normalizePositiveInteger(
 						document.getElementById('findings-run-id').value.trim()
@@ -4524,14 +5637,32 @@
 				if (!query.severity) {
 					delete query.severity;
 				}
+				if (!query.confidence) {
+					delete query.confidence;
+				}
 				if (!query.detector) {
 					delete query.detector;
+				}
+				if (!query.plugin_id) {
+					delete query.plugin_id;
+				}
+				if (!query.plugin_family) {
+					delete query.plugin_family;
+				}
+				if (!query.execution_mode) {
+					delete query.execution_mode;
+				}
+				if (!query.leakix_label) {
+					delete query.leakix_label;
 				}
 				if (!query.path_prefix) {
 					delete query.path_prefix;
 				}
 				if (!query.tags.length) {
 					delete query.tags;
+				}
+				if (!query.review_labels.length) {
+					delete query.review_labels;
 				}
 				if (!query.run_id) {
 					delete query.run_id;
@@ -4566,8 +5697,23 @@
 				if (query.severity) {
 					params.set('severity', query.severity);
 				}
+				if (query.confidence) {
+					params.set('confidence', query.confidence);
+				}
 				if (query.detector) {
 					params.set('detector', query.detector);
+				}
+				if (query.plugin_id) {
+					params.set('plugin_id', query.plugin_id);
+				}
+				if (query.plugin_family) {
+					params.set('plugin_family', query.plugin_family);
+				}
+				if (query.execution_mode) {
+					params.set('execution_mode', query.execution_mode);
+				}
+				if (query.leakix_label) {
+					params.set('leakix_label', query.leakix_label);
 				}
 				if (query.path_prefix) {
 					params.set('path_prefix', query.path_prefix);
@@ -4576,6 +5722,9 @@
 					params.set('q', query.q);
 				}
 				(query.tags || []).forEach(tag => params.append('tags', tag));
+				(query.review_labels || []).forEach(label =>
+					params.append('review_labels', label)
+				);
 				return params;
 			}
 
@@ -4591,14 +5740,40 @@
 				if (query.severity) {
 					parts.push(`severity ${query.severity}`);
 				}
+				if (query.confidence) {
+					parts.push(`confidence ${query.confidence}`);
+				}
 				if (query.detector) {
 					parts.push(`detector ${query.detector}`);
+				}
+				if (query.plugin_id) {
+					parts.push(`plugin ${query.plugin_id}`);
+				}
+				if (query.plugin_family) {
+					parts.push(
+						`family ${formatPluginCatalogValue(query.plugin_family)}`
+					);
+				}
+				if (query.execution_mode) {
+					parts.push(
+						`mode ${formatPluginCatalogValue(query.execution_mode)}`
+					);
+				}
+				if (query.leakix_label) {
+					parts.push(
+						`label ${formatPluginCatalogValue(query.leakix_label)}`
+					);
 				}
 				if (query.path_prefix) {
 					parts.push(`path ${query.path_prefix}`);
 				}
 				if (query.tags && query.tags.length) {
 					parts.push(`tags ${query.tags.join(', ')}`);
+				}
+				if (query.review_labels && query.review_labels.length) {
+					parts.push(
+						`review labels ${query.review_labels.join(', ')}`
+					);
 				}
 				if (query.run_id) {
 					parts.push(`run #${query.run_id}`);
@@ -4610,6 +5785,383 @@
 					parts.push(`limit ${query.limit}`);
 				}
 				return `Showing findings filtered by ${parts.join(' • ')}.`;
+			}
+
+			function formatPluginCatalogValue(value) {
+				return String(value || '')
+					.split('_')
+					.map(part =>
+						part ? `${part[0].toUpperCase()}${part.slice(1)}` : ''
+					)
+					.join(' ');
+			}
+
+			function formatFindingConfidence(value) {
+				return value
+					? `Confidence ${formatPluginCatalogValue(value)}`
+					: 'Confidence unknown';
+			}
+
+			function formatImplementationSource(value) {
+				return value
+					? formatPluginCatalogValue(value)
+					: 'Implementation source unavailable';
+			}
+
+			function formatCoverageStatus(value) {
+				return value
+					? formatPluginCatalogValue(value)
+					: 'Coverage unavailable';
+			}
+
+			function normalizeBooleanLike(value) {
+				if (typeof value === 'boolean') {
+					return value;
+				}
+				if (typeof value === 'number') {
+					return value !== 0;
+				}
+				if (typeof value === 'string') {
+					const normalized = value.trim().toLowerCase();
+					if (normalized === 'true') {
+						return true;
+					}
+					if (normalized === 'false') {
+						return false;
+					}
+				}
+				return null;
+			}
+
+			function lookupPolicyBoolean(candidates, keys) {
+				for (const candidate of candidates) {
+					if (!candidate || typeof candidate !== 'object') {
+						continue;
+					}
+					for (const key of keys) {
+						const normalized = normalizeBooleanLike(candidate[key]);
+						if (normalized !== null) {
+							return normalized;
+						}
+					}
+				}
+				return null;
+			}
+
+			function resolveActiveAuthorizedGateState() {
+				const candidates = [
+					state.dashboardSnapshot?.plugin_execution_policy,
+					state.dashboardSnapshot?.active_authorized_execution_policy,
+					state.dashboardSnapshot?.plugin_policy,
+					state.pluginCatalog?.policy,
+					state.pluginCatalog?.summary
+				];
+				const supported = lookupPolicyBoolean(candidates, [
+					'active_authorized_supported',
+					'supports_active_authorized',
+					'active_authorized_available'
+				]);
+				const enabled = lookupPolicyBoolean(candidates, [
+					'active_authorized_gate_enabled',
+					'active_authorized_enabled',
+					'allow_active_authorized_execution'
+				]);
+				if (enabled === true) {
+					return {
+						shortLabel: 'Gate enabled',
+						note: 'Global active-authorized execution is enabled. Opted-in runs, schedules, and port scans can execute active-authorized plugins.',
+						enabled: true,
+						supported
+					};
+				}
+				if (enabled === false) {
+					return {
+						shortLabel: 'Gate disabled',
+						note: 'Global active-authorized execution is disabled. Opt-in controls stay visible but active-authorized plugins remain suppressed until the gate is enabled.',
+						enabled: false,
+						supported
+					};
+				}
+				if (supported === false) {
+					return {
+						shortLabel: 'Gate unavailable',
+						note: 'This server does not publish active-authorized execution support yet. The UI keeps the controls visible for forward compatibility and defaults them to off.',
+						enabled: null,
+						supported: false
+					};
+				}
+				return {
+					shortLabel: 'Gate pending',
+					note: 'Active-authorized execution support has not been published by the server yet. Controls default to off and should be treated as no-op until backend support lands.',
+					enabled: null,
+					supported: null
+				};
+			}
+
+			function syncActiveAuthorizedGateUi() {
+				const gate = resolveActiveAuthorizedGateState();
+				[
+					elements.runActiveAuthorizedGate,
+					elements.scheduleActiveAuthorizedGate,
+					elements.portScanActiveAuthorizedGate
+				]
+					.filter(Boolean)
+					.forEach(element => {
+						element.textContent = gate.shortLabel;
+					});
+				[
+					elements.runActiveAuthorizedNote,
+					elements.scheduleActiveAuthorizedNote,
+					elements.portScanActiveAuthorizedNote,
+					elements.pluginCatalogGateNote
+				]
+					.filter(Boolean)
+					.forEach(element => {
+						element.textContent = gate.note;
+					});
+			}
+
+			function buildActiveAuthorizedExecutionPayload(checkboxId) {
+				return {
+					enabled: Boolean(document.getElementById(checkboxId)?.checked)
+				};
+			}
+
+			function normalizeActiveAuthorizedExecution(record) {
+				if (!record || typeof record !== 'object') {
+					return null;
+				}
+				if (typeof record.active_authorized_execution === 'object') {
+					const normalized = normalizeBooleanLike(
+						record.active_authorized_execution?.enabled
+					);
+					if (normalized !== null) {
+						return normalized;
+					}
+				}
+				const rootKeys = [
+					'allow_active_authorized_execution',
+					'active_authorized_enabled',
+					'allow_active_authorized_plugins'
+				];
+				for (const key of rootKeys) {
+					const normalized = normalizeBooleanLike(record[key]);
+					if (normalized !== null) {
+						return normalized;
+					}
+				}
+				return null;
+			}
+
+			function describeActiveAuthorizedExecution(record) {
+				const enabled = normalizeActiveAuthorizedExecution(record);
+				if (enabled === true) {
+					return 'Active-authorized opt-in enabled';
+				}
+				if (enabled === false) {
+					return 'Active-authorized opt-in off';
+				}
+				return null;
+			}
+
+			function hasActivePluginCatalogQuery(query) {
+				if (!query || typeof query !== 'object') {
+					return false;
+				}
+				return Boolean(
+					normalizeOptionalText(query.q) ||
+						normalizeOptionalText(query.family) ||
+						normalizeOptionalText(query.leakix_label) ||
+						normalizeOptionalText(query.execution_mode) ||
+						normalizeOptionalText(query.status) ||
+						normalizeOptionalText(query.coverage_status) ||
+						normalizePositiveInteger(query.limit)
+				);
+			}
+
+			function buildPluginCatalogQuery() {
+				const query = {
+					q: document.getElementById('plugins-query').value.trim(),
+					family: document.getElementById('plugins-family').value.trim(),
+					leakix_label: document
+						.getElementById('plugins-label')
+						.value.trim(),
+					execution_mode: document
+						.getElementById('plugins-execution-mode')
+						.value.trim(),
+					status: document
+						.getElementById('plugins-status')
+						.value.trim(),
+					coverage_status: document
+						.getElementById('plugins-coverage-status')
+						.value.trim(),
+					limit: normalizePositiveInteger(
+						document.getElementById('plugins-limit').value.trim()
+					)
+				};
+
+				Object.keys(query).forEach(key => {
+					if (!query[key]) {
+						delete query[key];
+					}
+				});
+				if (query.limit) {
+					query.limit = Math.max(1, Math.min(500, query.limit));
+				}
+				return hasActivePluginCatalogQuery(query) ? query : null;
+			}
+
+			function pluginCatalogQueryToSearchParams(query) {
+				const params = new URLSearchParams();
+				if (!query) {
+					return params;
+				}
+				Object.entries(query).forEach(([key, value]) => {
+					if (value) {
+						params.set(key, String(value));
+					}
+				});
+				return params;
+			}
+
+			function describePluginCatalogQuery(response, query) {
+				const summary = response?.summary || {};
+				const filteredTotal = Array.isArray(response?.plugins)
+					? response.plugins.length
+					: 0;
+				const base = `${filteredTotal} shown • ${summary.total || 0} total • ${summary.first_class_total || 0} first class • ${summary.external_scanner_only_total || 0} external scanner only`;
+				if (!hasActivePluginCatalogQuery(query)) {
+					return `Showing full plugin catalog. ${base}.`;
+				}
+
+				const parts = [];
+				if (query.q) {
+					parts.push(`text "${query.q}"`);
+				}
+				if (query.family) {
+					parts.push(`family ${formatPluginCatalogValue(query.family)}`);
+				}
+				if (query.leakix_label) {
+					parts.push(`label ${formatPluginCatalogValue(query.leakix_label)}`);
+				}
+				if (query.execution_mode) {
+					parts.push(
+						`mode ${formatPluginCatalogValue(query.execution_mode)}`
+					);
+				}
+				if (query.status) {
+					parts.push(`status ${formatPluginCatalogValue(query.status)}`);
+				}
+				if (query.coverage_status) {
+					parts.push(
+						`coverage ${formatCoverageStatus(query.coverage_status)}`
+					);
+				}
+				if (query.limit) {
+					parts.push(`limit ${query.limit}`);
+				}
+				return `Showing plugins filtered by ${parts.join(' • ')}. ${base}.`;
+			}
+
+			function renderPluginCatalog(response) {
+				state.pluginCatalog = response || null;
+				const plugins = Array.isArray(response?.plugins)
+					? response.plugins
+					: [];
+				elements.pluginCatalogList.replaceChildren();
+				elements.pluginCatalogEmpty.classList.toggle(
+					'hidden',
+					plugins.length > 0
+				);
+				elements.pluginCatalogEmpty.textContent = hasActivePluginCatalogQuery(
+					state.pluginCatalogQuery
+				)
+					? 'No plugin entries matched the current filters.'
+					: 'No plugin entries are available right now.';
+				elements.pluginQueryStatus.textContent = describePluginCatalogQuery(
+					response,
+					state.pluginCatalogQuery
+				);
+				if (!response?.summary) {
+					elements.pluginCatalogNote.textContent =
+						'Plugin catalog data is not available yet.';
+					return;
+				}
+
+				elements.pluginCatalogNote.textContent = `Modeled registry: ${response.summary.total} total • ${response.summary.first_class_total} first class • ${response.summary.external_scanner_only_total} external scanner only • ${response.summary.public_total} Public • ${response.summary.trusted_pro_total} Trusted / Pro.`;
+				syncActiveAuthorizedGateUi();
+
+				plugins.forEach(plugin => {
+					const item = document.createElement('li');
+					item.className = 'list-item';
+
+					const heading = document.createElement('div');
+					heading.className = 'finding-heading';
+					const label = document.createElement('strong');
+					label.textContent = `${plugin.plugin_id} • ${plugin.display_name}`;
+					heading.append(
+						label,
+						statusBadge(plugin.leakix_label),
+						statusBadge(plugin.family),
+						statusBadge(plugin.execution_mode),
+						statusBadge(plugin.status)
+					);
+					if (plugin.coverage_status) {
+						heading.appendChild(
+							createPill(
+								formatCoverageStatus(plugin.coverage_status)
+							)
+						);
+					}
+					if (plugin.implementation_source) {
+						heading.appendChild(
+							createPill(
+								formatImplementationSource(
+									plugin.implementation_source
+								)
+							)
+						);
+					}
+
+					const details = document.createElement('small');
+					details.className = 'muted';
+					const notes = plugin.notes ? ` • ${plugin.notes}` : '';
+					const activeFlag = plugin.requires_authorized_active_mode
+						? ` • requires authorized active mode (${resolveActiveAuthorizedGateState().shortLabel.toLowerCase()})`
+						: '';
+					const coverage = plugin.coverage_status
+						? ` • ${formatCoverageStatus(plugin.coverage_status)}`
+						: '';
+					const implementationSource = plugin.implementation_source
+						? ` • ${formatImplementationSource(plugin.implementation_source)}`
+						: '';
+					const coverageNote = plugin.coverage_note
+						? ` • ${plugin.coverage_note}`
+						: '';
+					details.textContent = `Default severity ${plugin.default_severity}${coverage}${implementationSource}${notes}${activeFlag}${coverageNote}`;
+
+					item.append(heading, details);
+					elements.pluginCatalogList.appendChild(item);
+				});
+			}
+
+			async function loadPluginCatalog() {
+				const params = pluginCatalogQueryToSearchParams(
+					state.pluginCatalogQuery
+				);
+				const suffix = params.toString() ? `?${params.toString()}` : '';
+				const response = await request(`/api/plugins${suffix}`, {
+					method: 'GET'
+				});
+				elements.pluginQueryError.classList.add('hidden');
+				renderPluginCatalog(response);
+			}
+
+			async function resetPluginCatalogSearch() {
+				state.pluginCatalogQuery = null;
+				elements.pluginQueryForm.reset();
+				elements.pluginQueryError.classList.add('hidden');
+				await loadPluginCatalog();
 			}
 
 			async function loadFindings() {
@@ -4648,7 +6200,8 @@
 			function buildRunScope(
 				targetIdsInputId,
 				tagsInputId,
-				failedOnlyInputId
+				failedOnlyInputId,
+				workerPoolInputId
 			) {
 				const targetIds = splitNumericList(
 					document.getElementById(targetIdsInputId).value.trim()
@@ -4656,14 +6209,18 @@
 				const tags = splitList(
 					document.getElementById(tagsInputId).value.trim()
 				);
+				const workerPool = normalizeOptionalText(
+					document.getElementById(workerPoolInputId).value.trim()
+				);
 				const failedOnly =
 					document.getElementById(failedOnlyInputId).checked;
-				if (!targetIds.length && !tags.length && !failedOnly) {
+				if (!targetIds.length && !tags.length && !workerPool && !failedOnly) {
 					return null;
 				}
 				return {
 					target_ids: targetIds,
 					tags,
+					worker_pool: workerPool,
 					failed_only: failedOnly
 				};
 			}
@@ -4671,11 +6228,81 @@
 			function resetRunScope(
 				targetIdsInputId,
 				tagsInputId,
-				failedOnlyInputId
+				failedOnlyInputId,
+				workerPoolInputId
 			) {
 				document.getElementById(targetIdsInputId).value = '';
 				document.getElementById(tagsInputId).value = '';
+				document.getElementById(workerPoolInputId).value = '';
 				document.getElementById(failedOnlyInputId).checked = false;
+			}
+
+			function buildPortScanPayload() {
+				const bootstrapEnabled = Boolean(
+					document.getElementById('port-scan-bootstrap-enabled')
+						?.checked
+				);
+				const followOnEnabled = Boolean(
+					document.getElementById('port-scan-follow-on-enabled')
+						?.checked
+				);
+				return {
+					target_range: document
+						.getElementById('port-scan-target-range')
+						.value.trim(),
+					ports: document
+						.getElementById('port-scan-ports')
+						.value.trim(),
+					schemes:
+						document
+							.getElementById('port-scan-schemes')
+							.value.trim() || 'auto',
+					tags: splitList(
+						document.getElementById('port-scan-tags').value.trim()
+					),
+					rate_limit:
+						normalizePositiveInteger(
+							document
+								.getElementById('port-scan-rate-limit')
+								.value.trim()
+						) || 0,
+					worker_pool: normalizeOptionalText(
+						document.getElementById('port-scan-worker-pool').value
+					),
+					follow_on_run_policy: {
+						enabled: followOnEnabled,
+						worker_pool: followOnEnabled
+							? normalizeOptionalText(
+									document.getElementById(
+										'port-scan-follow-on-pool'
+									).value
+								)
+							: null
+					},
+					bootstrap_policy: {
+						enabled: bootstrapEnabled,
+						worker_pool: bootstrapEnabled
+							? normalizeOptionalText(
+									document.getElementById(
+										'port-scan-bootstrap-pool'
+									).value
+								)
+							: null,
+						tags: bootstrapEnabled
+							? splitList(
+									document
+										.getElementById(
+											'port-scan-bootstrap-tags'
+										)
+										.value.trim()
+								)
+							: []
+					},
+					active_authorized_execution:
+						buildActiveAuthorizedExecutionPayload(
+							'port-scan-active-authorized-enabled'
+						)
+				};
 			}
 
 			function buildScanSettingsPayload() {
@@ -4915,6 +6542,9 @@
 				if (scope.tags && scope.tags.length) {
 					parts.push(`Tags ${scope.tags.join(', ')}`);
 				}
+				if (scope.worker_pool) {
+					parts.push(`Pool ${scope.worker_pool}`);
+				}
 				if (scope.failed_only) {
 					parts.push('Failed only');
 				}
@@ -4968,6 +6598,46 @@
 								'Failed to refresh dashboard.'
 							);
 						}
+					}
+				}
+			);
+
+			elements.runsWorkerPoolFilter.addEventListener('input', () => {
+				state.runWorkerPoolFilter =
+					elements.runsWorkerPoolFilter.value || '';
+				renderRuns(state.dashboardSnapshot?.recent_runs || []);
+			});
+
+			elements.workersWorkerPoolFilter.addEventListener('input', () => {
+				state.workerPoolFilter =
+					elements.workersWorkerPoolFilter.value || '';
+				renderWorkers(state.dashboardSnapshot?.workers || []);
+			});
+
+			elements.pluginQueryForm.addEventListener('submit', async event => {
+				event.preventDefault();
+				elements.pluginQueryError.classList.add('hidden');
+				state.pluginCatalogQuery = buildPluginCatalogQuery();
+
+				try {
+					await loadPluginCatalog();
+				} catch (error) {
+					elements.pluginQueryError.textContent =
+						error.message || 'Failed to filter plugin catalog.';
+					elements.pluginQueryError.classList.remove('hidden');
+				}
+			});
+
+			elements.pluginQueryResetButton.addEventListener(
+				'click',
+				async () => {
+					try {
+						await resetPluginCatalogSearch();
+					} catch (error) {
+						elements.pluginQueryError.textContent =
+							error.message ||
+							'Failed to reset plugin catalog filters.';
+						elements.pluginQueryError.classList.remove('hidden');
 					}
 				}
 			);
@@ -5129,6 +6799,13 @@
 				syncBootstrapDispatchVisibility();
 			});
 
+			elements.portScanBootstrapEnabled?.addEventListener(
+				'change',
+				() => {
+					syncPortScanBootstrapVisibility();
+				}
+			);
+
 			elements.bootstrapCandidateId.addEventListener('change', () => {
 				const candidate = findBootstrapCandidateById(
 					elements.bootstrapCandidateId.value
@@ -5239,7 +6916,12 @@
 
 			elements.queueButton.addEventListener('click', async () => {
 				try {
-					await request('/api/runs', { method: 'POST' });
+					await request('/api/runs', {
+						method: 'POST',
+						body: JSON.stringify({
+							active_authorized_execution: { enabled: false }
+						})
+					});
 					prependEvent('Queued a new run from the dashboard.');
 					await loadDashboard();
 				} catch (error) {
@@ -5298,19 +6980,30 @@
 				const scope = buildRunScope(
 					'run-target-ids',
 					'run-tags',
-					'run-failed-only'
+					'run-failed-only',
+					'run-worker-pool'
 				);
 
 				try {
 					await request('/api/runs', {
 						method: 'POST',
-						body: JSON.stringify({ scope })
+						body: JSON.stringify({
+							scope,
+							active_authorized_execution:
+								buildActiveAuthorizedExecutionPayload(
+									'run-active-authorized-enabled'
+								)
+						})
 					});
 					resetRunScope(
 						'run-target-ids',
 						'run-tags',
-						'run-failed-only'
+						'run-failed-only',
+						'run-worker-pool'
 					);
+					document.getElementById(
+						'run-active-authorized-enabled'
+					).checked = false;
 					prependEvent(
 						`Queued scoped run (${formatRunScope(scope)}).`
 					);
@@ -5338,7 +7031,8 @@
 				const scope = buildRunScope(
 					'schedule-target-ids',
 					'schedule-tags',
-					'schedule-failed-only'
+					'schedule-failed-only',
+					'schedule-worker-pool'
 				);
 
 				if (!Number.isFinite(intervalMinutes) || intervalMinutes <= 0) {
@@ -5358,7 +7052,11 @@
 								Math.round(intervalMinutes * 60)
 							),
 							enabled,
-							scope
+							scope,
+							active_authorized_execution:
+								buildActiveAuthorizedExecutionPayload(
+									'schedule-active-authorized-enabled'
+								)
 						})
 					});
 					elements.scheduleForm.reset();
@@ -5366,8 +7064,12 @@
 					resetRunScope(
 						'schedule-target-ids',
 						'schedule-tags',
-						'schedule-failed-only'
+						'schedule-failed-only',
+						'schedule-worker-pool'
 					);
+					document.getElementById(
+						'schedule-active-authorized-enabled'
+					).checked = false;
 					prependEvent(
 						`Saved schedule ${label} (${formatRunScope(scope)}).`
 					);
@@ -5379,7 +7081,58 @@
 				}
 			});
 
+			elements.portScanForm?.addEventListener('submit', async event => {
+				event.preventDefault();
+				elements.portScanError.classList.add('hidden');
+
+				try {
+					const payload = buildPortScanPayload();
+					await request('/api/port-scans', {
+						method: 'POST',
+						body: JSON.stringify(payload)
+					});
+					elements.portScanForm.reset();
+					resetPortScanFormDefaults();
+					prependEvent(
+						`Queued port scan for ${payload.target_range} on ${payload.ports}${payload.follow_on_run_policy?.enabled ? ' with follow-on host scanning' : ''}.`
+					);
+					await loadDashboard();
+				} catch (error) {
+					elements.portScanError.textContent =
+						error.message || 'Failed to queue port scan.';
+					elements.portScanError.classList.remove('hidden');
+				}
+			});
+
+			elements.workersRemoteUpdateAll.addEventListener(
+				'click',
+				async () => {
+					try {
+						if (
+							!window.confirm(
+								'Queue a remote self-update for all eligible workers?'
+							)
+						) {
+							return;
+						}
+						await requestAllWorkerRemoteUpdates();
+					} catch (error) {
+						handleRequestError(
+							error,
+							'Failed to queue remote updates for workers.'
+						);
+					}
+				}
+			);
+
 			window.addEventListener('beforeunload', closeEvents);
+			syncPortScanBootstrapVisibility();
+			elements.portScanFollowOnEnabled?.addEventListener(
+				'change',
+				syncPortScanFollowOnVisibility
+			);
+			syncPortScanFollowOnVisibility();
+			syncActiveAuthorizedGateUi();
 			ensureSession();
 		</script>
 	</body>

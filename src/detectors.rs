@@ -6,10 +6,13 @@ use std::{
 
 use crate::{
     config::AppConfig,
-    core::{redact_secret, ExtensionManifest, FindingCandidate, Severity},
+    core::{ExtensionManifest, FindingCandidate, FindingConfidence, Severity, redact_secret},
     fetcher::FetchedDocument,
+    plugins::build_plugin_metadata,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
+use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -75,6 +78,28 @@ struct ExternalFindingCandidate {
     end: Option<usize>,
     #[serde(default)]
     fingerprint: Option<String>,
+    #[serde(default)]
+    confidence: Option<String>,
+    #[serde(default)]
+    matched_signals: Vec<String>,
+    #[serde(default)]
+    review_labels: Vec<String>,
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    product_name: Option<String>,
+    #[serde(default)]
+    product_version: Option<String>,
+    #[serde(default)]
+    cpe: Option<String>,
+    #[serde(default)]
+    cve_ids: Vec<String>,
+    #[serde(default)]
+    kev_matched: Option<bool>,
+    #[serde(default)]
+    service_protocol: Option<String>,
+    #[serde(default)]
+    service_port: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -84,6 +109,7 @@ struct ExternalDetectorInvocation<'a> {
     url: &'a str,
     status: u16,
     content_type: Option<&'a str>,
+    headers: &'a [(String, String)],
     body: &'a str,
     truncated: bool,
     coverage_source: &'a str,
@@ -91,10 +117,22 @@ struct ExternalDetectorInvocation<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextValueKind {
-    HighEntropy,
-    TokenLike,
+    BroadSecret,
     Password,
     ConnectionString,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextualValueSource {
+    BodyAssignment,
+    StructuredField,
+    ResponseHeader,
+    ResponseCookie,
+    InlineScriptConfig,
+    InlineScriptDecoded,
+    HtmlAttribute,
+    UrlFragment,
+    UrlQuery,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +188,20 @@ static DISCORD_WEBHOOK: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9._-]+\b")
         .expect("valid regex")
 });
+static SCREENCONNECT_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?i)(?:screenconnect|connectwise\s+control)[^0-9]{0,40}(?P<version>\d+\.\d+\.\d+(?:\.\d+)?)",
+    )
+    .expect("valid regex")
+});
+static GOANYWHERE_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)(?:goanywhere(?:\s*mft)?)[^0-9]{0,40}(?P<version>\d+\.\d+\.\d+)")
+        .expect("valid regex")
+});
+static SOLR_SPEC_VERSION_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)"solr-spec-version"\s*:\s*"(?P<version>\d+\.\d+\.\d+)""#)
+        .expect("valid regex")
+});
 static DATABASE_URL_WITH_CREDS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp|mssql)://[^:@\s/]+:[^@\s/]+@[^\s"'<>]+\b"#)
         .expect("valid regex")
@@ -167,7 +219,7 @@ static PRIVATE_KEY: Lazy<Regex> = Lazy::new(|| {
     .expect("valid regex")
 });
 static CONTEXTUAL_ASSIGNMENT_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?mi)(?P<key>["']?[A-Za-z_][A-Za-z0-9_.-]{1,63}["']?)\s*(?:=|:)\s*(?P<value>"[^"\r\n]{4,}"|'[^'\r\n]{4,}'|(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|[A-Za-z][A-Za-z0-9+.-]*://[^\s"'`]+|[A-Za-z0-9_./+=:@$%?!;-]{4,})"#)
+    Regex::new(r#"(?mi)(?P<key>["']?[A-Za-z_][A-Za-z0-9_.-]{1,63}["']?)\s*(?:=|:)\s*(?P<value>"[^"\r\n]{4,}"|'[^'\r\n]{4,}'|`[^`\r\n]{4,}`|(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}|[A-Za-z][A-Za-z0-9+.-]*://[^\s"'`]+|[A-Za-z0-9_./+=:@$%?!;-]{4,})"#)
         .expect("valid regex")
 });
 static NPMRC_AUTH_RE: Lazy<Regex> = Lazy::new(|| {
@@ -181,6 +233,70 @@ static PYPIRC_PASSWORD_RE: Lazy<Regex> = Lazy::new(|| {
 });
 static NETRC_PASSWORD_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?mi)\bpassword\s+(?P<value>[^\s#]+)").expect("valid regex"));
+static SCRIPT_BLOCK_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<script\b(?P<attrs>[^>]*)>(?P<body>.*?)</script>").expect("valid regex")
+});
+static HTML_TAG_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)<(?P<tag>[a-zA-Z][a-zA-Z0-9:-]*)\b(?P<attrs>[^>]*)>"#).expect("valid regex")
+});
+static HTML_ATTRIBUTE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)(?P<name>[A-Za-z_:][A-Za-z0-9_.:-]*)\s*=\s*(?P<value>"[^"]*"|'[^']*')"#)
+        .expect("valid regex")
+});
+static STORAGE_SET_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)(?P<store>localstorage|sessionstorage)\s*\.\s*setitem\(\s*(?P<key>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*,\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\)"#,
+    )
+    .expect("valid regex")
+});
+static STORAGE_PROPERTY_ASSIGN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)(?P<store>localstorage|sessionstorage)\s*(?:\.\s*(?P<key_name>[A-Za-z_][A-Za-z0-9_-]*)|\[\s*(?P<key_literal>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\])\s*=\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)"#,
+    )
+    .expect("valid regex")
+});
+static DOCUMENT_COOKIE_ASSIGNMENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)document\s*\.\s*cookie\s*=\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)"#)
+        .expect("valid regex")
+});
+static COOKIE_LIBRARY_SET_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)(?:cookies?|cookieStore)\s*\.\s*set\(\s*(?P<key>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*,\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)"#,
+    )
+    .expect("valid regex")
+});
+static JSON_PARSE_STRING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)json\.parse\(\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\)"#,
+    )
+    .expect("valid regex")
+});
+static ATOB_STRING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?is)atob\(\s*(?P<value>"[A-Za-z0-9+/=_-]{16,}"|'[A-Za-z0-9+/=_-]{16,}'|`[A-Za-z0-9+/=_-]{16,}`)\s*\)"#)
+        .expect("valid regex")
+});
+static DECODE_URI_COMPONENT_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)decodeURIComponent\(\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\)"#,
+    )
+    .expect("valid regex")
+});
+static DECODE_URI_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)decodeURI\(\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\)"#,
+    )
+    .expect("valid regex")
+});
+static UNESCAPE_STRING_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?is)unescape\(\s*(?P<value>"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`)\s*\)"#,
+    )
+    .expect("valid regex")
+});
+static FRAGMENT_BLOB_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(?:https?://[^\s"'<>`]+)?#(?P<fragment>[A-Za-z0-9_=%&./:+-]{8,})"#)
+        .expect("valid regex")
+});
 
 fn exact_detector(
     name: &'static str,
@@ -525,13 +641,14 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
                 "bearer_token",
                 "bearertoken",
             ],
-            value_kind: ContextValueKind::TokenLike,
-            min_value_len: 16,
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
         },
         ContextualAssignmentRule {
             name: "generic_api_key",
             severity: Severity::High,
             keywords: &[
+                "key",
                 "api_key",
                 "apikey",
                 "app_key",
@@ -540,16 +657,34 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
                 "accesskey",
                 "auth_key",
                 "authkey",
+                "private_key",
+                "privatekey",
+                "public_api_key",
+                "publicapi_key",
+                "publicapikey",
+                "service_key",
+                "servicekey",
+                "license_key",
+                "licensekey",
+                "sdk_key",
+                "sdkkey",
+                "master_key",
+                "masterkey",
+                "consumer_key",
+                "consumerkey",
+                "encryption_key",
+                "encryptionkey",
                 "secret_access_key",
                 "secretaccesskey",
             ],
-            value_kind: ContextValueKind::HighEntropy,
-            min_value_len: 16,
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
         },
         ContextualAssignmentRule {
             name: "generic_client_secret",
             severity: Severity::High,
             keywords: &[
+                "secret",
                 "client_secret",
                 "clientsecret",
                 "consumer_secret",
@@ -562,9 +697,39 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
                 "appsecret",
                 "secret_key",
                 "secretkey",
+                "api_secret",
+                "apisecret",
+                "session_secret",
+                "sessionsecret",
+                "jwt_secret",
+                "jwtsecret",
+                "private_secret",
+                "privatesecret",
+                "encryption_secret",
+                "encryptionsecret",
+                "bot_secret",
+                "botsecret",
             ],
-            value_kind: ContextValueKind::HighEntropy,
-            min_value_len: 16,
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
+        },
+        ContextualAssignmentRule {
+            name: "generic_session_cookie",
+            severity: Severity::High,
+            keywords: &[
+                "session",
+                "sessionid",
+                "sessid",
+                "session_token",
+                "sessiontoken",
+                "connect_sid",
+                "remember_me",
+                "rememberme",
+                "auth_cookie",
+                "authcookie",
+            ],
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
         },
         ContextualAssignmentRule {
             name: "generic_access_token",
@@ -576,6 +741,13 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
                 "authtoken",
                 "api_token",
                 "apitoken",
+                "private_token",
+                "privatetoken",
+                "service_token",
+                "servicetoken",
+                "bot_token",
+                "bottoken",
+                "auth",
                 "session_token",
                 "sessiontoken",
                 "refresh_token",
@@ -584,15 +756,29 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
                 "idtoken",
                 "token",
             ],
-            value_kind: ContextValueKind::TokenLike,
-            min_value_len: 16,
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
         },
         ContextualAssignmentRule {
             name: "generic_password",
             severity: Severity::High,
-            keywords: &["password", "passwd", "pwd"],
+            keywords: &["password", "passwd", "pwd", "passphrase"],
             value_kind: ContextValueKind::Password,
             min_value_len: 10,
+        },
+        ContextualAssignmentRule {
+            name: "generic_credential",
+            severity: Severity::High,
+            keywords: &[
+                "credential",
+                "credentials",
+                "creds",
+                "auth_value",
+                "auth_secret",
+                "authsecret",
+            ],
+            value_kind: ContextValueKind::BroadSecret,
+            min_value_len: 12,
         },
     ]
 });
@@ -600,17 +786,38 @@ static CONTEXTUAL_ASSIGNMENT_RULES: Lazy<Vec<ContextualAssignmentRule>> = Lazy::
 const STRUCTURED_SECRET_FIELD_HINTS: &[&str] = &[
     "apiKey",
     "api_key",
+    "apiSecret",
+    "api_secret",
     "accessKey",
     "access_key",
+    "serviceKey",
+    "service_key",
+    "licenseKey",
+    "license_key",
+    "masterKey",
+    "master_key",
     "clientSecret",
     "client_secret",
+    "sessionSecret",
+    "session_secret",
+    "signingSecret",
+    "signing_secret",
+    "webhookSecret",
+    "webhook_secret",
+    "privateToken",
+    "private_token",
     "accessToken",
     "access_token",
+    "authToken",
+    "auth_token",
     "connectionString",
     "connection_string",
     "databaseUrl",
     "database_url",
+    "credential",
+    "credentials",
     "password",
+    "passphrase",
     "passwd",
     "secret",
     "token",
@@ -647,6 +854,14 @@ impl DetectorEngine {
         scan_detectors(document, &mut seen, &mut findings);
         scan_contextual_assignments(document, &mut seen, &mut findings);
         scan_structured_contextual_assignments(document, &mut seen, &mut findings);
+        scan_response_header_contextual_assignments(document, &mut seen, &mut findings);
+        scan_cookie_header_contextual_assignments(document, &mut seen, &mut findings);
+        scan_inline_script_contextual_assignments(document, &mut seen, &mut findings);
+        scan_inline_storage_contextual_assignments(document, &mut seen, &mut findings);
+        scan_html_attribute_contextual_assignments(document, &mut seen, &mut findings);
+        scan_url_fragment_contextual_assignments(document, &mut seen, &mut findings);
+        scan_url_query_contextual_assignments(document, &mut seen, &mut findings);
+        scan_phase_one_plugin_findings(document, &mut seen, &mut findings);
         scan_external_detector_packs(document, &mut seen, &mut findings, &self.external_packs);
 
         findings
@@ -713,7 +928,13 @@ fn scan_contextual_assignments(
         };
 
         let normalized_value = normalize_contextual_value(value_match.as_str());
-        if !validate_contextual_value(document, &key, &normalized_value, rule) {
+        if !validate_contextual_value(
+            document,
+            &key,
+            &normalized_value,
+            rule,
+            ContextualValueSource::BodyAssignment,
+        ) {
             continue;
         }
 
@@ -747,7 +968,13 @@ fn scan_structured_contextual_assignments(
         };
 
         let normalized_value = normalize_contextual_value(&field.value);
-        if !validate_contextual_value(document, &key, &normalized_value, rule) {
+        if !validate_contextual_value(
+            document,
+            &key,
+            &normalized_value,
+            rule,
+            ContextualValueSource::StructuredField,
+        ) {
             continue;
         }
 
@@ -797,6 +1024,1074 @@ fn scan_external_detector_packs(
     }
 }
 
+fn scan_response_header_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for (header_name, header_value) in &document.headers {
+        let key = normalize_contextual_key(header_name);
+        let Some(rule) = contextual_assignment_rule(&key) else {
+            continue;
+        };
+        let normalized_value = normalize_contextual_value(header_value);
+        if !validate_contextual_value(
+            document,
+            &key,
+            &normalized_value,
+            rule,
+            ContextualValueSource::ResponseHeader,
+        ) {
+            continue;
+        }
+
+        push_metadata_secret_finding_candidate(
+            findings,
+            seen,
+            document,
+            rule.name,
+            &rule.severity,
+            &normalized_value,
+            &format!(
+                "HTTP response header {} exposed a secret-like value.",
+                header_name.trim()
+            ),
+            Some(FindingConfidence::High),
+            vec!["response_header".to_string(), key.clone()],
+            vec!["response_header_secret".to_string()],
+        );
+    }
+}
+
+fn scan_url_query_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    let Ok(url) = Url::parse(&document.url) else {
+        return;
+    };
+
+    for (query_name, query_value) in url.query_pairs() {
+        let key = normalize_contextual_key(&query_name);
+        let Some(rule) = contextual_assignment_rule(&key) else {
+            continue;
+        };
+        let normalized_value = normalize_contextual_value(&query_value);
+        if !validate_contextual_value(
+            document,
+            &key,
+            &normalized_value,
+            rule,
+            ContextualValueSource::UrlQuery,
+        ) {
+            continue;
+        }
+
+        push_metadata_secret_finding_candidate(
+            findings,
+            seen,
+            document,
+            rule.name,
+            &rule.severity,
+            &normalized_value,
+            &format!(
+                "URL query parameter {} exposed a secret-like value.",
+                query_name.trim()
+            ),
+            Some(FindingConfidence::Medium),
+            vec!["url_query".to_string(), key.clone()],
+            vec!["query_secret".to_string()],
+        );
+    }
+}
+
+fn scan_url_fragment_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for captures in FRAGMENT_BLOB_RE.captures_iter(&document.body) {
+        let Some(fragment_blob) = captures.name("fragment").map(|value| value.as_str()) else {
+            continue;
+        };
+        for (fragment_name, fragment_value) in parse_fragment_assignments(fragment_blob) {
+            let key = normalize_contextual_key(&fragment_name);
+            let Some(rule) = contextual_assignment_rule(&key) else {
+                continue;
+            };
+            let normalized_value = normalize_contextual_value(&fragment_value);
+            if !validate_contextual_value(
+                document,
+                &key,
+                &normalized_value,
+                rule,
+                ContextualValueSource::UrlFragment,
+            ) {
+                continue;
+            }
+
+            push_metadata_secret_finding_candidate(
+                findings,
+                seen,
+                document,
+                rule.name,
+                &rule.severity,
+                &normalized_value,
+                &format!(
+                    "URL fragment parameter {} exposed a secret-like value.",
+                    fragment_name.trim()
+                ),
+                Some(FindingConfidence::Medium),
+                vec!["url_fragment".to_string(), key.clone()],
+                vec!["fragment_secret".to_string()],
+            );
+        }
+    }
+}
+
+fn scan_cookie_header_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for (header_name, header_value) in &document.headers {
+        let normalized_header = normalize_contextual_key(header_name);
+        match normalized_header.as_str() {
+            "set_cookie" => {
+                if let Some((cookie_name, cookie_value)) =
+                    parse_cookie_header_assignment(header_value, true)
+                {
+                    process_cookie_candidate(
+                        document,
+                        seen,
+                        findings,
+                        header_name,
+                        &cookie_name,
+                        &cookie_value,
+                    );
+                }
+            }
+            "cookie" => {
+                for (cookie_name, cookie_value) in
+                    parse_cookie_header_assignments(header_value, false)
+                {
+                    process_cookie_candidate(
+                        document,
+                        seen,
+                        findings,
+                        header_name,
+                        &cookie_name,
+                        &cookie_value,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_inline_script_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for captures in SCRIPT_BLOCK_RE.captures_iter(&document.body) {
+        let attrs = captures
+            .name("attrs")
+            .map(|value| parse_html_attributes(value.as_str()))
+            .unwrap_or_default();
+        let Some(script_body) = captures.name("body").map(|value| value.as_str()) else {
+            continue;
+        };
+        if !script_tag_looks_like_config(&attrs, script_body) {
+            continue;
+        }
+
+        scan_contextual_assignments_in_blob(
+            document,
+            seen,
+            findings,
+            script_body,
+            ContextualValueSource::InlineScriptConfig,
+            "Inline script config exposed a secret-like {} value.",
+            "inline_script",
+        );
+
+        for decoded in extract_decoded_inline_script_blobs(script_body) {
+            scan_contextual_assignments_in_blob(
+                document,
+                seen,
+                findings,
+                &decoded,
+                ContextualValueSource::InlineScriptDecoded,
+                "Decoded inline script config exposed a secret-like {} value.",
+                "inline_script_decoded",
+            );
+        }
+    }
+}
+
+fn scan_inline_storage_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for captures in SCRIPT_BLOCK_RE.captures_iter(&document.body) {
+        let Some(script_body) = captures.name("body").map(|value| value.as_str()) else {
+            continue;
+        };
+
+        for setter in STORAGE_SET_ITEM_RE.captures_iter(script_body) {
+            let Some(key_literal) = setter.name("key").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(value_literal) = setter.name("value").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(storage_name) = setter.name("store").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(decoded_key) = decode_javascript_string_literal(key_literal) else {
+                continue;
+            };
+            let Some(decoded_value) = decode_javascript_string_literal(value_literal) else {
+                continue;
+            };
+            process_inline_storage_candidate(
+                document,
+                seen,
+                findings,
+                storage_name,
+                &decoded_key,
+                &decoded_value,
+            );
+        }
+
+        for setter in STORAGE_PROPERTY_ASSIGN_RE.captures_iter(script_body) {
+            let Some(storage_name) = setter.name("store").map(|value| value.as_str()) else {
+                continue;
+            };
+            let decoded_key =
+                if let Some(key_name) = setter.name("key_name").map(|value| value.as_str()) {
+                    key_name.to_string()
+                } else {
+                    let Some(key_literal) = setter.name("key_literal").map(|value| value.as_str())
+                    else {
+                        continue;
+                    };
+                    let Some(decoded_key) = decode_javascript_string_literal(key_literal) else {
+                        continue;
+                    };
+                    decoded_key
+                };
+            let Some(value_literal) = setter.name("value").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(decoded_value) = decode_javascript_string_literal(value_literal) else {
+                continue;
+            };
+            process_inline_storage_candidate(
+                document,
+                seen,
+                findings,
+                storage_name,
+                &decoded_key,
+                &decoded_value,
+            );
+        }
+
+        for cookie_assignment in DOCUMENT_COOKIE_ASSIGNMENT_RE.captures_iter(script_body) {
+            let Some(raw_cookie_value) =
+                cookie_assignment.name("value").map(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(decoded_cookie_value) = decode_javascript_string_literal(raw_cookie_value)
+            else {
+                continue;
+            };
+            for (cookie_name, cookie_value) in
+                parse_cookie_header_assignments(&decoded_cookie_value, false)
+            {
+                process_inline_cookie_candidate(
+                    document,
+                    seen,
+                    findings,
+                    "document.cookie",
+                    &cookie_name,
+                    &cookie_value,
+                );
+            }
+        }
+
+        for cookie_setter in COOKIE_LIBRARY_SET_RE.captures_iter(script_body) {
+            let Some(key_literal) = cookie_setter.name("key").map(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(value_literal) = cookie_setter.name("value").map(|value| value.as_str())
+            else {
+                continue;
+            };
+            let Some(decoded_key) = decode_javascript_string_literal(key_literal) else {
+                continue;
+            };
+            let Some(decoded_value) = decode_javascript_string_literal(value_literal) else {
+                continue;
+            };
+            process_inline_cookie_candidate(
+                document,
+                seen,
+                findings,
+                "Cookies.set",
+                &decoded_key,
+                &decoded_value,
+            );
+        }
+    }
+}
+
+fn scan_contextual_assignments_in_blob(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+    blob: &str,
+    source: ContextualValueSource,
+    evidence_template: &str,
+    signal_label: &str,
+) {
+    for assignment in CONTEXTUAL_ASSIGNMENT_RE.captures_iter(blob) {
+        let Some(key_match) = assignment.name("key") else {
+            continue;
+        };
+        let Some(value_match) = assignment.name("value") else {
+            continue;
+        };
+
+        let key = normalize_contextual_key(key_match.as_str());
+        let Some(rule) = contextual_assignment_rule(&key) else {
+            continue;
+        };
+        let normalized_value = normalize_contextual_value(value_match.as_str());
+        if !validate_contextual_value(document, &key, &normalized_value, rule, source) {
+            continue;
+        }
+
+        push_metadata_secret_finding_candidate(
+            findings,
+            seen,
+            document,
+            rule.name,
+            &rule.severity,
+            &normalized_value,
+            &evidence_template.replace("{}", key_match.as_str().trim_matches(&['\"', '\''][..])),
+            Some(FindingConfidence::Medium),
+            vec![signal_label.to_string(), key.clone()],
+            vec!["inline_script_secret".to_string()],
+        );
+    }
+}
+
+fn scan_html_attribute_contextual_assignments(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    for captures in HTML_TAG_RE.captures_iter(&document.body) {
+        let Some(tag_match) = captures.name("tag") else {
+            continue;
+        };
+        let Some(attrs_match) = captures.name("attrs") else {
+            continue;
+        };
+        let tag = tag_match.as_str().to_ascii_lowercase();
+        let attrs = parse_html_attributes(attrs_match.as_str());
+        if attrs.is_empty() {
+            continue;
+        }
+
+        if tag == "meta" {
+            let Some(key) = html_meta_key(&attrs) else {
+                continue;
+            };
+            let Some(value) = html_attribute_value(&attrs, "content") else {
+                continue;
+            };
+            process_html_attribute_candidate(document, seen, findings, &tag, &key, value);
+            continue;
+        }
+
+        if let Some(value) = html_attribute_value(&attrs, "value") {
+            if let Some(key) = html_attribute_value(&attrs, "name")
+                .or_else(|| html_attribute_value(&attrs, "id"))
+                .or_else(|| html_attribute_value(&attrs, "data-name"))
+            {
+                process_html_attribute_candidate(document, seen, findings, &tag, key, value);
+            }
+        }
+
+        for (name, value) in &attrs {
+            if name.starts_with("data-") {
+                process_html_attribute_candidate(document, seen, findings, &tag, name, value);
+                if html_attribute_blob_looks_like_config(name, value) {
+                    let decoded_value = decode_html_entities_minimal(value);
+                    let blob_value =
+                        decode_percent_escapes(&decoded_value).unwrap_or(decoded_value.clone());
+                    scan_contextual_assignments_in_blob(
+                        document,
+                        seen,
+                        findings,
+                        &blob_value,
+                        ContextualValueSource::HtmlAttribute,
+                        "HTML attribute blob exposed a secret-like {} value.",
+                        "html_attribute_blob",
+                    );
+                    for decoded in extract_decoded_inline_script_blobs(&blob_value) {
+                        scan_contextual_assignments_in_blob(
+                            document,
+                            seen,
+                            findings,
+                            &decoded,
+                            ContextualValueSource::HtmlAttribute,
+                            "Decoded HTML attribute blob exposed a secret-like {} value.",
+                            "html_attribute_blob_decoded",
+                        );
+                    }
+                }
+            } else if html_attribute_blob_looks_like_config(name, value) {
+                let decoded_value = decode_html_entities_minimal(value);
+                let blob_value =
+                    decode_percent_escapes(&decoded_value).unwrap_or(decoded_value.clone());
+                scan_contextual_assignments_in_blob(
+                    document,
+                    seen,
+                    findings,
+                    &blob_value,
+                    ContextualValueSource::HtmlAttribute,
+                    "HTML attribute blob exposed a secret-like {} value.",
+                    "html_attribute_blob",
+                );
+            }
+        }
+    }
+}
+
+fn process_cookie_candidate(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+    header_name: &str,
+    cookie_name: &str,
+    cookie_value: &str,
+) {
+    let key = normalize_contextual_key(cookie_name);
+    let Some(rule) = contextual_assignment_rule(&key) else {
+        return;
+    };
+    let normalized_value = normalize_contextual_value(cookie_value);
+    if !validate_contextual_value(
+        document,
+        &key,
+        &normalized_value,
+        rule,
+        ContextualValueSource::ResponseCookie,
+    ) {
+        return;
+    }
+
+    push_metadata_secret_finding_candidate(
+        findings,
+        seen,
+        document,
+        rule.name,
+        &rule.severity,
+        &normalized_value,
+        &format!(
+            "HTTP {} {} exposed a secret-like cookie value.",
+            header_name.trim(),
+            cookie_name.trim()
+        ),
+        Some(FindingConfidence::High),
+        vec![
+            "cookie_header".to_string(),
+            normalize_contextual_key(header_name),
+            key.clone(),
+        ],
+        vec!["cookie_secret".to_string()],
+    );
+}
+
+fn process_inline_storage_candidate(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+    storage_name: &str,
+    key_name: &str,
+    value: &str,
+) {
+    let key = normalize_contextual_key(key_name);
+    let Some(rule) = contextual_assignment_rule(&key) else {
+        return;
+    };
+    let normalized_value = normalize_contextual_value(value);
+    if !validate_contextual_value(
+        document,
+        &key,
+        &normalized_value,
+        rule,
+        ContextualValueSource::InlineScriptConfig,
+    ) {
+        return;
+    }
+
+    push_metadata_secret_finding_candidate(
+        findings,
+        seen,
+        document,
+        rule.name,
+        &rule.severity,
+        &normalized_value,
+        &format!(
+            "Inline {} key {} exposed a secret-like value.",
+            storage_name.trim(),
+            key_name.trim()
+        ),
+        Some(FindingConfidence::Medium),
+        vec![
+            "inline_storage".to_string(),
+            storage_name.trim().to_ascii_lowercase(),
+            key.clone(),
+        ],
+        vec![
+            "inline_script_secret".to_string(),
+            "browser_storage_secret".to_string(),
+        ],
+    );
+}
+
+fn process_inline_cookie_candidate(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+    source_name: &str,
+    cookie_name: &str,
+    cookie_value: &str,
+) {
+    let key = normalize_contextual_key(cookie_name);
+    let Some(rule) = contextual_assignment_rule(&key) else {
+        return;
+    };
+    let normalized_value = normalize_contextual_value(cookie_value);
+    if !validate_contextual_value(
+        document,
+        &key,
+        &normalized_value,
+        rule,
+        ContextualValueSource::InlineScriptConfig,
+    ) {
+        return;
+    }
+
+    push_metadata_secret_finding_candidate(
+        findings,
+        seen,
+        document,
+        rule.name,
+        &rule.severity,
+        &normalized_value,
+        &format!(
+            "Inline {} assignment for {} exposed a secret-like value.",
+            source_name.trim(),
+            cookie_name.trim()
+        ),
+        Some(FindingConfidence::Medium),
+        vec!["inline_cookie".to_string(), key.clone()],
+        vec![
+            "inline_script_secret".to_string(),
+            "cookie_secret".to_string(),
+        ],
+    );
+}
+
+fn parse_cookie_header_assignments(value: &str, set_cookie: bool) -> Vec<(String, String)> {
+    if set_cookie {
+        parse_cookie_header_assignment(value, true)
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        value
+            .split(';')
+            .filter_map(|segment| parse_cookie_header_assignment(segment, false))
+            .collect()
+    }
+}
+
+fn parse_cookie_header_assignment(value: &str, set_cookie: bool) -> Option<(String, String)> {
+    let segment = if set_cookie {
+        value.split(';').next().unwrap_or("").trim()
+    } else {
+        value.trim()
+    };
+    let (name, raw_value) = segment.split_once('=')?;
+    let normalized_name = name.trim();
+    let normalized_value = raw_value.trim();
+    if normalized_name.is_empty() || normalized_value.is_empty() {
+        return None;
+    }
+    Some((normalized_name.to_string(), normalized_value.to_string()))
+}
+
+fn parse_fragment_assignments(value: &str) -> Vec<(String, String)> {
+    let fragment = value.split('?').next_back().unwrap_or(value);
+    url::form_urlencoded::parse(fragment.as_bytes())
+        .filter_map(|(name, value)| {
+            let normalized_name = name.trim();
+            let normalized_value = value.trim();
+            (!normalized_name.is_empty() && !normalized_value.is_empty())
+                .then_some((normalized_name.to_string(), normalized_value.to_string()))
+        })
+        .collect()
+}
+
+fn script_tag_looks_like_config(attributes: &[(String, String)], body: &str) -> bool {
+    let type_value = html_attribute_value(attributes, "type")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let id_value = html_attribute_value(attributes, "id")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let data_name_value = html_attribute_value(attributes, "data-name")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    let attr_blob = format!("{type_value}\n{id_value}\n{data_name_value}");
+
+    let lowered = body.to_ascii_lowercase();
+    let markers = [
+        "window.__",
+        "window.config",
+        "window.env",
+        "window.runtime",
+        "runtimeconfig",
+        "runtime_config",
+        "__next_data__",
+        "__nuxt__",
+        "publicruntimeconfig",
+        "privateruntimeconfig",
+        "import.meta.env",
+        "bootstrap",
+        "appconfig",
+        "__env__",
+    ];
+    let body_or_attr_marked = markers.iter().any(|marker| lowered.contains(marker))
+        || markers.iter().any(|marker| attr_blob.contains(marker))
+        || id_value.contains("__next_data__")
+        || id_value.contains("__nuxt__")
+        || id_value.contains("apollo-state")
+        || id_value.contains("bootstrap")
+        || id_value.contains("runtime-config")
+        || id_value.contains("runtimeconfig");
+
+    let json_bootstrap = type_value.contains("json")
+        && (body.trim_start().starts_with('{') || body.trim_start().starts_with('['));
+
+    (body_or_attr_marked || json_bootstrap)
+        && (body.contains('{') || body.contains('=') || body.contains(':'))
+}
+
+fn html_attribute_blob_looks_like_config(name: &str, value: &str) -> bool {
+    let normalized_name = normalize_contextual_key(name);
+    let decoded_html = decode_html_entities_minimal(value);
+    let percent_decoded =
+        decode_percent_escapes(&decoded_html).unwrap_or_else(|| decoded_html.clone());
+    let lowered = percent_decoded.to_ascii_lowercase();
+    let name_hints = [
+        "data_state",
+        "data_config",
+        "data_bootstrap",
+        "data_props",
+        "data_options",
+        "data_env",
+        "data_settings",
+        "x_data",
+        "ng_init",
+        "data_json",
+    ];
+    let marked_name = name_hints.iter().any(|hint| normalized_name.contains(hint));
+    let marked_value = lowered.contains("api_key")
+        || lowered.contains("access_token")
+        || lowered.contains("private_token")
+        || lowered.contains("session_secret")
+        || lowered.contains("runtimeconfig")
+        || lowered.contains("runtime_config")
+        || lowered.contains("window.__")
+        || lowered.contains("__next_data__")
+        || lowered.contains("__nuxt__");
+
+    (marked_name || marked_value)
+        && (percent_decoded.trim_start().starts_with('{')
+            || percent_decoded.trim_start().starts_with('[')
+            || CONTEXTUAL_ASSIGNMENT_RE.is_match(&percent_decoded))
+}
+
+fn extract_decoded_inline_script_blobs(script_body: &str) -> Vec<String> {
+    let mut blobs = Vec::new();
+
+    for captures in JSON_PARSE_STRING_RE.captures_iter(script_body) {
+        let Some(raw_literal) = captures.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(decoded) = decode_javascript_string_literal(raw_literal) else {
+            continue;
+        };
+        if decoded_blob_looks_like_config(&decoded) {
+            blobs.push(decoded);
+        }
+    }
+
+    for captures in ATOB_STRING_RE.captures_iter(script_body) {
+        let Some(raw_literal) = captures.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(encoded) = decode_javascript_string_literal(raw_literal) else {
+            continue;
+        };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+            continue;
+        };
+        let Ok(decoded) = String::from_utf8(bytes) else {
+            continue;
+        };
+        if decoded_blob_looks_like_config(&decoded) {
+            blobs.push(decoded);
+        }
+    }
+
+    for captures in DECODE_URI_COMPONENT_RE.captures_iter(script_body) {
+        let Some(raw_literal) = captures.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(encoded) = decode_javascript_string_literal(raw_literal) else {
+            continue;
+        };
+        let Some(decoded) = decode_percent_escapes(&encoded) else {
+            continue;
+        };
+        if decoded_blob_looks_like_config(&decoded) {
+            blobs.push(decoded);
+        }
+    }
+
+    for captures in DECODE_URI_RE.captures_iter(script_body) {
+        let Some(raw_literal) = captures.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(encoded) = decode_javascript_string_literal(raw_literal) else {
+            continue;
+        };
+        let Some(decoded) = decode_percent_escapes(&encoded) else {
+            continue;
+        };
+        if decoded_blob_looks_like_config(&decoded) {
+            blobs.push(decoded);
+        }
+    }
+
+    for captures in UNESCAPE_STRING_RE.captures_iter(script_body) {
+        let Some(raw_literal) = captures.name("value").map(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(encoded) = decode_javascript_string_literal(raw_literal) else {
+            continue;
+        };
+        let Some(decoded) = decode_percent_escapes(&encoded) else {
+            continue;
+        };
+        if decoded_blob_looks_like_config(&decoded) {
+            blobs.push(decoded);
+        }
+    }
+
+    blobs
+}
+
+fn decoded_blob_looks_like_config(decoded: &str) -> bool {
+    let trimmed = decoded.trim();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || CONTEXTUAL_ASSIGNMENT_RE.is_match(trimmed)
+}
+
+fn decode_javascript_string_literal(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() < 2 {
+        return None;
+    }
+    let first = trimmed.chars().next()?;
+    let last = trimmed.chars().last()?;
+    if first != last || !matches!(first, '"' | '\'' | '`') {
+        return None;
+    }
+    if first == '"' {
+        return serde_json::from_str::<String>(trimmed).ok();
+    }
+
+    let inner = &trimmed[1..trimmed.len() - 1];
+    let mut decoded = String::new();
+    let mut chars = inner.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+        let Some(escaped) = chars.next() else {
+            decoded.push('\\');
+            break;
+        };
+        match escaped {
+            '\\' => decoded.push('\\'),
+            '\'' => decoded.push('\''),
+            '"' => decoded.push('"'),
+            '`' => decoded.push('`'),
+            'n' => decoded.push('\n'),
+            'r' => decoded.push('\r'),
+            't' => decoded.push('\t'),
+            'x' => {
+                let hex = [chars.next(), chars.next()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<String>();
+                if hex.len() == 2 {
+                    if let Ok(value) = u8::from_str_radix(&hex, 16) {
+                        decoded.push(value as char);
+                        continue;
+                    }
+                }
+                decoded.push('x');
+                decoded.push_str(&hex);
+            }
+            'u' => {
+                if chars.clone().next() == Some('{') {
+                    let _ = chars.next();
+                    let mut hex = String::new();
+                    for candidate in chars.by_ref() {
+                        if candidate == '}' {
+                            break;
+                        }
+                        hex.push(candidate);
+                    }
+                    if let Ok(value) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(value) {
+                            decoded.push(ch);
+                            continue;
+                        }
+                    }
+                    decoded.push('u');
+                    decoded.push('{');
+                    decoded.push_str(&hex);
+                    decoded.push('}');
+                } else {
+                    let hex = [chars.next(), chars.next(), chars.next(), chars.next()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<String>();
+                    if hex.len() == 4 {
+                        if let Ok(value) = u32::from_str_radix(&hex, 16) {
+                            if let Some(ch) = char::from_u32(value) {
+                                decoded.push(ch);
+                                continue;
+                            }
+                        }
+                    }
+                    decoded.push('u');
+                    decoded.push_str(&hex);
+                }
+            }
+            other => decoded.push(other),
+        }
+    }
+    Some(decoded)
+}
+
+fn decode_html_entities_minimal(value: &str) -> String {
+    let mut decoded = value
+        .replace("&quot;", "\"")
+        .replace("&#34;", "\"")
+        .replace("&#x22;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">");
+
+    if decoded.contains("&#x") || decoded.contains("&#") {
+        let mut normalized = String::new();
+        let mut chars = decoded.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '&' && chars.peek() == Some(&'#') {
+                let _ = chars.next();
+                let is_hex = matches!(chars.peek(), Some('x') | Some('X'));
+                if is_hex {
+                    let _ = chars.next();
+                }
+                let mut digits = String::new();
+                while let Some(candidate) = chars.peek().copied() {
+                    if candidate == ';' {
+                        let _ = chars.next();
+                        break;
+                    }
+                    if candidate.is_ascii_hexdigit() {
+                        digits.push(candidate);
+                        let _ = chars.next();
+                    } else {
+                        digits.clear();
+                        break;
+                    }
+                }
+                if !digits.is_empty() {
+                    let radix = if is_hex { 16 } else { 10 };
+                    if let Ok(codepoint) = u32::from_str_radix(&digits, radix) {
+                        if let Some(rendered) = char::from_u32(codepoint) {
+                            normalized.push(rendered);
+                            continue;
+                        }
+                    }
+                }
+                normalized.push('&');
+                normalized.push('#');
+                if is_hex {
+                    normalized.push('x');
+                }
+                normalized.push_str(&digits);
+                continue;
+            }
+            normalized.push(ch);
+        }
+        decoded = normalized;
+    }
+
+    decoded
+}
+
+fn decode_percent_escapes(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut changed = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 1 < bytes.len() => {
+                if bytes[index + 1] == b'u' || bytes[index + 1] == b'U' {
+                    if index + 5 < bytes.len() {
+                        let hex = &value[index + 2..index + 6];
+                        if let Ok(codepoint) = u32::from_str_radix(hex, 16) {
+                            if let Some(ch) = char::from_u32(codepoint) {
+                                let mut buffer = [0u8; 4];
+                                let rendered = ch.encode_utf8(&mut buffer);
+                                decoded.extend_from_slice(rendered.as_bytes());
+                                index += 6;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                } else if index + 2 < bytes.len() {
+                    let hex = &value[index + 1..index + 3];
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        decoded.push(byte);
+                        index += 3;
+                        changed = true;
+                        continue;
+                    }
+                }
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+                changed = true;
+            }
+            other => {
+                decoded.push(other);
+                index += 1;
+            }
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    changed.then_some(decoded)
+}
+
+fn parse_html_attributes(raw: &str) -> Vec<(String, String)> {
+    HTML_ATTRIBUTE_RE
+        .captures_iter(raw)
+        .filter_map(|captures| {
+            let name = captures.name("name")?.as_str().trim().to_ascii_lowercase();
+            let value = captures
+                .name("value")?
+                .as_str()
+                .trim()
+                .trim_matches(&['"', '\''][..])
+                .to_string();
+            (!name.is_empty() && !value.is_empty()).then_some((name, value))
+        })
+        .collect()
+}
+
+fn html_attribute_value<'a>(attributes: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attributes
+        .iter()
+        .find(|(attr_name, _)| attr_name == name)
+        .map(|(_, value)| value.as_str())
+}
+
+fn html_meta_key<'a>(attributes: &'a [(String, String)]) -> Option<&'a str> {
+    html_attribute_value(attributes, "name")
+        .or_else(|| html_attribute_value(attributes, "property"))
+        .or_else(|| html_attribute_value(attributes, "http-equiv"))
+}
+
+fn process_html_attribute_candidate(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+    tag: &str,
+    raw_key: &str,
+    raw_value: &str,
+) {
+    let key = normalize_contextual_key(raw_key);
+    let Some(rule) = contextual_assignment_rule(&key) else {
+        return;
+    };
+    let normalized_value = normalize_contextual_value(raw_value);
+    if !validate_contextual_value(
+        document,
+        &key,
+        &normalized_value,
+        rule,
+        ContextualValueSource::HtmlAttribute,
+    ) {
+        return;
+    }
+
+    push_metadata_secret_finding_candidate(
+        findings,
+        seen,
+        document,
+        rule.name,
+        &rule.severity,
+        &normalized_value,
+        &format!(
+            "HTML <{}> attribute {} exposed a secret-like value.",
+            tag.trim(),
+            raw_key.trim()
+        ),
+        Some(FindingConfidence::Medium),
+        vec!["html_attribute".to_string(), tag.to_string(), key.clone()],
+        vec!["html_attribute_secret".to_string()],
+    );
+}
+
 fn run_external_detector_pack(
     document: &FetchedDocument,
     manifest: &ExtensionManifest,
@@ -810,6 +2105,7 @@ fn run_external_detector_pack(
         url: &document.url,
         status: document.status,
         content_type: document.content_type.as_deref(),
+        headers: &document.headers,
         body: &document.body,
         truncated: document.truncated,
         coverage_source: &document.coverage_source,
@@ -976,6 +2272,14 @@ fn external_finding_candidate_from_record(
     } else {
         format!("external detector {detector} matched {redacted_value}")
     };
+    let confidence = record
+        .confidence
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::parse)
+        .transpose()
+        .map_err(|error: String| anyhow!("invalid external finding confidence: {error}"))?;
 
     Ok(Some(FindingCandidate {
         detector: detector.to_string(),
@@ -984,6 +2288,26 @@ fn external_finding_candidate_from_record(
         redacted_value,
         evidence,
         fingerprint,
+        confidence,
+        matched_signals: record.matched_signals.clone(),
+        review_labels: record.review_labels.clone(),
+        plugin_metadata: record.plugin_id.as_deref().and_then(|plugin_id| {
+            let cve_ids = record
+                .cve_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            build_plugin_metadata(
+                plugin_id,
+                record.product_name.as_deref(),
+                record.product_version.as_deref(),
+                record.cpe.as_deref(),
+                &cve_ids,
+                record.kev_matched,
+                record.service_protocol.as_deref(),
+                record.service_port,
+            )
+        }),
     }))
 }
 
@@ -1764,7 +3088,2298 @@ fn push_finding_candidate(
         redacted_value: redact_secret(secret_value),
         evidence: build_evidence(document, start, end, evidence_value),
         fingerprint,
+        confidence: None,
+        matched_signals: Vec::new(),
+        review_labels: Vec::new(),
+        plugin_metadata: None,
     });
+}
+
+fn push_plugin_finding_candidate(
+    findings: &mut Vec<FindingCandidate>,
+    seen: &mut HashSet<String>,
+    document: &FetchedDocument,
+    plugin_id: &str,
+    detector_name: &str,
+    severity: Severity,
+    redacted_value: &str,
+    evidence: &str,
+    product_name: Option<&str>,
+    product_version: Option<&str>,
+    cpe: Option<&str>,
+    cve_ids: &[&str],
+    kev_matched: Option<bool>,
+    service_protocol: Option<&str>,
+    service_port: Option<u16>,
+) {
+    let redacted_value = redacted_value.trim();
+    if redacted_value.is_empty() {
+        return;
+    }
+
+    let fingerprint_source = format!(
+        "{plugin_id}:{detector_name}:{}:{redacted_value}",
+        document.path
+    );
+    let fingerprint = fingerprint(&fingerprint_source);
+    let dedupe_key = format!("{}:{fingerprint}", document.path);
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+
+    findings.push(FindingCandidate {
+        detector: detector_name.to_string(),
+        severity,
+        path: document.path.clone(),
+        redacted_value: redacted_value.to_string(),
+        evidence: evidence.trim().to_string(),
+        fingerprint,
+        confidence: None,
+        matched_signals: Vec::new(),
+        review_labels: Vec::new(),
+        plugin_metadata: build_plugin_metadata(
+            plugin_id,
+            product_name,
+            product_version,
+            cpe,
+            cve_ids,
+            kev_matched,
+            service_protocol,
+            service_port,
+        ),
+    });
+}
+
+fn scan_phase_one_plugin_findings(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    scan_phase_one_passive_http_plugins(document, seen, findings);
+    scan_phase_one_version_correlations(document, seen, findings);
+}
+
+fn scan_phase_one_passive_http_plugins(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    let lowered_path = document.path.to_ascii_lowercase();
+    let lowered_body = document.body.to_ascii_lowercase();
+    let trimmed_body = document.body.trim();
+
+    if lowered_path.contains("server-status")
+        && (lowered_body.contains("scoreboard:")
+            || lowered_body.contains("server version:")
+            || lowered_body.contains("server mpm:"))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ApacheStatusPlugin",
+            "apache_server_status_public",
+            Severity::Medium,
+            "apache server-status page",
+            "Apache server-status markers were observed in a public response.",
+            Some("Apache HTTP Server"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if (lowered_path.contains("/check_mk") || lowered_path.contains("/checkmk"))
+        && (lowered_body.contains("checkmk")
+            || lowered_body.contains("check_mk")
+            || lowered_body.contains("monitoring"))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "CheckMkPlugin",
+            "checkmk_monitoring_endpoint_public",
+            Severity::Medium,
+            "checkmk endpoint",
+            "Checkmk monitoring markers were observed in a public response.",
+            Some("Checkmk"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if looks_like_config_json_path(&lowered_path) && looks_like_json_object(trimmed_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ConfigJsonHttp",
+            "json_config_file_exposed",
+            Severity::Medium,
+            "json configuration file",
+            "A JSON configuration-style document was fetched from a public path.",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.ends_with(".ds_store") || lowered_path.contains("/.ds_store") {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DotDsStoreOpenPlugin",
+            "ds_store_listing_exposed",
+            Severity::Medium,
+            ".DS_Store file",
+            "A .DS_Store artifact was fetched from a public path.",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if (looks_like_dotenv_path(&lowered_path))
+        && (document.body.contains('=')
+            && (lowered_body.contains("app_")
+                || lowered_body.contains("database_url=")
+                || lowered_body.contains("secret_key=")
+                || lowered_body.contains("api_key=")
+                || lowered_body.contains("token=")
+                || lowered_body.contains("password=")))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DotEnvConfigPlugin",
+            "dotenv_file_exposed",
+            Severity::High,
+            "dotenv configuration",
+            "A dotenv-style configuration file was observed on a public path.",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.contains(".git/config")
+        && (lowered_body.contains("[core]") || lowered_body.contains("[remote"))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "GitConfigHttpPlugin",
+            "git_config_history_exposed",
+            Severity::High,
+            "git configuration file",
+            "A .git/config file was observed on a public path.",
+            Some("Git"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if (lowered_path.contains("/graphql") || lowered_body.contains("__schema"))
+        && (lowered_body.contains("__schema")
+            || lowered_body.contains("\"querytype\"")
+            || lowered_body.contains("\"mutationtype\"")
+            || lowered_body.contains("introspectionquery"))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "GraphQLIntrospectionPlugin",
+            "graphql_introspection_enabled",
+            Severity::Medium,
+            "graphql introspection response",
+            "GraphQL introspection markers were observed in a public response.",
+            Some("GraphQL"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_chrome_devtools_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ChromeDevToolsPlugin",
+            "chrome_devtools_public",
+            Severity::High,
+            "chrome devtools protocol",
+            "Chrome DevTools Protocol markers were observed in a public response.",
+            Some("Chrome DevTools"),
+            extract_first_json_string_field(&document.body, &["Browser"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_jenkins_surface(&lowered_body, document) {
+        let version = extract_header_value(document, "x-jenkins")
+            .or_else(|| extract_header_value(document, "x-hudson"));
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "JenkinsOpenPlugin",
+            "jenkins_public_instance",
+            Severity::Medium,
+            "jenkins instance",
+            "Jenkins headers or page markers were observed on a public HTTP response.",
+            Some("Jenkins"),
+            version.as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_grafana_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "GrafanaOpenPlugin",
+            "grafana_public_instance",
+            Severity::Medium,
+            "grafana instance",
+            "Grafana UI or API markers were observed in a public response.",
+            Some("Grafana"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_goanywhere_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "GoAnywhereMFT",
+            "goanywhere_admin_public",
+            Severity::Medium,
+            "goanywhere mft admin",
+            "GoAnywhere MFT administration markers were observed in a public response.",
+            Some("GoAnywhere MFT"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_vicibox_recordings_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ViciboxPlugin",
+            "vicibox_recordings_public",
+            Severity::Medium,
+            "vicibox recordings",
+            "Vicidial/ViciBox recordings exposure markers were observed in a public response.",
+            Some("Vicidial / ViciBox"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_deadbolt_ransom_note(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DeadMon",
+            "deadbolt_ransom_note",
+            Severity::High,
+            "deadbolt ransom note",
+            "DeadBolt ransomware note markers were observed in a public response.",
+            Some("DeadBolt"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_attu_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "AttuPlugin",
+            "attu_public_instance",
+            Severity::Medium,
+            "attu ui",
+            "Attu (Milvus GUI) markers were observed in a public response.",
+            Some("Attu"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_cadvisor_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "CAdvisorPlugin",
+            "cadvisor_public_instance",
+            Severity::Medium,
+            "cadvisor dashboard",
+            "cAdvisor markers were observed in a public response.",
+            Some("cAdvisor"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_chroma_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ChromaPlugin",
+            "chroma_public_instance",
+            Severity::Medium,
+            "chroma api",
+            "Chroma markers were observed in a public response.",
+            Some("Chroma"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_cockroachdb_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "CockroachDBPlugin",
+            "cockroachdb_console_public",
+            Severity::Medium,
+            "cockroachdb console",
+            "CockroachDB console markers were observed in a public response.",
+            Some("CockroachDB"),
+            extract_first_json_string_field(&document.body, &["build", "tag", "version"])
+                .as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_druid_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DruidPlugin",
+            "druid_public_instance",
+            Severity::Medium,
+            "druid console",
+            "Apache Druid console markers were observed in a public response.",
+            Some("Apache Druid"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_dagster_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DagsterPlugin",
+            "dagster_ui_public",
+            Severity::Medium,
+            "dagster ui",
+            "Dagster UI markers were observed in a public response.",
+            Some("Dagster"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if (lowered_path.contains("/telescope") || lowered_body.contains("laravel telescope"))
+        && lowered_body.contains("telescope")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "LaravelTelescopeHttpPlugin",
+            "laravel_telescope_enabled",
+            Severity::Medium,
+            "laravel telescope panel",
+            "Laravel Telescope UI markers were observed in a public response.",
+            Some("Laravel Telescope"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_flink_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "FlinkPlugin",
+            "flink_dashboard_public",
+            Severity::Medium,
+            "flink dashboard",
+            "Apache Flink dashboard markers were observed in a public response.",
+            Some("Apache Flink"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_h2_console_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "H2ConsolePlugin",
+            "h2_console_public",
+            Severity::Medium,
+            "h2 console",
+            "H2 Console markers were observed in a public response.",
+            Some("H2 Console"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_harbor_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "HarborPlugin",
+            "harbor_public_instance",
+            Severity::Medium,
+            "harbor ui",
+            "Harbor UI markers were observed in a public response.",
+            Some("Harbor"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_hdfs_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "HdfsOpenPlugin",
+            "hdfs_namenode_public",
+            Severity::Medium,
+            "hdfs namenode",
+            "Hadoop HDFS NameNode markers were observed in a public response.",
+            Some("Hadoop HDFS"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_localai_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "LocalAIPlugin",
+            "localai_public_instance",
+            Severity::Medium,
+            "localai api surface",
+            "LocalAI markers were observed in a public response.",
+            Some("LocalAI"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_marqo_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "MarqoPlugin",
+            "marqo_public_instance",
+            Severity::Medium,
+            "marqo api",
+            "Marqo markers were observed in a public response.",
+            Some("Marqo"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_mlflow_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "MLflowPlugin",
+            "mlflow_tracking_server_public",
+            Severity::Medium,
+            "mlflow tracking ui",
+            "MLflow UI or tracking API markers were observed in a public response.",
+            Some("MLflow"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_meilisearch_surface(&lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "MeilisearchPlugin",
+            "meilisearch_public_instance",
+            Severity::Medium,
+            "meilisearch api",
+            "Meilisearch markers were observed in a public response.",
+            Some("Meilisearch"),
+            extract_first_json_string_field(&document.body, &["pkgVersion", "version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_milvus_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "MilvusPlugin",
+            "milvus_public_instance",
+            Severity::Medium,
+            "milvus api",
+            "Milvus markers were observed in a public response.",
+            Some("Milvus"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_mongo_express_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "MongoExpressPlugin",
+            "mongo_express_public",
+            Severity::Medium,
+            "mongo express ui",
+            "Mongo Express markers were observed in a public response.",
+            Some("Mongo Express"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_neo4j_surface(&lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "Neo4jOpenPlugin",
+            "neo4j_http_public",
+            Severity::Medium,
+            "neo4j http api",
+            "Neo4j Browser or HTTP API markers were observed in a public response.",
+            Some("Neo4j"),
+            extract_first_json_string_field(&document.body, &["neo4j_version", "version"])
+                .as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if (lowered_path.contains("/api/tags") || lowered_body.contains("\"ollama_version\""))
+        && lowered_body.contains("\"models\"")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "OllamaPlugin",
+            "ollama_server_exposed",
+            Severity::Medium,
+            "ollama model catalog",
+            "Ollama API model-list markers were observed without authentication.",
+            Some("Ollama"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_postgrest_surface(&lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "PostgRESTPlugin",
+            "postgrest_public_instance",
+            Severity::Medium,
+            "postgrest api",
+            "PostgREST markers were observed in a public response.",
+            Some("PostgREST"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_prefect_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "PrefectPlugin",
+            "prefect_server_public",
+            Severity::Medium,
+            "prefect ui",
+            "Prefect UI or API markers were observed in a public response.",
+            Some("Prefect"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_rails_debug_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "RailsPlugin",
+            "rails_debug_public",
+            Severity::Medium,
+            "rails debug page",
+            "Ruby on Rails debug page markers were observed in a public response.",
+            Some("Ruby on Rails"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_redis_commander_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "RedisCommanderPlugin",
+            "redis_commander_public",
+            Severity::Medium,
+            "redis commander ui",
+            "Redis Commander markers were observed in a public response.",
+            Some("Redis Commander"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_solr_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SolrOpenPlugin",
+            "solr_admin_public",
+            Severity::Medium,
+            "solr admin console",
+            "Apache Solr administration markers were observed in a public response.",
+            Some("Apache Solr"),
+            extract_first_json_string_field(
+                &document.body,
+                &["solr-spec-version", "lucene-spec-version"],
+            )
+            .as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_selenium_grid_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SeleniumGridPlugin",
+            "selenium_grid_public",
+            Severity::Medium,
+            "selenium grid",
+            "Selenium Grid console markers were observed in a public response.",
+            Some("Selenium Grid"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_splash_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SplashPlugin",
+            "splash_public_instance",
+            Severity::Medium,
+            "splash rendering service",
+            "Splash rendering service markers were observed in a public response.",
+            Some("Splash"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_qdrant_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "QdrantPlugin",
+            "qdrant_public_instance",
+            Severity::Medium,
+            "qdrant api",
+            "Qdrant markers were observed in a public response.",
+            Some("Qdrant"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_jupyter_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "JupyterPlugin",
+            "jupyter_public_instance",
+            Severity::Medium,
+            "jupyter notebook or lab",
+            "Jupyter Notebook or Lab markers were observed in a public response.",
+            Some("Jupyter"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_questdb_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "QuestDBPlugin",
+            "questdb_public_instance",
+            Severity::Medium,
+            "questdb console",
+            "QuestDB markers were observed in a public response.",
+            Some("QuestDB"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_yarn_resourcemanager_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "YarnOpenPlugin",
+            "yarn_resourcemanager_public",
+            Severity::Medium,
+            "yarn resourcemanager",
+            "Hadoop YARN ResourceManager markers were observed in a public response.",
+            Some("Hadoop YARN"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.contains("phpinfo")
+        || lowered_body.contains("<title>phpinfo()</title>")
+        || lowered_body.contains("php version ")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "PhpInfoHttpPlugin",
+            "phpinfo_file_exposed",
+            Severity::Medium,
+            "phpinfo page",
+            "PHP info page markers were observed in a public response.",
+            Some("PHP"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_ray_dashboard_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "RayDashboardPlugin",
+            "ray_dashboard_public",
+            Severity::Medium,
+            "ray dashboard",
+            "Ray Dashboard markers were observed in a public response.",
+            Some("Ray Dashboard"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_weaviate_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "WeaviatePlugin",
+            "weaviate_public_instance",
+            Severity::Medium,
+            "weaviate api",
+            "Weaviate markers were observed in a public response.",
+            Some("Weaviate"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_vespa_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "VespaPlugin",
+            "vespa_public_instance",
+            Severity::Medium,
+            "vespa application status",
+            "Vespa application status markers were observed in a public response.",
+            Some("Vespa"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.ends_with("/metrics")
+        && lowered_body.contains("# help")
+        && lowered_body.contains("# type")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "PrometheusPlugin",
+            "prometheus_metrics_public",
+            Severity::Medium,
+            "prometheus metrics endpoint",
+            "Prometheus metrics markers were observed in a public response.",
+            Some("Prometheus"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_couchdb_surface(&lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "CouchDbOpenPlugin",
+            "couchdb_public_instance",
+            Severity::Medium,
+            "couchdb welcome response",
+            "CouchDB welcome or Fauxton markers were observed in a public response.",
+            Some("CouchDB"),
+            extract_json_string_field(&document.body, "version").as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_elasticsearch_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ElasticSearchOpenPlugin",
+            "elasticsearch_public_instance",
+            Severity::Medium,
+            "elasticsearch api root",
+            "ElasticSearch root API markers were observed in a public response.",
+            Some("ElasticSearch"),
+            extract_first_json_string_field(&document.body, &["number"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_consul_surface(&lowered_path, &lowered_body, trimmed_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "Consul",
+            "consul_public_server",
+            Severity::Medium,
+            "consul ui/api surface",
+            "Consul UI or API markers were observed in a public response.",
+            Some("Consul"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_docker_registry_surface(&lowered_path, trimmed_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DockerRegistryHttpPlugin",
+            "docker_registry_public",
+            Severity::Medium,
+            "docker registry api",
+            "Docker Registry v2 API markers were observed in a public response.",
+            Some("Docker Registry"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_nsq_admin_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "NsqAdminPlugin",
+            "nsq_admin_public",
+            Severity::Medium,
+            "nsqadmin panel",
+            "NSQ Admin markers were observed in a public response.",
+            Some("NSQ Admin"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if advertises_ntlm_auth(document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "HttpNTLM",
+            "http_ntlm_advertised",
+            Severity::Medium,
+            "ntlm challenge",
+            "HTTP response headers advertised NTLM authentication.",
+            Some("NTLM"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_nginx_ui_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "NginxUIPlugin",
+            "nginx_ui_public",
+            Severity::Medium,
+            "nginx ui",
+            "Nginx UI markers were observed in a public response.",
+            Some("Nginx UI"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_nats_monitoring_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "NATSPlugin",
+            "nats_monitoring_public",
+            Severity::Medium,
+            "nats monitoring api",
+            "NATS monitoring markers were observed in a public response.",
+            Some("NATS"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_nomad_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "NomadPlugin",
+            "nomad_public_instance",
+            Severity::Medium,
+            "nomad ui",
+            "HashiCorp Nomad UI markers were observed in a public response.",
+            Some("Nomad"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_novnc_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "NoVncPlugin",
+            "novnc_public_instance",
+            Severity::Medium,
+            "novnc client",
+            "noVNC markers were observed in a public response.",
+            Some("noVNC"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_body.contains("import.meta.env")
+        || lowered_body.contains("window.env")
+        || lowered_body.contains("window.__env")
+        || lowered_body.contains("process.env")
+        || lowered_body.contains("next_public_")
+        || lowered_body.contains("vite_")
+        || lowered_body.contains("react_app_")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "PublicEnvPlugin",
+            "public_environment_variables_exposed",
+            Severity::Medium,
+            "public environment variable bundle",
+            "Client-side environment variable markers were observed in a public response.",
+            None,
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_sonarqube_surface(&lowered_path, &lowered_body, document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SonarQubePlugin",
+            "sonarqube_public_instance",
+            Severity::Medium,
+            "sonarqube instance",
+            "SonarQube UI or API markers were observed in a public response.",
+            Some("SonarQube"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_spring_boot_actuator_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SpringBootActuatorPlugin",
+            "spring_boot_actuator_public",
+            Severity::Medium,
+            "spring boot actuator",
+            "Sensitive Spring Boot actuator markers were observed in a public response.",
+            Some("Spring Boot"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_tidb_status_surface(&lowered_path, &lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "TiDBPlugin",
+            "tidb_status_public",
+            Severity::Medium,
+            "tidb status server",
+            "TiDB status server markers were observed in a public response.",
+            Some("TiDB"),
+            extract_first_json_string_field(&document.body, &["version"]).as_deref(),
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.contains("security.txt") {
+        if let Some(expires_at) = extract_security_txt_expiry(&document.body) {
+            if expires_at < Utc::now() {
+                push_plugin_finding_candidate(
+                    findings,
+                    seen,
+                    document,
+                    "SecurityTxtPlugin",
+                    "expired_security_txt",
+                    Severity::Low,
+                    "expired security.txt",
+                    "security.txt Expires value is in the past.",
+                    Some("security.txt"),
+                    Some(&expires_at.to_rfc3339()),
+                    None,
+                    &[],
+                    None,
+                    Some("http"),
+                    infer_service_port(document),
+                );
+            }
+        }
+    }
+
+    if lowered_path.contains("swagger")
+        || lowered_path.contains("openapi")
+        || lowered_path.contains("api-docs")
+        || lowered_body.contains("swagger-ui")
+        || lowered_body.contains("\"openapi\"")
+        || lowered_body.contains("\"swagger\"")
+        || lowered_body.contains("openapi:")
+        || lowered_body.contains("swagger:")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SwaggerUIPlugin",
+            "swagger_api_description_public",
+            Severity::Medium,
+            "swagger/openapi description",
+            "Swagger or OpenAPI markers were observed in a public response.",
+            Some("OpenAPI"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.contains("_profiler")
+        || extract_header_value(document, "x-debug-token").is_some()
+        || extract_header_value(document, "x-debug-token-link").is_some()
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SymfonyProfilerPlugin",
+            "symfony_profiler_enabled",
+            Severity::Medium,
+            "symfony profiler panel",
+            "Symfony profiler markers were observed in a public response.",
+            Some("Symfony"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_body.contains("symfony exception")
+        || (lowered_body.contains("whoops, looks like something went wrong")
+            && lowered_body.contains("symfony"))
+        || lowered_body.contains("symfony\\\\component\\\\")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "SymfonyVerbosePlugin",
+            "symfony_verbose_error_leak",
+            Severity::Medium,
+            "symfony verbose error page",
+            "Symfony verbose exception markers were observed in a public response.",
+            Some("Symfony"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_path.contains("trace.axd")
+        || (lowered_body.contains("trace.axd") && lowered_body.contains("application trace"))
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "TraceAxdPlugin",
+            "aspnet_trace_axd_exposed",
+            Severity::Medium,
+            "trace.axd endpoint",
+            "ASP.NET trace.axd markers were observed in a public response.",
+            Some("ASP.NET"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_vite_fs_raw_env_exposure(&lowered_path, &document.body) {
+        let (redacted_value, evidence) = if lowered_path.contains("/proc/self/environ")
+            || lowered_path.contains("/proc/1/environ")
+        {
+            (
+                "vite @fs raw process environment",
+                "A Vite /@fs/ raw file read exposed a process environment dump.",
+            )
+        } else {
+            (
+                "vite @fs raw dotenv file",
+                "A Vite /@fs/ raw file read exposed a local dotenv-style file.",
+            )
+        };
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ViteJSPlugin",
+            "vite_fs_raw_file_read_exposed",
+            Severity::High,
+            redacted_value,
+            evidence,
+            Some("Vite"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_vscode_sftp_surface(&lowered_path, trimmed_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "VsCodeSFTPPlugin",
+            "vscode_sftp_config_exposed",
+            Severity::Medium,
+            "vscode sftp configuration",
+            "VSCode SFTP configuration markers were observed in a public response.",
+            Some("VSCode SFTP"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if lowered_body.contains("/@vite/client")
+        || lowered_body.contains("__vite_ping")
+        || lowered_body.contains("import.meta.hot")
+        || lowered_body.contains("vite/client")
+    {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "ViteJSPlugin",
+            "vite_development_environment_exposed",
+            Severity::Medium,
+            "vite development client",
+            "Vite development environment markers were observed in a public response.",
+            Some("Vite"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_webdav_surface(document) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "WebDAVPlugin",
+            "webdav_public_instance",
+            Severity::Medium,
+            "webdav capability",
+            "WebDAV capability headers were observed in a public response.",
+            Some("WebDAV"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_django_debug_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "DjangoPlugin",
+            "django_debug_public",
+            Severity::Medium,
+            "django debug page",
+            "Django debug page markers were observed in a public response.",
+            Some("Django"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_flask_debug_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "FlaskPlugin",
+            "flask_debug_public",
+            Severity::Medium,
+            "flask debugger",
+            "Flask/Werkzeug debugger markers were observed in a public response.",
+            Some("Flask"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+
+    if is_yii_debug_surface(&lowered_body) {
+        push_plugin_finding_candidate(
+            findings,
+            seen,
+            document,
+            "YiiDebugPlugin",
+            "yii_debug_public",
+            Severity::Medium,
+            "yii debug toolbar",
+            "Yii debug toolbar markers were observed in a public response.",
+            Some("Yii"),
+            None,
+            None,
+            &[],
+            None,
+            Some("http"),
+            infer_service_port(document),
+        );
+    }
+}
+
+fn scan_phase_one_version_correlations(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    if let Some(version) = extract_screenconnect_version(document) {
+        if is_screenconnect_vulnerable_version(&version) {
+            push_plugin_finding_candidate(
+                findings,
+                seen,
+                document,
+                "ConnectWiseScreenConnect",
+                "screenconnect_vulnerable_version",
+                Severity::High,
+                "screenconnect vulnerable version",
+                "ConnectWise ScreenConnect vulnerable-version markers were observed in a public response.",
+                Some("ConnectWise ScreenConnect"),
+                Some(&version),
+                None,
+                &[],
+                None,
+                Some("http"),
+                infer_service_port(document),
+            );
+        }
+    }
+
+    if let Some(version) = extract_goanywhere_version(document) {
+        if compare_numeric_versions(&version, "7.4.1").is_lt() {
+            push_plugin_finding_candidate(
+                findings,
+                seen,
+                document,
+                "GoAnywhereMFT202501",
+                "goanywhere_vulnerable_version",
+                Severity::High,
+                "goanywhere vulnerable version",
+                "GoAnywhere MFT vulnerable-version markers were observed in a public response.",
+                Some("GoAnywhere MFT"),
+                Some(&version),
+                None,
+                &[],
+                None,
+                Some("http"),
+                infer_service_port(document),
+            );
+        }
+    }
+
+    if let Some(version) = extract_solr_version(document) {
+        if compare_numeric_versions(&version, "9.8.0").is_lt() {
+            push_plugin_finding_candidate(
+                findings,
+                seen,
+                document,
+                "SolrVersionPlugin",
+                "solr_vulnerable_version",
+                Severity::High,
+                "solr vulnerable version",
+                "Apache Solr version markers were observed below the current patched threshold for published 2024-2025 security fixes.",
+                Some("Apache Solr"),
+                Some(&version),
+                None,
+                &[],
+                None,
+                Some("http"),
+                infer_service_port(document),
+            );
+        }
+    }
+
+    if let Some(version) = extract_header_value(document, "x-jenkins")
+        .or_else(|| extract_header_value(document, "x-hudson"))
+    {
+        if compare_numeric_versions(&version, "2.426.3").is_lt() {
+            push_plugin_finding_candidate(
+                findings,
+                seen,
+                document,
+                "JenkinsVersionPlugin",
+                "jenkins_version_outdated",
+                Severity::High,
+                "jenkins version disclosure",
+                "Jenkins version disclosure matched the initial phase-1 static outdated-version floor.",
+                Some("Jenkins"),
+                Some(&version),
+                None,
+                &[],
+                None,
+                Some("http"),
+                infer_service_port(document),
+            );
+        }
+    }
+}
+
+fn looks_like_config_json_path(lowered_path: &str) -> bool {
+    lowered_path.ends_with("/config.json")
+        || lowered_path.ends_with("/runtime-config.json")
+        || lowered_path.ends_with("/settings.json")
+        || lowered_path.ends_with("/manifest.json")
+}
+
+fn looks_like_json_object(trimmed_body: &str) -> bool {
+    trimmed_body.starts_with('{') && trimmed_body.ends_with('}') && trimmed_body.contains(':')
+}
+
+fn is_chrome_devtools_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    (lowered_path.contains("/json/version") || lowered_path.contains("/json/list"))
+        && lowered_body.contains("websocketdebuggerurl")
+        && (lowered_body.contains("\"browser\"") || lowered_body.contains("\"protocol-version\""))
+}
+
+fn is_attu_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("<title>attu")
+        || lowered_body.contains("milvus gui")
+        || (lowered_body.contains("attu") && lowered_body.contains("milvus"))
+}
+
+fn is_cadvisor_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("<title>cadvisor")
+        || lowered_body.contains("cadvisor -")
+        || lowered_body.contains("container advisor")
+}
+
+fn is_chroma_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    (lowered_path.contains("/api/v1/heartbeat") || lowered_path.contains("/api/v2/heartbeat"))
+        && (lowered_body.contains("chroma") || lowered_body.contains("heartbeat"))
+}
+
+fn is_cockroachdb_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_body.contains("cockroach")
+        && (lowered_body.contains("db console")
+            || lowered_body.contains("cockroachlabs")
+            || lowered_body.contains("cockroach labs")
+            || lowered_path.contains("/_admin"))
+}
+
+fn is_dagster_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("dagster ui") || lowered_body.contains("dagit")
+}
+
+fn is_deadbolt_ransom_note(lowered_body: &str) -> bool {
+    lowered_body.contains("deadbolt")
+        && (lowered_body.contains("bitcoin")
+            || lowered_body.contains("files have been encrypted")
+            || lowered_body.contains("unlock"))
+}
+
+fn is_django_debug_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("you’re seeing this error because you have <code>debug = true</code>")
+        || lowered_body
+            .contains("you're seeing this error because you have <code>debug = true</code>")
+        || (lowered_body.contains("django version")
+            && lowered_body.contains("exception type:")
+            && lowered_body.contains("request method:"))
+}
+
+fn is_druid_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("apache druid console")
+        || lowered_body.contains("druid console")
+        || lowered_body.contains("druid coordinator")
+}
+
+fn is_elasticsearch_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("\"tagline\":\"you know, for search\"")
+        || (lowered_body.contains("\"cluster_name\"")
+            && lowered_body.contains("\"version\"")
+            && lowered_body.contains("\"lucene_version\""))
+}
+
+fn is_grafana_surface(lowered_path: &str, lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("window.grafanabootdata")
+        || lowered_body.contains("<title>grafana")
+        || lowered_body.contains("grafana-app")
+        || (lowered_path.contains("/api/health")
+            && lowered_body.contains("\"database\"")
+            && lowered_body.contains("\"version\""))
+        || extract_header_value(document, "x-grafana-org-id").is_some()
+}
+
+fn is_flink_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("apache flink dashboard")
+        || lowered_body.contains("flink web dashboard")
+        || lowered_body.contains("flink-dashboard")
+}
+
+fn is_flask_debug_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("werkzeug debugger")
+        || lowered_body.contains("the debugger caught an exception in your wsgi application")
+}
+
+fn is_h2_console_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("h2-console") || lowered_body.contains("<title>h2 console")
+}
+
+fn is_harbor_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("<title>harbor")
+        || lowered_body.contains("harbor-ui")
+        || lowered_body.contains("project harbor")
+}
+
+fn is_hdfs_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("dfshealth")
+        || (lowered_body.contains("namenode")
+            && (lowered_body.contains("hadoop") || lowered_body.contains("dfs health")))
+}
+
+fn is_goanywhere_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("goanywhere")
+        || (lowered_body.contains("goanywhere") && lowered_body.contains("mft"))
+}
+
+fn is_vicibox_recordings_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/recordings/")
+        && (lowered_body.contains("vicidial")
+            || lowered_body.contains("vicibox")
+            || lowered_body.contains(".wav")
+            || lowered_body.contains(".mp3"))
+}
+
+fn is_jenkins_surface(lowered_body: &str, document: &FetchedDocument) -> bool {
+    extract_header_value(document, "x-jenkins").is_some()
+        || extract_header_value(document, "x-hudson").is_some()
+        || lowered_body.contains("dashboard [jenkins]")
+        || lowered_body.contains("jenkins.instanceidentity")
+        || lowered_body.contains("welcome to jenkins")
+}
+
+fn is_jupyter_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/tree")
+        || lowered_path.contains("/lab")
+        || lowered_body.contains("jupyter notebook")
+        || lowered_body.contains("jupyterlab")
+        || lowered_body.contains("jupyter server")
+}
+
+fn is_localai_surface(lowered_path: &str, lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("localai")
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("localai"))
+        || (lowered_path.contains("/v1/models") && lowered_body.contains("\"data\""))
+        || (lowered_path.contains("/readyz") && lowered_body.contains("localai"))
+}
+
+fn is_marqo_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    (lowered_path.contains("/indexes") || lowered_path.contains("/api"))
+        && lowered_body.contains("marqo")
+}
+
+fn is_mlflow_surface(lowered_path: &str, lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("<title>mlflow")
+        || lowered_body.contains("mlflow ui")
+        || lowered_body.contains("mlflow tracking")
+        || lowered_body.contains("__mlflow")
+        || lowered_path.contains("/ajax-api/2.0/mlflow")
+        || extract_header_value(document, "x-mlflow-server-version").is_some()
+}
+
+fn is_meilisearch_surface(lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("meilisearch")
+        || extract_header_value(document, "x-meilisearch-instance-uid").is_some()
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("meilisearch"))
+}
+
+fn is_milvus_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    (lowered_path.contains("/api/v1") || lowered_path.contains("/api/v2"))
+        && lowered_body.contains("milvus")
+}
+
+fn is_mongo_express_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("mongo express") || lowered_body.contains("<title>mongo-express")
+}
+
+fn is_nats_monitoring_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    (lowered_path.contains("/varz")
+        || lowered_path.contains("/connz")
+        || lowered_path.contains("/routez"))
+        && lowered_body.contains("server_id")
+        && lowered_body.contains("max_connections")
+}
+
+fn is_neo4j_surface(lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("neo4j browser")
+        || lowered_body.contains("neo4j_version")
+        || lowered_body.contains("bolt_routing")
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("neo4j"))
+}
+
+fn is_nomad_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("<title>nomad")
+        || lowered_body.contains("nomad ui")
+        || lowered_body.contains("hashicorp nomad")
+}
+
+fn is_novnc_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("novnc")
+        && (lowered_body.contains("connect") || lowered_body.contains("remote desktop"))
+}
+
+fn is_nginx_ui_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("<title>nginx ui")
+        || lowered_body.contains("nginx-ui")
+        || lowered_body.contains("nginx ui")
+}
+
+fn is_postgrest_surface(lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("postgrest")
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("postgrest"))
+}
+
+fn is_prefect_surface(lowered_path: &str, lowered_body: &str, _document: &FetchedDocument) -> bool {
+    lowered_body.contains("prefect ui")
+        || lowered_body.contains("__prefect2_ui_api_url")
+        || lowered_body.contains("prefect server")
+        || lowered_body.contains("\"prefect\"")
+        || lowered_path.contains("/api/health")
+            && lowered_body.contains("\"status\"")
+            && lowered_body.contains("prefect")
+}
+
+fn is_rails_debug_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("application trace")
+        && lowered_body.contains("framework trace")
+        && lowered_body.contains("full trace")
+        && (lowered_body.contains("web console") || lowered_body.contains("action dispatch"))
+}
+
+fn is_qdrant_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_body.contains("qdrant")
+        && (lowered_path.contains("/collections")
+            || lowered_path.contains("/dashboard")
+            || lowered_path.contains("/api"))
+}
+
+fn is_questdb_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("questdb")
+        || (lowered_body.contains("web console") && lowered_body.contains("quest"))
+}
+
+fn is_ray_dashboard_surface(
+    lowered_path: &str,
+    lowered_body: &str,
+    _document: &FetchedDocument,
+) -> bool {
+    lowered_body.contains("ray dashboard")
+        || lowered_body.contains("ray cluster")
+        || lowered_body.contains("\"ray_version\"")
+        || lowered_path.contains("/api/version")
+            && lowered_body.contains("\"version\"")
+            && lowered_body.contains("ray")
+}
+
+fn is_redis_commander_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("redis commander") || lowered_body.contains("<title>redis-commander")
+}
+
+fn is_solr_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/solr")
+        && (lowered_body.contains("solr admin")
+            || lowered_body.contains("apache solr")
+            || lowered_body.contains("lucene-spec-version")
+            || lowered_body.contains("solr-spec-version"))
+}
+
+fn is_selenium_grid_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/grid/console")
+        || lowered_body.contains("selenium grid")
+        || lowered_body.contains("grid console")
+}
+
+fn is_splash_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/render.html")
+        && (lowered_body.contains("splash")
+            || lowered_body.contains("lua scripting")
+            || lowered_body.contains("javascript rendering service"))
+}
+
+fn is_spring_boot_actuator_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/actuator/")
+        && (lowered_body.contains("propertysources")
+            || lowered_body.contains("activeprofiles")
+            || lowered_body.contains("beans")
+            || lowered_body.contains("contexts")
+            || lowered_body.contains("\"status\""))
+}
+
+fn is_tidb_status_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/status")
+        && lowered_body.contains("tidb")
+        && lowered_body.contains("status")
+}
+
+fn is_weaviate_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_body.contains("weaviate")
+        && (lowered_path.contains("/v1/meta")
+            || lowered_path.contains("/v1/")
+            || lowered_path.contains("/meta"))
+}
+
+fn is_vespa_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/applicationstatus")
+        && (lowered_body.contains("vespa") || lowered_body.contains("application status"))
+}
+
+fn is_vscode_sftp_surface(lowered_path: &str, trimmed_body: &str) -> bool {
+    lowered_path.ends_with("/.vscode/sftp.json")
+        && trimmed_body.starts_with('{')
+        && trimmed_body.contains("\"host\"")
+        && trimmed_body.contains("\"username\"")
+}
+
+fn is_webdav_surface(document: &FetchedDocument) -> bool {
+    header_contains_token(document, "dav", "1")
+        || header_contains_token(document, "allow", "PROPFIND")
+        || header_contains_token(document, "allow", "MKCOL")
+}
+
+fn is_yarn_resourcemanager_surface(lowered_path: &str, lowered_body: &str) -> bool {
+    lowered_path.contains("/cluster")
+        || ((lowered_body.contains("yarn resourcemanager")
+            || lowered_body.contains("resourcemanager"))
+            && lowered_body.contains("hadoop"))
+}
+
+fn is_yii_debug_surface(lowered_body: &str) -> bool {
+    lowered_body.contains("yii debug toolbar")
+        || lowered_body.contains("yii debug")
+        || lowered_body.contains("yii\\debug")
+}
+
+fn is_couchdb_surface(lowered_body: &str, document: &FetchedDocument) -> bool {
+    lowered_body.contains("\"couchdb\":\"welcome\"")
+        || lowered_body.contains("fauxton")
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("couchdb"))
+}
+
+fn is_consul_surface(
+    lowered_path: &str,
+    lowered_body: &str,
+    trimmed_body: &str,
+    _document: &FetchedDocument,
+) -> bool {
+    lowered_body.contains("consul ui")
+        || lowered_body.contains("consul-ui")
+        || lowered_body.contains("\"consul_version\"")
+        || (lowered_path.contains("/v1/status/leader")
+            && trimmed_body.starts_with('"')
+            && trimmed_body.ends_with('"')
+            && trimmed_body.contains(':'))
+        || (lowered_path.contains("/ui/") && lowered_body.contains("consul"))
+}
+
+fn is_docker_registry_surface(
+    lowered_path: &str,
+    trimmed_body: &str,
+    document: &FetchedDocument,
+) -> bool {
+    extract_header_value(document, "docker-distribution-api-version")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("registry/2.0"))
+        && document.status == 200
+        || (lowered_path.contains("/v2/")
+            && document.status == 200
+            && (trimmed_body == "{}"
+                || trimmed_body.contains("\"repositories\"")
+                || trimmed_body.contains("\"errors\"") == false))
+}
+
+fn is_nsq_admin_surface(
+    lowered_path: &str,
+    lowered_body: &str,
+    _document: &FetchedDocument,
+) -> bool {
+    lowered_body.contains("<title>nsq admin")
+        || lowered_body.contains("nsqadmin")
+        || lowered_path.contains("/nsqadmin")
+}
+
+fn is_sonarqube_surface(
+    lowered_path: &str,
+    lowered_body: &str,
+    document: &FetchedDocument,
+) -> bool {
+    lowered_body.contains("sonarqube")
+        || lowered_body.contains("sonarcloud")
+        || lowered_path.contains("/api/system/status")
+            && lowered_body.contains("\"status\"")
+            && lowered_body.contains("up")
+        || extract_header_value(document, "server")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("sonarqube"))
+}
+
+fn extract_json_string_field(body: &str, field_name: &str) -> Option<String> {
+    let value = serde_json::from_str::<JsonValue>(body).ok()?;
+    value.get(field_name)?.as_str().map(str::to_string)
+}
+
+fn extract_first_json_string_field(body: &str, field_names: &[&str]) -> Option<String> {
+    for field_name in field_names {
+        if let Some(value) = extract_json_string_field(body, field_name) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn extract_header_value(document: &FetchedDocument, name: &str) -> Option<String> {
+    document
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_header_value_by_name_fragment(
+    document: &FetchedDocument,
+    fragment: &str,
+) -> Option<String> {
+    let lowered_fragment = fragment.to_ascii_lowercase();
+    document
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.to_ascii_lowercase().contains(&lowered_fragment))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_version_token(value: &str) -> Option<String> {
+    let regex = Regex::new(r"\d+\.\d+\.\d+(?:\.\d+)?").ok()?;
+    regex
+        .find(value)
+        .map(|matched| matched.as_str().to_string())
+}
+
+fn extract_screenconnect_version(document: &FetchedDocument) -> Option<String> {
+    if let Some(value) = extract_header_value_by_name_fragment(document, "screenconnect") {
+        if let Some(version) = extract_version_token(&value) {
+            return Some(version);
+        }
+    }
+    SCREENCONNECT_VERSION_RE
+        .captures(&document.body)
+        .and_then(|captures| captures.name("version"))
+        .map(|matched| matched.as_str().to_string())
+}
+
+fn is_screenconnect_vulnerable_version(version: &str) -> bool {
+    let parts = numeric_version_parts(version);
+    let Some(major) = parts.first().copied() else {
+        return false;
+    };
+    let minor = parts.get(1).copied().unwrap_or_default();
+
+    if major < 22 {
+        return true;
+    }
+
+    if major == 22 {
+        return compare_numeric_versions(version, "22.4.20001").is_lt();
+    }
+
+    if major == 23 {
+        if minor < 9 {
+            return true;
+        }
+        if minor == 9 {
+            return compare_numeric_versions(version, "23.9.8").is_lt();
+        }
+        return false;
+    }
+
+    false
+}
+
+fn extract_goanywhere_version(document: &FetchedDocument) -> Option<String> {
+    GOANYWHERE_VERSION_RE
+        .captures(&document.body)
+        .and_then(|captures| captures.name("version"))
+        .map(|matched| matched.as_str().to_string())
+}
+
+fn extract_solr_version(document: &FetchedDocument) -> Option<String> {
+    SOLR_SPEC_VERSION_RE
+        .captures(&document.body)
+        .and_then(|captures| captures.name("version"))
+        .map(|matched| matched.as_str().to_string())
+        .or_else(|| {
+            extract_first_json_string_field(&document.body, &["solr-spec-version", "version"])
+        })
+}
+
+fn header_contains_token(document: &FetchedDocument, name: &str, token: &str) -> bool {
+    extract_header_value(document, name).is_some_and(|value| {
+        value
+            .to_ascii_lowercase()
+            .contains(&token.to_ascii_lowercase())
+    })
+}
+
+fn advertises_ntlm_auth(document: &FetchedDocument) -> bool {
+    header_contains_token(document, "www-authenticate", "NTLM")
+}
+
+fn extract_security_txt_expiry(body: &str) -> Option<DateTime<Utc>> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() < "expires:".len() || !trimmed[..8].eq_ignore_ascii_case("expires:") {
+            continue;
+        }
+        let value = trimmed[8..].trim();
+        if let Ok(parsed) = DateTime::parse_from_rfc3339(value) {
+            return Some(parsed.with_timezone(&Utc));
+        }
+    }
+    None
+}
+
+fn infer_service_port(document: &FetchedDocument) -> Option<u16> {
+    Url::parse(&document.url)
+        .ok()
+        .and_then(|url| url.port_or_known_default())
+}
+
+fn compare_numeric_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_parts = numeric_version_parts(left);
+    let mut right_parts = numeric_version_parts(right);
+    let target_len = left_parts.len().max(right_parts.len()).max(3);
+    left_parts.resize(target_len, 0);
+    right_parts.resize(target_len, 0);
+    left_parts.cmp(&right_parts)
+}
+
+fn numeric_version_parts(value: &str) -> Vec<u64> {
+    value
+        .split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        .find(|segment| segment.chars().any(|ch| ch.is_ascii_digit()))
+        .unwrap_or_default()
+        .split('.')
+        .filter_map(|segment| segment.parse::<u64>().ok())
+        .collect()
 }
 
 fn candidate_detectors(document: &FetchedDocument) -> Vec<&'static DetectorDefinition> {
@@ -1824,7 +5439,7 @@ fn normalize_contextual_value(value: &str) -> String {
     value
         .trim()
         .trim_end_matches(|ch| ch == ',' || ch == ';')
-        .trim_matches(&['"', '\''][..])
+        .trim_matches(&['"', '\'', '`'][..])
         .trim()
         .to_string()
 }
@@ -1834,23 +5449,66 @@ fn validate_contextual_value(
     key: &str,
     value: &str,
     rule: &ContextualAssignmentRule,
+    source: ContextualValueSource,
 ) -> bool {
     if value.len() < rule.min_value_len || looks_like_placeholder_secret(value) {
         return false;
     }
 
     match rule.value_kind {
-        ContextValueKind::HighEntropy => looks_like_high_entropy_secret(value),
-        ContextValueKind::TokenLike => {
-            if key == "token" && !is_contextual_secret_path(&document.path) {
+        ContextValueKind::BroadSecret => {
+            if matches!(key, "token" | "secret" | "key" | "auth")
+                && !is_contextual_secret_path(&document.path)
+                && matches!(
+                    source,
+                    ContextualValueSource::BodyAssignment | ContextualValueSource::StructuredField
+                )
+            {
                 let candidate = strip_auth_scheme(value).unwrap_or(value);
                 return looks_like_jwt(candidate);
             }
-            looks_like_token_like_secret(value)
+            looks_like_broad_secret(value)
         }
         ContextValueKind::Password => looks_like_secretish_password(value),
         ContextValueKind::ConnectionString => looks_like_connection_string(value),
     }
+}
+
+fn push_metadata_secret_finding_candidate(
+    findings: &mut Vec<FindingCandidate>,
+    seen: &mut HashSet<String>,
+    document: &FetchedDocument,
+    detector_name: &str,
+    severity: &Severity,
+    secret_value: &str,
+    evidence: &str,
+    confidence: Option<FindingConfidence>,
+    matched_signals: Vec<String>,
+    review_labels: Vec<String>,
+) {
+    let secret_value = secret_value.trim();
+    if secret_value.is_empty() {
+        return;
+    }
+
+    let fingerprint = fingerprint(secret_value);
+    let dedupe_key = format!("{}:{detector_name}:{fingerprint}", document.path);
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+
+    findings.push(FindingCandidate {
+        detector: detector_name.to_string(),
+        severity: severity.clone(),
+        path: document.path.clone(),
+        redacted_value: redact_secret(secret_value),
+        evidence: evidence.trim().to_string(),
+        fingerprint,
+        confidence,
+        matched_signals,
+        review_labels,
+        plugin_metadata: None,
+    });
 }
 
 fn looks_like_placeholder_secret(value: &str) -> bool {
@@ -1945,6 +5603,39 @@ fn looks_like_token_like_secret(value: &str) -> bool {
     looks_like_jwt(candidate) || looks_like_high_entropy_secret(candidate)
 }
 
+fn looks_like_broad_secret(value: &str) -> bool {
+    let candidate = strip_auth_scheme(value).unwrap_or(value).trim();
+    if candidate.len() < 12
+        || candidate.contains("://")
+        || candidate.chars().any(|ch| ch.is_whitespace())
+    {
+        return false;
+    }
+
+    looks_like_token_like_secret(candidate)
+        || looks_like_base64_secret(candidate)
+        || looks_like_hex_secret(candidate)
+        || looks_like_secretish_password(candidate)
+        || has_secretish_prefix(candidate)
+}
+
+fn looks_like_hex_secret(value: &str) -> bool {
+    let candidate = value.trim();
+    candidate.len() >= 16
+        && unique_char_count(candidate) >= 6
+        && candidate.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn has_secretish_prefix(value: &str) -> bool {
+    let lowered = value.to_ascii_lowercase();
+    [
+        "sk_", "sk-", "pk_", "pk-", "key_", "key-", "tok_", "tok-", "pat_", "pat-", "ghp_",
+        "glpat-", "xox", "hf_", "sg.", "npm_", "pypi-", "bearer ", "basic ",
+    ]
+    .iter()
+    .any(|prefix| lowered.starts_with(prefix))
+}
+
 fn looks_like_high_entropy_secret(value: &str) -> bool {
     let candidate = strip_auth_scheme(value).unwrap_or(value).trim();
     if candidate.len() < 16
@@ -2007,7 +5698,7 @@ fn looks_like_secretish_password(value: &str) -> bool {
 
 fn is_contextual_secret_path(path: &str) -> bool {
     let lowered = path.trim().to_ascii_lowercase();
-    lowered.ends_with(".env")
+    looks_like_dotenv_path(&lowered)
         || lowered.contains(".env.")
         || lowered.ends_with(".json")
         || lowered.ends_with(".yaml")
@@ -2027,6 +5718,48 @@ fn is_contextual_secret_path(path: &str) -> bool {
         || lowered.ends_with("kubeconfig")
         || lowered.ends_with("/config")
         || lowered.contains("/settings")
+}
+
+fn looks_like_dotenv_path(lowered_path: &str) -> bool {
+    lowered_path.ends_with(".env")
+        || lowered_path.contains("/.env")
+        || lowered_path.contains(".env?")
+}
+
+fn is_vite_fs_raw_env_exposure(lowered_path: &str, body: &str) -> bool {
+    if !lowered_path.starts_with("/@fs/") || !lowered_path.contains("?raw") {
+        return false;
+    }
+
+    if lowered_path.contains(".env") {
+        return looks_like_env_assignment_blob(body, 2);
+    }
+
+    if lowered_path.contains("/proc/self/environ") || lowered_path.contains("/proc/1/environ") {
+        return body.contains('\0') && looks_like_env_assignment_blob(body, 3);
+    }
+
+    false
+}
+
+fn looks_like_env_assignment_blob(body: &str, minimum_assignments: usize) -> bool {
+    body.split(|ch| matches!(ch, '\0' | '\n' | '\r'))
+        .filter_map(|segment| {
+            let trimmed = segment.trim();
+            let (key, value) = trimmed.split_once('=')?;
+            if key.len() < 2
+                || value.trim().is_empty()
+                || !key
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+            {
+                return None;
+            }
+            Some(())
+        })
+        .take(minimum_assignments)
+        .count()
+        >= minimum_assignments
 }
 
 fn strip_auth_scheme(value: &str) -> Option<&str> {
@@ -2129,16 +5862,25 @@ fn fingerprint(value: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
+    use crate::core::Severity;
     use crate::fetcher::FetchedDocument;
 
-    use super::{candidate_detectors, DetectorEngine};
+    use super::{DetectorEngine, candidate_detectors, compare_numeric_versions};
 
     fn document(path: &str, body: &str) -> FetchedDocument {
+        document_with_headers(path, body, &[])
+    }
+
+    fn document_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> FetchedDocument {
         FetchedDocument {
             path: path.to_string(),
             url: format!("https://example.test{path}"),
             status: 200,
             content_type: Some("text/plain".to_string()),
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
             body: body.to_string(),
             truncated: false,
             coverage_source: "test-seed".to_string(),
@@ -2155,6 +5897,1213 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].redacted_value.contains("****"));
         assert_eq!(findings[0].path, "/.env");
+    }
+
+    #[test]
+    fn detector_engine_tags_phase_one_passive_plugins_with_catalog_metadata() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/.env",
+            "APP_KEY=base64:1234567890\nDATABASE_URL=postgres://scanner:secret@example.test/db\n",
+        ));
+
+        let dotenv = findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .plugin_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.plugin_id == "DotEnvConfigPlugin")
+            })
+            .expect("dotenv plugin finding");
+
+        let metadata = dotenv.plugin_metadata.as_ref().expect("plugin metadata");
+        assert_eq!(metadata.plugin_id, "DotEnvConfigPlugin");
+        assert_eq!(metadata.plugin_family.as_str(), "leakage_debug_config");
+        assert_eq!(metadata.execution_mode.as_str(), "passive_http");
+        assert_eq!(metadata.leakix_label.as_str(), "trusted_pro");
+    }
+
+    #[test]
+    fn detector_engine_flags_vite_fs_raw_dotenv_reads() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/@fs/..%2f..%2f..%2f..%2f.env?raw",
+            "VITE_API_BASE_URL=https://api.example.test\nDATABASE_URL=postgres://scanner:secret@example.test/db\n",
+        ));
+
+        let vite = findings
+            .iter()
+            .find(|finding| {
+                finding.detector == "vite_fs_raw_file_read_exposed"
+                    && finding
+                        .plugin_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.plugin_id == "ViteJSPlugin")
+            })
+            .expect("vite @fs raw dotenv finding");
+        assert_eq!(vite.severity, Severity::High);
+
+        assert!(findings.iter().any(|finding| {
+            finding
+                .plugin_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.plugin_id == "DotEnvConfigPlugin")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_flags_vite_fs_raw_process_environment_reads() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/@fs//proc/self/environ?raw",
+            "PWD=/workspace\0HOME=/root\0DATABASE_URL=postgres://scanner:secret@example.test/db\0",
+        ));
+
+        let vite = findings
+            .iter()
+            .find(|finding| {
+                finding.detector == "vite_fs_raw_file_read_exposed"
+                    && finding
+                        .plugin_metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.plugin_id == "ViteJSPlugin")
+            })
+            .expect("vite @fs raw environ finding");
+        assert_eq!(vite.severity, Severity::High);
+    }
+
+    #[test]
+    fn detector_engine_emits_version_correlation_finding_for_old_jenkins_header() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html><title>Dashboard [Jenkins]</title></html>",
+            &[("X-Jenkins", "2.401.3")],
+        ));
+
+        let version_finding = findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .plugin_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.plugin_id == "JenkinsVersionPlugin")
+            })
+            .expect("jenkins version correlation finding");
+        let metadata = version_finding
+            .plugin_metadata
+            .as_ref()
+            .expect("plugin metadata");
+        assert_eq!(metadata.execution_mode.as_str(), "version_correlation");
+        assert_eq!(metadata.product_name.as_deref(), Some("Jenkins"));
+        assert_eq!(metadata.product_version.as_deref(), Some("2.401.3"));
+    }
+
+    #[test]
+    fn detector_engine_emits_screenconnect_vulnerability_only_for_affected_versions() {
+        let engine = DetectorEngine::new();
+        let vulnerable = engine.scan_document(&document_with_headers(
+            "/login",
+            "<html><title>ConnectWise Control</title></html>",
+            &[("X-ScreenConnect-Version", "23.9.7.8817")],
+        ));
+        let vulnerable_ids = vulnerable
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(vulnerable_ids.contains("ConnectWiseScreenConnect"));
+
+        let patched = engine.scan_document(&document_with_headers(
+            "/login",
+            "<html><title>ConnectWise Control</title></html>",
+            &[("X-ScreenConnect-Version", "23.9.8.9000")],
+        ));
+        let patched_ids = patched
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!patched_ids.contains("ConnectWiseScreenConnect"));
+    }
+
+    #[test]
+    fn detector_engine_emits_goanywhere_vulnerability_only_for_affected_versions() {
+        let engine = DetectorEngine::new();
+        let vulnerable = engine.scan_document(&document(
+            "/goanywhere/login.xhtml",
+            "<html><title>GoAnywhere MFT</title><div>GoAnywhere MFT 7.4.0</div></html>",
+        ));
+        let vulnerable_ids = vulnerable
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(vulnerable_ids.contains("GoAnywhereMFT202501"));
+
+        let patched = engine.scan_document(&document(
+            "/goanywhere/login.xhtml",
+            "<html><title>GoAnywhere MFT</title><div>GoAnywhere MFT 7.4.1</div></html>",
+        ));
+        let patched_ids = patched
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!patched_ids.contains("GoAnywhereMFT202501"));
+    }
+
+    #[test]
+    fn detector_engine_emits_solr_vulnerability_only_for_affected_versions() {
+        let engine = DetectorEngine::new();
+        let vulnerable = engine.scan_document(&document(
+            "/solr/admin/info/system",
+            "{\"lucene\":{\"solr-spec-version\":\"9.7.0\"},\"mode\":\"solrcloud\"}",
+        ));
+        let vulnerable_ids = vulnerable
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(vulnerable_ids.contains("SolrVersionPlugin"));
+
+        let patched = engine.scan_document(&document(
+            "/solr/admin/info/system",
+            "{\"lucene\":{\"solr-spec-version\":\"9.8.0\"},\"mode\":\"solrcloud\"}",
+        ));
+        let patched_ids = patched
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!patched_ids.contains("SolrVersionPlugin"));
+    }
+
+    #[test]
+    fn detector_engine_emits_bundled_http_pack_findings_for_promoted_plugins() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-http-plugin-pack")
+            .expect("bundled http plugin pack manifest");
+
+        let craft = super::run_external_detector_pack(
+            &document(
+                "/admin/login",
+                "<html><title>Craft CMS</title><body>Craft CMS Control Panel</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("craft rule should execute");
+        let moodle = super::run_external_detector_pack(
+            &document(
+                "/login/index.php",
+                "<html><title>Moodle</title><body>Moodle login</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("moodle rule should execute");
+        let mirth = super::run_external_detector_pack(
+            &document(
+            "/",
+            "<html><title>NextGen Connect</title><body>Mirth Connect Administrator</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("mirth rule should execute");
+        let sap = super::run_external_detector_pack(
+            &document(
+            "/irj/portal",
+            "<html><title>SAP NetWeaver Portal</title><body>SAP Enterprise Portal</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("sap rule should execute");
+
+        let all = [craft, moodle, mirth, sap]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+
+        let plugin_ids = all
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(plugin_ids.contains("CraftCMSPlugin"));
+        assert!(plugin_ids.contains("MoodlePlugin"));
+        assert!(plugin_ids.contains("MirthPlugin"));
+        assert!(plugin_ids.contains("SAPNetWeaverPlugin"));
+        assert!(all.iter().all(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.implementation_source.as_str() == "bundled_detector_pack"
+            })
+        }));
+    }
+
+    #[test]
+    fn detector_engine_emits_bundled_version_pack_findings_for_promoted_plugins() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-version-rule-pack")
+            .expect("bundled version rule pack manifest");
+
+        let litellm = super::run_external_detector_pack(
+            &document(
+                "/",
+                "<html><title>LiteLLM</title><body>LiteLLM version 1.82.8</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("litellm version rule should execute");
+        let flowise = super::run_external_detector_pack(
+            &document(
+                "/",
+                "<html><title>Flowise</title><body>Flowise version 3.0.1</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("flowise version rule should execute");
+
+        let all = [litellm, flowise].into_iter().flatten().collect::<Vec<_>>();
+        let plugin_ids = all
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(plugin_ids.contains("LiteLLMPlugin"));
+        assert!(plugin_ids.contains("FlowiseVersionPlugin"));
+        assert!(all.iter().all(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.implementation_source.as_str() == "bundled_version_rule"
+            })
+        }));
+        assert!(all.iter().all(|finding| finding.confidence.is_some()));
+        assert!(all.iter().any(|finding| {
+            finding.evidence.contains("version 1.82.8")
+                || finding.evidence.contains("version 3.0.1")
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "LiteLLMPlugin"
+                    && metadata.cve_ids.iter().any(|cve| cve == "CVE-2026-35029")
+                    && metadata.cve_ids.iter().any(|cve| cve == "CVE-2026-35030")
+                    && metadata.kev_matched == Some(false)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "FlowiseVersionPlugin"
+                    && metadata.cve_ids.iter().any(|cve| cve == "CVE-2025-50538")
+                    && metadata.cve_ids.iter().any(|cve| cve == "CVE-2025-8943")
+                    && metadata.kev_matched == Some(false)
+            })
+        }));
+    }
+
+    #[test]
+    fn detector_engine_emits_bundled_version_pack_findings_for_best_effort_promotions() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-version-rule-pack")
+            .expect("bundled version rule pack manifest");
+
+        let appsmith = super::run_external_detector_pack(
+            &document(
+                "/",
+                "<html><title>Appsmith</title><body>Appsmith Community Edition version 1.50.9</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("appsmith version rule should execute");
+        let zimbra = super::run_external_detector_pack(
+            &document(
+                "/",
+                "<html><title>Zimbra</title><body>Zimbra Collaboration Suite 10.0.3</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("zimbra version rule should execute");
+        let sharepoint = super::run_external_detector_pack(
+            &document(
+                "/_layouts/15/start.aspx",
+                "<html><title>Microsoft SharePoint</title><body>SharePoint Server Version 16.0.10396.20017</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("sharepoint version rule should execute");
+        let n8n = super::run_external_detector_pack(
+            &document_with_headers(
+                "/rest/settings",
+                "{\"data\":{}}",
+                &[("X-N8N-Version", "1.120.3")],
+            ),
+            &manifest,
+        )
+        .expect("n8n version rule should execute");
+        let metabase = super::run_external_detector_pack(
+            &document_with_headers(
+                "/api/health",
+                "{\"status\":\"ok\",\"product\":\"metabase\"}",
+                &[("X-Metabase-Version", "v0.56.2")],
+            ),
+            &manifest,
+        )
+        .expect("metabase version rule should execute");
+        let appsmith_header = super::run_external_detector_pack(
+            &document_with_headers(
+                "/api/v1/health",
+                "{\"appsmith\":\"ok\"}",
+                &[("X-Appsmith-Version", "1.50.9")],
+            ),
+            &manifest,
+        )
+        .expect("appsmith version rule should execute");
+        let bitbucket = super::run_external_detector_pack(
+            &document(
+                "/users/sign_in",
+                "<html><title>Bitbucket</title><body>Bitbucket version 8.3.0</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("bitbucket version rule should execute");
+        let confluence = super::run_external_detector_pack(
+            &document(
+                "/login.action",
+                "<html><title>Confluence</title><body>Confluence version 8.5.1</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("confluence version rule should execute");
+        let gitlab = super::run_external_detector_pack(
+            &document(
+                "/users/sign_in",
+                "<html><title>GitLab</title><body>GitLab version 16.7.1</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("gitlab version rule should execute");
+        let jira = super::run_external_detector_pack(
+            &document(
+                "/login.jsp",
+                "<html><title>Jira</title><body>Jira version 8.16.0</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("jira version rule should execute");
+        let teamcity = super::run_external_detector_pack(
+            &document(
+                "/login.html",
+                "<html><title>TeamCity</title><body>TeamCity version 2023.11.3</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("teamcity version rule should execute");
+        let wazuh = super::run_external_detector_pack(
+            &document(
+                "/app/login",
+                "<html><title>Wazuh</title><body>Wazuh version 4.8.2</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("wazuh version rule should execute");
+        let zoneminder = super::run_external_detector_pack(
+            &document(
+                "/zm/index.php",
+                "<html><title>ZoneMinder</title><body>ZoneMinder version 1.36.32</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("zoneminder version rule should execute");
+
+        let all = [
+            appsmith,
+            zimbra,
+            sharepoint,
+            n8n,
+            metabase,
+            appsmith_header,
+            bitbucket,
+            confluence,
+            gitlab,
+            jira,
+            teamcity,
+            wazuh,
+            zoneminder,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let plugin_ids = all
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(plugin_ids.contains("AppsmithPlugin"));
+        assert!(plugin_ids.contains("BitbucketPlugin"));
+        assert!(plugin_ids.contains("ConfluenceVersionIssue"));
+        assert!(plugin_ids.contains("GitlabPlugin"));
+        assert!(plugin_ids.contains("JiraPlugin"));
+        assert!(plugin_ids.contains("N8nPlugin"));
+        assert!(plugin_ids.contains("MetabaseHttpPlugin"));
+        assert!(plugin_ids.contains("ZimbraPlugin"));
+        assert!(plugin_ids.contains("SharePointPlugin"));
+        assert!(plugin_ids.contains("TeamCityPlugin"));
+        assert!(plugin_ids.contains("WazuhPlugin"));
+        assert!(plugin_ids.contains("ZoneMinderPlugin"));
+        assert!(all.iter().all(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.implementation_source.as_str() == "bundled_version_rule"
+            })
+        }));
+        assert!(all.iter().all(|finding| finding.confidence.is_some()));
+        assert!(
+            all.iter()
+                .all(|finding| !finding.matched_signals.is_empty())
+        );
+        assert!(all.iter().all(|finding| !finding.review_labels.is_empty()));
+        assert!(all.iter().any(|finding| {
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "version")
+        }));
+        assert!(all.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "version_rule")
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.evidence.contains("version 1.50.9")
+                || finding.evidence.contains("version 1.120.3")
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "AppsmithPlugin"
+                    && metadata.cve_ids == vec!["CVE-2024-55965".to_string()]
+                    && metadata.kev_matched == Some(false)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "N8nPlugin"
+                    && metadata.cve_ids.iter().any(|cve| cve == "CVE-2025-68613")
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "BitbucketPlugin"
+                    && metadata.cve_ids == vec!["CVE-2022-36804".to_string()]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "ConfluenceVersionIssue"
+                    && metadata.cve_ids == vec!["CVE-2023-22515".to_string()]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "GitlabPlugin"
+                    && metadata.cve_ids == vec!["CVE-2023-7028".to_string()]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "JiraPlugin"
+                    && metadata.cve_ids == vec!["CVE-2021-26086".to_string()]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "SharePointPlugin"
+                    && metadata.cve_ids
+                        == vec![
+                            "CVE-2025-49704".to_string(),
+                            "CVE-2025-49706".to_string(),
+                            "CVE-2025-53770".to_string(),
+                            "CVE-2025-53771".to_string(),
+                        ]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "TeamCityPlugin"
+                    && metadata.cve_ids == vec!["CVE-2024-27198".to_string()]
+                    && metadata.kev_matched == Some(true)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "WazuhPlugin"
+                    && metadata.cve_ids == vec!["CVE-2025-24016".to_string()]
+                    && metadata.kev_matched == Some(false)
+            })
+        }));
+        assert!(all.iter().any(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.plugin_id == "ZoneMinderPlugin"
+                    && metadata.cve_ids
+                        == vec![
+                            "CVE-2023-25825".to_string(),
+                            "CVE-2023-26032".to_string(),
+                            "CVE-2023-26034".to_string(),
+                            "CVE-2023-26035".to_string(),
+                            "CVE-2023-26036".to_string(),
+                            "CVE-2023-26037".to_string(),
+                            "CVE-2023-26039".to_string(),
+                        ]
+                    && metadata.kev_matched == Some(false)
+            })
+        }));
+    }
+
+    #[test]
+    fn detector_engine_version_rules_skip_patched_versions_for_curated_cve_ranges() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-version-rule-pack")
+            .expect("bundled version rule pack manifest");
+
+        let appsmith = super::run_external_detector_pack(
+            &document(
+                "/",
+                "<html><title>Appsmith</title><body>Appsmith Community Edition version 1.51.0</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("appsmith version rule should execute");
+        let gitlab = super::run_external_detector_pack(
+            &document(
+                "/users/sign_in",
+                "<html><title>GitLab</title><body>GitLab version 16.7.2</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("gitlab version rule should execute");
+        let teamcity = super::run_external_detector_pack(
+            &document(
+                "/login.html",
+                "<html><title>TeamCity</title><body>TeamCity version 2023.11.4</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("teamcity version rule should execute");
+
+        let plugin_ids = [appsmith, gitlab, teamcity]
+            .into_iter()
+            .flatten()
+            .filter_map(|finding| finding.plugin_metadata)
+            .map(|metadata| metadata.plugin_id)
+            .collect::<HashSet<_>>();
+
+        assert!(!plugin_ids.contains("AppsmithPlugin"));
+        assert!(!plugin_ids.contains("GitlabPlugin"));
+        assert!(!plugin_ids.contains("TeamCityPlugin"));
+    }
+
+    #[test]
+    fn detector_engine_emits_bundled_http_pack_findings_for_best_effort_promotions() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-http-plugin-pack")
+            .expect("bundled http rule pack manifest");
+
+        let browserless = super::run_external_detector_pack(
+            &document(
+                "/json/version",
+                "<html><title>Browserless</title><body>browserless chrome service</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("browserless rule should execute");
+        let node_red = super::run_external_detector_pack(
+            &document(
+                "/red/settings",
+                "<html><title>Node-RED</title><body>Welcome to Node-RED</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("node-red rule should execute");
+        let traversal = super::run_external_detector_pack(
+            &document("/../../../../etc/passwd", "root:x:0:0:root:/root:/bin/sh"),
+            &manifest,
+        )
+        .expect("traversal rule should execute");
+
+        let all = [browserless, node_red, traversal]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let plugin_ids = all
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(plugin_ids.contains("BrowserlessPlugin"));
+        assert!(plugin_ids.contains("NodeREDPlugin"));
+        assert!(plugin_ids.contains("TraversalHttpPlugin"));
+        assert!(all.iter().all(|finding| {
+            finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                metadata.implementation_source.as_str() == "bundled_detector_pack"
+            })
+        }));
+        assert!(all.iter().all(|finding| finding.confidence.is_some()));
+        assert!(
+            all.iter()
+                .any(|finding| finding.evidence.contains("/json/version"))
+        );
+        assert!(
+            all.iter()
+                .all(|finding| !finding.matched_signals.is_empty())
+        );
+        assert!(all.iter().all(|finding| !finding.review_labels.is_empty()));
+        assert!(all.iter().any(|finding| {
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "path_hint")
+        }));
+        assert!(all.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "http_rule")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_best_effort_http_rules_respect_negative_path_filters() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-http-plugin-pack")
+            .expect("bundled http rule pack manifest");
+
+        let findings = super::run_external_detector_pack(
+            &document(
+                "/docs/browserless/overview",
+                "<html><title>Browserless Docs</title><body>browserless version 2.30.1</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("browserless docs rule should execute");
+
+        let plugin_ids = findings
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!plugin_ids.contains("BrowserlessPlugin"));
+    }
+
+    #[test]
+    fn detector_engine_best_effort_version_rules_respect_negative_path_filters() {
+        let config = crate::config::AppConfig::default();
+        let manifest = config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-version-rule-pack")
+            .expect("bundled version rule pack manifest");
+
+        let findings = super::run_external_detector_pack(
+            &document_with_headers(
+                "/docs/appsmith/getting-started",
+                "<html><title>Appsmith docs</title><body>Appsmith version 1.51.0</body></html>",
+                &[("X-Appsmith-Version", "1.51.0")],
+            ),
+            &manifest,
+        )
+        .expect("appsmith docs rule should execute");
+
+        let plugin_ids = findings
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!plugin_ids.contains("AppsmithPlugin"));
+    }
+
+    #[test]
+    fn detector_engine_tags_additional_phase_one_public_surfaces() {
+        let engine = DetectorEngine::new();
+        let cases = vec![
+            (
+                document(
+                    "/login",
+                    "<html><script>window.grafanaBootData = {\"user\":null};</script></html>",
+                ),
+                "GrafanaOpenPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>MLflow</title><div>MLflow Tracking</div></html>",
+                ),
+                "MLflowPlugin",
+            ),
+            (
+                document(
+                    "/api/health",
+                    "{\"status\":\"READY\",\"prefect\":\"server\"}",
+                ),
+                "PrefectPlugin",
+            ),
+            (
+                document(
+                    "/api/version",
+                    "{\"version\":\"2.9.0\",\"ray\":\"dashboard\"}",
+                ),
+                "RayDashboardPlugin",
+            ),
+            (
+                document("/", "<html><title>SonarQube</title></html>"),
+                "SonarQubePlugin",
+            ),
+            (
+                document("/", "<html><title>NSQ Admin</title></html>"),
+                "NsqAdminPlugin",
+            ),
+            (
+                document_with_headers(
+                    "/v2/",
+                    "{}",
+                    &[("Docker-Distribution-Api-Version", "registry/2.0")],
+                ),
+                "DockerRegistryHttpPlugin",
+            ),
+            (document("/v1/status/leader", "\"10.0.0.1:8300\""), "Consul"),
+            (
+                document("/", "{\"couchdb\":\"Welcome\",\"version\":\"3.4.2\"}"),
+                "CouchDbOpenPlugin",
+            ),
+        ];
+
+        for (document, expected_plugin_id) in cases {
+            let findings = engine.scan_document(&document);
+            let plugin_ids = findings
+                .iter()
+                .filter_map(|finding| finding.plugin_metadata.as_ref())
+                .map(|metadata| metadata.plugin_id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(
+                plugin_ids.contains(expected_plugin_id),
+                "expected {expected_plugin_id} for {} but saw {:?}",
+                document.path,
+                plugin_ids
+            );
+        }
+    }
+
+    #[test]
+    fn detector_engine_tags_vector_data_and_admin_public_surfaces() {
+        let engine = DetectorEngine::new();
+        let cases = vec![
+            (
+                document("/", "<html><title>Attu</title><div>Milvus GUI</div></html>"),
+                "AttuPlugin",
+            ),
+            (
+                document("/", "<html><title>cAdvisor - /</title></html>"),
+                "CAdvisorPlugin",
+            ),
+            (
+                document(
+                    "/_admin/v1/health",
+                    "<html>Cockroach Labs DB Console</html>",
+                ),
+                "CockroachDBPlugin",
+            ),
+            (
+                document("/", "<html><title>Dagster UI</title></html>"),
+                "DagsterPlugin",
+            ),
+            (
+                document("/", "<html><title>Apache Flink Dashboard</title></html>"),
+                "FlinkPlugin",
+            ),
+            (
+                document_with_headers(
+                    "/version",
+                    "{\"pkgVersion\":\"1.8.0\"}",
+                    &[("X-MeiliSearch-Instance-Uid", "test-instance")],
+                ),
+                "MeilisearchPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "{\"neo4j_version\":\"5.24.0\",\"bolt_routing\":\"/db/{databaseName}/cluster\"}",
+                ),
+                "Neo4jOpenPlugin",
+            ),
+            (
+                document_with_headers(
+                    "/",
+                    "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"Example API\"},\"postgrest\":\"12.0\"}",
+                    &[("Server", "postgrest/12.0")],
+                ),
+                "PostgRESTPlugin",
+            ),
+            (
+                document(
+                    "/collections",
+                    "{\"title\":\"qdrant - vector search engine\",\"version\":\"1.13.0\"}",
+                ),
+                "QdrantPlugin",
+            ),
+            (
+                document("/", "<html><title>QuestDB Web Console</title></html>"),
+                "QuestDBPlugin",
+            ),
+            (
+                document(
+                    "/v1/meta",
+                    "{\"hostname\":\"vector-1\",\"version\":\"1.26.0\",\"weaviate\":\"ok\"}",
+                ),
+                "WeaviatePlugin",
+            ),
+            (
+                document_with_headers(
+                    "/v1/models",
+                    "{\"data\":[],\"version\":\"2.15.0\",\"localai\":\"ok\"}",
+                    &[("Server", "LocalAI/2.15.0")],
+                ),
+                "LocalAIPlugin",
+            ),
+        ];
+
+        for (document, expected_plugin_id) in cases {
+            let findings = engine.scan_document(&document);
+            let plugin_ids = findings
+                .iter()
+                .filter_map(|finding| finding.plugin_metadata.as_ref())
+                .map(|metadata| metadata.plugin_id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(
+                plugin_ids.contains(expected_plugin_id),
+                "expected {expected_plugin_id} for {} but saw {:?}",
+                document.path,
+                plugin_ids
+            );
+        }
+    }
+
+    #[test]
+    fn detector_engine_tags_more_phase_one_admin_surfaces() {
+        let engine = DetectorEngine::new();
+        let cases = vec![
+            (
+                document(
+                    "/api/v1/heartbeat",
+                    "{\"nanosecond heartbeat\":true,\"chroma\":\"ok\"}",
+                ),
+                "ChromaPlugin",
+            ),
+            (
+                document("/", "<html><title>Apache Druid Console</title></html>"),
+                "DruidPlugin",
+            ),
+            (
+                document("/h2-console", "<html><title>H2 Console</title></html>"),
+                "H2ConsolePlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>Harbor</title><div>harbor-ui</div></html>",
+                ),
+                "HarborPlugin",
+            ),
+            (
+                document(
+                    "/dfshealth.html",
+                    "<html><title>NameNode</title><div>Hadoop DFS Health</div></html>",
+                ),
+                "HdfsOpenPlugin",
+            ),
+            (
+                document("/lab", "<html><title>JupyterLab</title></html>"),
+                "JupyterPlugin",
+            ),
+            (
+                document("/indexes", "{\"marqo\":\"ok\",\"results\":[]}"),
+                "MarqoPlugin",
+            ),
+            (
+                document(
+                    "/api/v1/health",
+                    "{\"milvus\":\"ok\",\"status\":\"healthy\"}",
+                ),
+                "MilvusPlugin",
+            ),
+            (
+                document("/", "<html><title>Mongo Express</title></html>"),
+                "MongoExpressPlugin",
+            ),
+            (
+                document(
+                    "/varz",
+                    "{\"server_id\":\"abc\",\"max_connections\":65536,\"version\":\"2.10.0\"}",
+                ),
+                "NATSPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>Nomad</title><div>HashiCorp Nomad</div></html>",
+                ),
+                "NomadPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>noVNC</title><button>Connect</button></html>",
+                ),
+                "NoVncPlugin",
+            ),
+            (
+                document("/", "<html><title>redis-commander</title></html>"),
+                "RedisCommanderPlugin",
+            ),
+            (
+                document(
+                    "/grid/console",
+                    "<html><title>Grid Console</title><div>Selenium Grid</div></html>",
+                ),
+                "SeleniumGridPlugin",
+            ),
+            (
+                document(
+                    "/cluster",
+                    "<html><title>YARN ResourceManager</title><div>Hadoop</div></html>",
+                ),
+                "YarnOpenPlugin",
+            ),
+        ];
+
+        for (document, expected_plugin_id) in cases {
+            let findings = engine.scan_document(&document);
+            let plugin_ids = findings
+                .iter()
+                .filter_map(|finding| finding.plugin_metadata.as_ref())
+                .map(|metadata| metadata.plugin_id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(
+                plugin_ids.contains(expected_plugin_id),
+                "expected {expected_plugin_id} for {} but saw {:?}",
+                document.path,
+                plugin_ids
+            );
+        }
+    }
+
+    #[test]
+    fn detector_engine_tags_framework_debug_and_misc_http_surfaces() {
+        let engine = DetectorEngine::new();
+        let cases = vec![
+            (
+                document(
+                    "/json/version",
+                    "{\"Browser\":\"Chrome/123.0.0.0\",\"webSocketDebuggerUrl\":\"ws://127.0.0.1/devtools/browser/abc\"}",
+                ),
+                "ChromeDevToolsPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html>You’re seeing this error because you have <code>DEBUG = True</code> in your Django settings file. Django version 5.1 Exception Type:</html>",
+                ),
+                "DjangoPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "{\"name\":\"node-a\",\"cluster_name\":\"elastic\",\"version\":{\"number\":\"8.15.0\",\"lucene_version\":\"9.11.1\"},\"tagline\":\"You Know, for Search\"}",
+                ),
+                "ElasticSearchOpenPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>Werkzeug Debugger</title><div>The debugger caught an exception in your WSGI application</div></html>",
+                ),
+                "FlaskPlugin",
+            ),
+            (
+                document(
+                    "/goanywhere/login.xhtml",
+                    "<html><title>GoAnywhere MFT</title><div>GoAnywhere MFT Administration</div></html>",
+                ),
+                "GoAnywhereMFT",
+            ),
+            (
+                document_with_headers(
+                    "/",
+                    "<html>Unauthorized</html>",
+                    &[("WWW-Authenticate", "NTLM")],
+                ),
+                "HttpNTLM",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><title>Nginx UI</title><div>nginx-ui</div></html>",
+                ),
+                "NginxUIPlugin",
+            ),
+            (
+                document(
+                    "/solr/admin/info/system",
+                    "{\"lucene\":{\"solr-spec-version\":\"9.7.0\"},\"mode\":\"solrcloud\"}",
+                ),
+                "SolrOpenPlugin",
+            ),
+            (
+                document(
+                    "/actuator/env",
+                    "{\"activeProfiles\":[\"prod\"],\"propertySources\":[{\"name\":\"systemProperties\"}]}",
+                ),
+                "SpringBootActuatorPlugin",
+            ),
+            (
+                document(
+                    "/.vscode/sftp.json",
+                    "{\"host\":\"example.test\",\"username\":\"deploy\",\"protocol\":\"sftp\"}",
+                ),
+                "VsCodeSFTPPlugin",
+            ),
+            (
+                document_with_headers(
+                    "/",
+                    "<html>Index</html>",
+                    &[("DAV", "1,2"), ("Allow", "OPTIONS, GET, PROPFIND, MKCOL")],
+                ),
+                "WebDAVPlugin",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><div>Yii Debug Toolbar</div><div>yii\\\\debug</div></html>",
+                ),
+                "YiiDebugPlugin",
+            ),
+        ];
+
+        for (document, expected_plugin_id) in cases {
+            let findings = engine.scan_document(&document);
+            let plugin_ids = findings
+                .iter()
+                .filter_map(|finding| finding.plugin_metadata.as_ref())
+                .map(|metadata| metadata.plugin_id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(
+                plugin_ids.contains(expected_plugin_id),
+                "expected {expected_plugin_id} for {} but saw {:?}",
+                document.path,
+                plugin_ids
+            );
+        }
+    }
+
+    #[test]
+    fn detector_engine_tags_more_status_and_ransom_surfaces() {
+        let engine = DetectorEngine::new();
+        let cases = vec![
+            (
+                document(
+                    "/",
+                    "<html><h1>DeadBolt</h1><p>Your files have been encrypted. Send Bitcoin to unlock.</p></html>",
+                ),
+                "DeadMon",
+            ),
+            (
+                document(
+                    "/",
+                    "<html><h1>Application Trace</h1><h2>Framework Trace</h2><h3>Full Trace</h3><div>Web Console</div></html>",
+                ),
+                "RailsPlugin",
+            ),
+            (
+                document(
+                    "/render.html",
+                    "<html><title>Splash</title><p>JavaScript rendering service with Lua scripting</p></html>",
+                ),
+                "SplashPlugin",
+            ),
+            (
+                document(
+                    "/status",
+                    "<html><title>TiDB Status</title><div>TiDB status server</div></html>",
+                ),
+                "TiDBPlugin",
+            ),
+            (
+                document(
+                    "/ApplicationStatus",
+                    "<html><title>Application Status</title><div>Vespa</div></html>",
+                ),
+                "VespaPlugin",
+            ),
+            (
+                document(
+                    "/RECORDINGS/",
+                    "<html><title>Recordings</title><div>Vicidial recordings archive</div><a href=\"agent-001.wav\">agent-001.wav</a></html>",
+                ),
+                "ViciboxPlugin",
+            ),
+        ];
+
+        for (document, expected_plugin_id) in cases {
+            let findings = engine.scan_document(&document);
+            let plugin_ids = findings
+                .iter()
+                .filter_map(|finding| finding.plugin_metadata.as_ref())
+                .map(|metadata| metadata.plugin_id.as_str())
+                .collect::<HashSet<_>>();
+            assert!(
+                plugin_ids.contains(expected_plugin_id),
+                "expected {expected_plugin_id} for {} but saw {:?}",
+                document.path,
+                plugin_ids
+            );
+        }
+    }
+
+    #[test]
+    fn compare_numeric_versions_handles_suffixes_and_segment_length() {
+        assert!(compare_numeric_versions("2.401.3", "2.426.3").is_lt());
+        assert!(compare_numeric_versions("2.426.3-lts", "2.426.3").is_eq());
+        assert!(compare_numeric_versions("2.500", "2.426.3").is_gt());
     }
 
     #[test]
@@ -2637,6 +7586,660 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].detector, "npm_access_token");
+    }
+
+    #[test]
+    fn detector_engine_broadly_finds_generic_key_and_token_shapes() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/runtime-config.json",
+            concat!(
+                "X_API_KEY=key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\n",
+                "PRIVATE_TOKEN=tok_AbCdEfGhIjKlMnOpQrStUvWxYz123456\n",
+                "SESSION_SECRET=shh_9z8y7x6w5v4u3t2s1r0qPONMLKJIHG\n",
+                "LICENSE_KEY=lic-1234-ABCDEFGHijklmnopQRSTuvwxYZ\n",
+                "AUTHORIZATION=Bearer pat_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6\n",
+                "PASSPHRASE=VaultDoorPassphrase2026!\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(detectors.contains("generic_authorization_header"));
+        assert!(detectors.contains("generic_password"));
+    }
+
+    #[test]
+    fn detector_engine_finds_broad_structured_secret_fields() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/settings/runtime.yaml",
+            concat!(
+                "integrations:\n",
+                "  upstream:\n",
+                "    serviceKey: key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\n",
+                "    privateToken: tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\n",
+                "    sessionSecret: Sup3rSess10nSecretValueAlphaBeta\n",
+                "    credentials: CredValueAbCdEfGhIjKlMnOpQrSt\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(detectors.contains("generic_credential"));
+    }
+
+    #[test]
+    fn detector_engine_avoids_generic_key_outside_secret_contexts() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/public/index.html",
+            concat!(
+                "token = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJwdWJsaWMifQ.signaturevalue123456\n",
+                "key = key_1234567890ABCDEFGHIJKLMNOPQRST\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_response_header_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/status",
+            "",
+            &[
+                ("X-Api-Key", "key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2"),
+                (
+                    "Authorization",
+                    "Bearer pat_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+                ),
+                ("X-Auth-Token", "tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654"),
+            ],
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_authorization_header"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "response_header_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_query_parameter_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&FetchedDocument {
+            path: "/download".to_string(),
+            url: "https://example.test/download?api_key=key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2&private_token=tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654&session_secret=Sup3rSess10nSecretValueAlphaBeta".to_string(),
+            status: 200,
+            content_type: Some("text/plain".to_string()),
+            headers: Vec::new(),
+            body: String::new(),
+            truncated: false,
+            coverage_source: "test-seed".to_string(),
+        });
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "query_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_header_and_query_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&FetchedDocument {
+            path: "/public".to_string(),
+            url:
+                "https://example.test/public?api_key=your_api_key_here&private_token=%24%7BTOKEN%7D"
+                    .to_string(),
+            status: 200,
+            content_type: Some("text/plain".to_string()),
+            headers: vec![
+                ("X-Api-Key".to_string(), "your_api_key_here".to_string()),
+                ("Authorization".to_string(), "Bearer ${TOKEN}".to_string()),
+            ],
+            body: String::new(),
+            truncated: false,
+            coverage_source: "test-seed".to_string(),
+        });
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_cookie_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/login",
+            "",
+            &[
+                (
+                    "Set-Cookie",
+                    "sessionid=4f8c2d1a7b9e6f0c3d5a8b1c7e9f2a4d; Path=/; HttpOnly",
+                ),
+                (
+                    "Set-Cookie",
+                    "remember_me=tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654; Path=/; Secure",
+                ),
+            ],
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_session_cookie"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "cookie_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_finds_cookie_header_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/debug",
+            "",
+            &[(
+                "Cookie",
+                "session_token=tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654; private_token=pat_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6",
+            )],
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_session_cookie"));
+        assert!(detectors.contains("generic_access_token"));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_cookie_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/public",
+            "",
+            &[
+                ("Set-Cookie", "sessionid=changeme123; Path=/"),
+                (
+                    "Cookie",
+                    "remember_me=${TOKEN}; private_token=your_api_key_here",
+                ),
+            ],
+        ));
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_html_attribute_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<html><head>",
+                "<meta name=\"api-key\" content=\"key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\">",
+                "<meta property=\"private-token\" content=\"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\">",
+                "</head><body>",
+                "<div data-session-secret=\"Sup3rSess10nSecretValueAlphaBeta\"></div>",
+                "<input type=\"hidden\" name=\"service_key\" value=\"key_AbCdEfGhIjKlMnOpQrStUvWxYz123456\">",
+                "</body></html>"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "html_attribute_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_html_attribute_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<html><head>",
+                "<meta name=\"api-key\" content=\"your_api_key_here\">",
+                "</head><body>",
+                "<div data-session-secret=\"${SESSION_SECRET}\"></div>",
+                "<input type=\"hidden\" name=\"service_key\" value=\"changeme123\">",
+                "</body></html>"
+            ),
+        ));
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_engine_finds_script_tag_bootstrap_json_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script id=\"__NEXT_DATA__\" type=\"application/json\">",
+                "{\"props\":{\"pageProps\":{\"api_key\":\"key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\",\"private_token\":\"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\",\"session_secret\":\"Sup3rSess10nSecretValueAlphaBeta\"}}}",
+                "</script>"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+    }
+
+    #[test]
+    fn detector_engine_finds_serialized_html_attribute_blob_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<div data-state='{\"api_key\":\"key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\",\"private_token\":\"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\"}'></div>",
+                "<div x-data=\"{ session_secret: 'Sup3rSess10nSecretValueAlphaBeta' }\"></div>"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "html_attribute_blob")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_finds_html_entity_encoded_attribute_blob_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            "<div data-state=\"{&quot;api_key&quot;:&quot;key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2&quot;,&quot;private_token&quot;:&quot;tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654&quot;}\"></div>",
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_inline_script_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.__ENV__ = {\n",
+                "  token: `tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654`,\n",
+                "  key: 'key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2',\n",
+                "  secret: \"Sup3rSess10nSecretValueAlphaBeta\"\n",
+                "};\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "inline_script_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_inline_script_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.__ENV__ = {\n",
+                "  token: `${TOKEN}`,\n",
+                "  key: 'your_api_key_here',\n",
+                "  secret: \"changeme123\"\n",
+                "};\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!detectors.contains("generic_access_token"));
+        assert!(!detectors.contains("generic_api_key"));
+        assert!(!detectors.contains("generic_client_secret"));
+    }
+
+    #[test]
+    fn detector_engine_finds_escaped_inline_script_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.__ENV__ = {\n",
+                "  token: `tok_\\x5aYXWVUTSRQPONMLKJIHGFEDCBA987654`,\n",
+                "  key: 'key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e\\u0032',\n",
+                "  secret: \"Sup3rSess10nSecretValueAlpha\\u0042eta\"\n",
+                "};\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_client_secret"));
+    }
+
+    #[test]
+    fn detector_engine_finds_decoded_json_parse_inline_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.runtimeConfig = JSON.parse(\"{\\\"api_key\\\":\\\"key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2\\\",\\\"private_token\\\":\\\"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\\\",\\\"session_secret\\\":\\\"Sup3rSess10nSecretValueAlphaBeta\\\"}\");\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "inline_script_decoded")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_finds_decode_uri_inline_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.__ENV__ = decodeURI('%7B%22api_key%22%3A%22key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2%22%2C%22private_token%22%3A%22tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654%22%7D');\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+    }
+
+    #[test]
+    fn detector_engine_finds_decoded_atob_inline_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.__BOOTSTRAP__ = atob(\"eyJhcGlfa2V5Ijoia2V5X0Y3czhROWIwVDF1MlYzdzRYNXk2WjdhOEI5YzBEMWUyIiwicHJpdmF0ZV90b2tlbiI6InRva19aWVhXVlVUU1JRUE9OTUxLSklIR0ZFRENCQTk4NzY1NCJ9\");\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_decoded_inline_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.runtimeConfig = JSON.parse(\"{\\\"api_key\\\":\\\"your_api_key_here\\\",\\\"private_token\\\":\\\"${TOKEN}\\\",\\\"session_secret\\\":\\\"changeme123\\\"}\");\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!detectors.contains("generic_api_key"));
+        assert!(!detectors.contains("generic_access_token"));
+        assert!(!detectors.contains("generic_client_secret"));
+    }
+
+    #[test]
+    fn detector_engine_finds_unescape_inline_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "window.runtimeConfig = unescape('%7B%22session_secret%22%3A%22Sup3rSess10nSecretValueAlphaBeta%22%2C%22api_key%22%3A%22key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2%22%7D');\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(detectors.contains("generic_api_key"));
+    }
+
+    #[test]
+    fn detector_engine_finds_inline_storage_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "localStorage.setItem('api_key', 'key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2');\n",
+                "sessionStorage.setItem(\"private_token\", \"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\");\n",
+                "document.cookie = \"sessionid=4f8c2d1a7b9e6f0c3d5a8b1c7e9f2a4d; path=/\";\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_session_cookie"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "browser_storage_secret")
+        }));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "inline_storage")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_inline_storage_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "localStorage.setItem('api_key', 'your_api_key_here');\n",
+                "sessionStorage.setItem(\"private_token\", \"${TOKEN}\");\n",
+                "document.cookie = \"sessionid=changeme123; path=/\";\n",
+                "</script>\n"
+            ),
+        ));
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_engine_finds_inline_storage_property_and_cookie_helper_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "localStorage.api_key = 'key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2';\n",
+                "sessionStorage['private_token'] = \"tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654\";\n",
+                "Cookies.set('sessionid', '4f8c2d1a7b9e6f0c3d5a8b1c7e9f2a4d');\n",
+                "</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_session_cookie"));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_inline_storage_property_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<script>\n",
+                "localStorage.api_key = 'your_api_key_here';\n",
+                "sessionStorage['private_token'] = \"${TOKEN}\";\n",
+                "Cookies.set('sessionid', 'changeme123');\n",
+                "</script>\n"
+            ),
+        ));
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn detector_engine_finds_generic_fragment_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<a href=\"https://example.test/callback#access_token=tok_ZYXWVUTSRQPONMLKJIHGFEDCBA987654&id_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdGEifQ.signaturevalue123456\">continue</a>\n",
+                "<script>window.location.hash = '#api_key=key_F7s8Q9r0T1u2V3w4X5y6Z7a8B9c0D1e2&session_secret=Sup3rSess10nSecretValueAlphaBeta';</script>\n"
+            ),
+        ));
+
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        assert!(detectors.contains("generic_access_token"));
+        assert!(detectors.contains("generic_api_key"));
+        assert!(detectors.contains("generic_client_secret"));
+        assert!(findings.iter().any(|finding| {
+            finding
+                .review_labels
+                .iter()
+                .any(|label| label == "fragment_secret")
+        }));
+    }
+
+    #[test]
+    fn detector_engine_ignores_placeholder_fragment_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document(
+            "/index.html",
+            concat!(
+                "<a href=\"https://example.test/callback#access_token=${TOKEN}&api_key=your_api_key_here\">continue</a>\n",
+                "<script>window.location.hash = '#session_secret=changeme123';</script>\n"
+            ),
+        ));
+
+        assert!(findings.is_empty());
     }
 
     #[test]

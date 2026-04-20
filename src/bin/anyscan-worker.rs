@@ -6,33 +6,119 @@ use std::{
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, anyhow};
 use anyscan::{
-    config::{parse_port_scan_ports, AppConfig},
+    config::{AppConfig, parse_port_scan_ports},
     core::{
-        merge_coverage_source_stat, normalize_run_scope, ApiEvent, DiscoveryProvenanceRecord,
-        ExtensionManifest, FetchTelemetry, NewFinding, PortScanRecord, PortScanSchemePolicy,
-        RunScope, RunStatus, RunSummary, ScanJobRecord, ScanRunRecord, TargetDefinition,
+        ApiEvent, DiscoveryProvenanceRecord, ExtensionManifest, FetchTelemetry, NewFinding,
+        PortScanProtocolFindingRecord, PortScanRecord, PortScanSchemePolicy, RunScope, RunStatus,
+        RunSummary, ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord, WorkerBootstrapJobClaim,
-        WorkerBootstrapJobRecord, WorkerRegistration,
+        WorkerBootstrapJobRecord, WorkerRegistration, WorkerRemoteCommandRecord,
+        WorkerRemoteUpdateStatus, merge_coverage_source_stat, normalize_run_scope,
     },
     detectors::DetectorEngine,
     fetcher::{Fetcher, TargetFetchReport},
     ops::init_tracing,
-    store::AnyScanStore,
+    plugins::{PluginExecutionMode, build_plugin_metadata, lookup_plugin},
+    worker_api::AnyScanWorkerApiClient as AnyScanStore,
 };
+use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
-use serde::Serialize;
-use tokio::sync::oneshot;
-use tracing::{error, info};
+use reqwest::blocking::Client as BlockingHttpClient;
+use serde::{Deserialize, Serialize};
+use tokio::sync::{oneshot, watch};
+use tracing::{error, info, warn};
+
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_NAME_ENV_NAMES: &[&str] = &["AGENT_NAME"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_NAME_ENV_NAMES: &[&str] = &["AGENT_NAME", "ANYSCAN_WORKER_NAME"];
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_POOL_ENV_NAMES: &[&str] = &["AGENT_POOL"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_POOL_ENV_NAMES: &[&str] = &["AGENT_POOL", "ANYSCAN_WORKER_POOL"];
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_TOKEN_ENV_NAMES: &[&str] = &["AGENT_TOKEN", "AGENT_ENROLLMENT_TOKEN"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_TOKEN_ENV_NAMES: &[&str] = &[
+    "AGENT_TOKEN",
+    "AGENT_ENROLLMENT_TOKEN",
+    "ANYSCAN_WORKER_TOKEN",
+    "ANYSCAN_WORKER_ENROLLMENT_TOKEN",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_TAGS_ENV_NAMES: &[&str] = &["AGENT_TAGS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_TAGS_ENV_NAMES: &[&str] = &["AGENT_TAGS", "ANYSCAN_WORKER_TAGS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_BOOTSTRAP_SUPPORT_ENV_NAMES: &[&str] = &["AGENT_ENABLE_BOOTSTRAP"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_BOOTSTRAP_SUPPORT_ENV_NAMES: &[&str] = &[
+    "AGENT_ENABLE_BOOTSTRAP",
+    "ANYSCAN_WORKER_SUPPORTS_BOOTSTRAP",
+    "ANYSCAN_WORKER_ENABLE_BOOTSTRAP",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const WORKER_ID_ENV_NAMES: &[&str] = &["AGENT_ID"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const WORKER_ID_ENV_NAMES: &[&str] = &["AGENT_ID", "ANYSCAN_WORKER_ID"];
+#[cfg(feature = "worker-bundle-stealth")]
+const CONTROL_URL_ENV_NAMES: &[&str] = &["AGENT_MANAGEMENT_URL", "CONTROL_URL"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const CONTROL_URL_ENV_NAMES: &[&str] = &[
+    "AGENT_MANAGEMENT_URL",
+    "ANYSCAN_WORKER_MANAGEMENT_URL",
+    "CONTROL_URL",
+    "ANYSCAN_API_BASE_URL",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const REMOTE_UPDATE_ENABLED_ENV_NAMES: &[&str] = &["AGENT_REMOTE_UPDATE_ENABLED"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const REMOTE_UPDATE_ENABLED_ENV_NAMES: &[&str] = &[
+    "AGENT_REMOTE_UPDATE_ENABLED",
+    "ANYSCAN_WORKER_REMOTE_UPDATE_ENABLED",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const REMOTE_UPDATE_REQUEST_FILE_ENV_NAMES: &[&str] = &["AGENT_REMOTE_UPDATE_REQUEST_FILE"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const REMOTE_UPDATE_REQUEST_FILE_ENV_NAMES: &[&str] = &[
+    "AGENT_REMOTE_UPDATE_REQUEST_FILE",
+    "ANYSCAN_WORKER_REMOTE_UPDATE_REQUEST_FILE",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const REMOTE_UPDATE_INSTALLER_URL_ENV_NAMES: &[&str] = &["AGENT_REMOTE_UPDATE_INSTALLER_URL"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const REMOTE_UPDATE_INSTALLER_URL_ENV_NAMES: &[&str] = &[
+    "AGENT_REMOTE_UPDATE_INSTALLER_URL",
+    "ANYSCAN_WORKER_REMOTE_UPDATE_INSTALLER_URL",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const REMOTE_DEBUG_ENABLED_ENV_NAMES: &[&str] = &["AGENT_REMOTE_DEBUG_ENABLED"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const REMOTE_DEBUG_ENABLED_ENV_NAMES: &[&str] = &[
+    "AGENT_REMOTE_DEBUG_ENABLED",
+    "ANYSCAN_WORKER_REMOTE_DEBUG_ENABLED",
+];
+#[cfg(feature = "worker-bundle-stealth")]
+const REMOTE_UPDATE_STATUS_FILE_ENV_NAMES: &[&str] = &["AGENT_REMOTE_UPDATE_STATUS_FILE"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const REMOTE_UPDATE_STATUS_FILE_ENV_NAMES: &[&str] = &[
+    "AGENT_REMOTE_UPDATE_STATUS_FILE",
+    "ANYSCAN_WORKER_REMOTE_UPDATE_STATUS_FILE",
+];
 
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(long, env = "ANYSCAN_CONFIG")]
+    #[cfg_attr(feature = "worker-bundle-stealth", arg(long, env = "AGENT_CONFIG"))]
+    #[cfg_attr(
+        not(feature = "worker-bundle-stealth"),
+        arg(long, env = "ANYSCAN_CONFIG")
+    )]
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
@@ -61,12 +147,58 @@ struct WorkerRuntime {
     scanner_adapters: Vec<ExtensionManifest>,
     importers: Vec<ExtensionManifest>,
     provisioners: Vec<ExtensionManifest>,
+    remote_update_plan: Option<RemoteUpdatePlan>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteUpdatePlan {
+    request_file: PathBuf,
+    installer_url: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkerRemoteUpdateState {
+    status: Option<WorkerRemoteUpdateStatus>,
+    message: Option<String>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug)]
+struct RemoteCommandExecution {
+    exit_code: Option<i32>,
+    timed_out: bool,
+    stdout: String,
+    stderr: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash)]
 struct DiscoveredEndpoint {
     host: String,
     port: u16,
+    service_name: Option<String>,
+    transport: Option<String>,
+    tags: Vec<String>,
+    version: Option<String>,
+    reported_plugins: Vec<ReportedProtocolPluginFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct ReportedProtocolPluginFinding {
+    plugin_id: String,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    product_name: Option<String>,
+    #[serde(default)]
+    product_version: Option<String>,
+    #[serde(default)]
+    cpe: Option<String>,
+    #[serde(default)]
+    cve_ids: Vec<String>,
+    #[serde(default)]
+    kev_matched: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -115,22 +247,42 @@ struct ProvisionerInvocation<'a> {
     enrollment_token: &'a str,
 }
 
+#[derive(Debug, Clone, Default)]
+struct WorkerNetworkIdentity {
+    local_ip_addresses: Vec<String>,
+    public_ip_address: Option<String>,
+    public_ip_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WorkerPlatformIdentity {
+    operating_system: Option<String>,
+    architecture: Option<String>,
+    platform: Option<String>,
+}
+
+const PUBLIC_IP_CHECK_URLS: &[&str] = &[
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://checkip.amazonaws.com",
+];
+const PUBLIC_IP_CHECK_TIMEOUT_SECONDS: u64 = 5;
+const REMOTE_COMMAND_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(cli.config.as_deref())?;
-    init_tracing("anyscan-worker");
-
-    let store = AnyScanStore::from_config(&config)?;
-    store.initialize()?;
-    seed_bootstrap_inventory(&store, &config)?;
+    init_tracing("agentd");
 
     let detectors = DetectorEngine::from_config(&config)?;
     let worker_id = build_worker_id();
-    let worker_runtime = build_worker_runtime(&config, &worker_id)?;
 
     match cli.command.unwrap_or(Command::Daemon) {
         Command::Seed => {
+            let store = AnyScanStore::from_config_and_worker(&config, &worker_id)?;
+            store.initialize()?;
+            seed_bootstrap_inventory(&store, &config)?;
             info!("seeded bootstrap inventory");
         }
         Command::Queue {
@@ -139,23 +291,80 @@ async fn main() -> Result<()> {
             tags,
             failed_only,
         } => {
+            let store = AnyScanStore::from_config_and_worker(&config, &worker_id)?;
+            store.initialize()?;
             let scope = normalize_run_scope(Some(RunScope {
                 target_ids,
                 tags,
+                worker_pool: None,
                 failed_only,
             }));
             queue_run_with_event(&store, &requested_by, scope.as_ref())?;
             info!(requested_by = %requested_by, has_scope = scope.is_some(), "queued run");
         }
         Command::Once => {
+            let store = AnyScanStore::from_config_and_worker(&config, &worker_id)?;
+            store.initialize()?;
+            let worker_runtime = build_worker_runtime(&config, &worker_id)?;
+            seed_bootstrap_inventory(&store, &config)?;
             run_once(&config, &worker_id, store, detectors, &worker_runtime).await?;
         }
         Command::Daemon => {
-            run_daemon(config, worker_id, store, detectors, worker_runtime).await?;
+            run_daemon_with_retry(config, worker_id, detectors).await?;
         }
     }
 
     Ok(())
+}
+
+async fn run_daemon_with_retry(
+    config: AppConfig,
+    worker_id: String,
+    detectors: DetectorEngine,
+) -> Result<()> {
+    const DAEMON_STARTUP_RETRY_SECONDS: u64 = 5;
+
+    loop {
+        let attempt = (|| -> Result<(AnyScanStore, WorkerRuntime)> {
+            let store = AnyScanStore::from_config_and_worker(&config, &worker_id)?;
+            store.initialize()?;
+            let worker_runtime = build_worker_runtime(&config, &worker_id)?;
+            seed_bootstrap_inventory(&store, &config)?;
+            Ok((store, worker_runtime))
+        })();
+
+        match attempt {
+            Ok((store, worker_runtime)) => match run_daemon(
+                config.clone(),
+                worker_id.clone(),
+                store,
+                detectors.clone(),
+                worker_runtime,
+            )
+            .await
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    error!(
+                        worker_id = %worker_id,
+                        %error,
+                        retry_seconds = DAEMON_STARTUP_RETRY_SECONDS,
+                        "agent daemon exited; retrying"
+                    );
+                }
+            },
+            Err(error) => {
+                error!(
+                    worker_id = %worker_id,
+                    %error,
+                    retry_seconds = DAEMON_STARTUP_RETRY_SECONDS,
+                    "agent startup failed; retrying"
+                );
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(DAEMON_STARTUP_RETRY_SECONDS)).await;
+    }
 }
 
 async fn run_daemon(
@@ -166,21 +375,38 @@ async fn run_daemon(
     worker_runtime: WorkerRuntime,
 ) -> Result<()> {
     let worker_registration_ttl = worker_registration_ttl_seconds(&config);
-    register_worker_or_bail(
+    let worker_registration_interval =
+        worker_registration_refresh_interval(&config, worker_registration_ttl);
+    let registered_worker = register_worker_or_bail(
         &store,
         &worker_runtime.registration,
         worker_registration_ttl,
     )?;
+    let (remote_update_tx, remote_update_rx) =
+        watch::channel(registered_worker.remote_update_requested_at);
     let (registration_shutdown_tx, registration_shutdown_rx) = oneshot::channel();
     let registration_handle = tokio::spawn(worker_registration_heartbeat(
         store.clone(),
         worker_runtime.registration.clone(),
         worker_registration_ttl,
+        worker_registration_interval,
+        remote_update_tx,
         registration_shutdown_rx,
     ));
+    let mut last_handled_remote_update_at = None;
 
     let daemon_result = async {
         loop {
+            if let Some(requested_at) = remote_update_rx.borrow().clone() {
+                if last_handled_remote_update_at != Some(requested_at)
+                    && maybe_schedule_remote_update(&store, &worker_runtime, requested_at)?
+                {
+                    last_handled_remote_update_at = Some(requested_at);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            }
+
             if let Err(error) = seed_bootstrap_inventory(&store, &config) {
                 error!(%error, "failed to seed bootstrap inventory");
             }
@@ -188,19 +414,22 @@ async fn run_daemon(
                 error!(%error, "failed to queue due schedules");
             }
 
-            if let Some(run) =
-                store.claim_next_runnable_run(&worker_id, config.storage.redis_run_lease_seconds)?
-            {
-                info!(run_id = run.id, worker_id = %worker_id, "claimed runnable run");
-                process_run(&config, &worker_id, &store, detectors.clone(), run.id).await?;
-                continue;
+            if worker_runtime.registration.supports_remote_debug_commands {
+                if let Some(command) = store.claim_next_pending_remote_command()? {
+                    info!(
+                        remote_command_id = command.id,
+                        worker_id = %worker_id,
+                        "claimed remote debug command"
+                    );
+                    process_remote_command(&store, &worker_id, command).await?;
+                    continue;
+                }
             }
 
             if worker_runtime.registration.supports_bootstrap {
-                if let Some(bootstrap_job) = store.claim_next_pending_bootstrap_job(
-                    &worker_id,
-                    config.storage.redis_run_lease_seconds,
-                )? {
+                if let Some(bootstrap_job) = store
+                    .claim_next_pending_bootstrap_job(config.storage.redis_run_lease_seconds)?
+                {
                     info!(
                         bootstrap_job_id = bootstrap_job.job.id,
                         worker_id = %worker_id,
@@ -221,10 +450,9 @@ async fn run_daemon(
             }
 
             if worker_runtime.registration.supports_port_scans {
-                if let Some(port_scan) = store.claim_next_pending_port_scan(
-                    &worker_id,
-                    config.storage.redis_run_lease_seconds,
-                )? {
+                if let Some(port_scan) =
+                    store.claim_next_pending_port_scan(config.storage.redis_run_lease_seconds)?
+                {
                     info!(
                         port_scan_id = port_scan.id,
                         worker_id = %worker_id,
@@ -237,10 +465,36 @@ async fn run_daemon(
                 }
             }
 
-            if let Some(run) = store.next_assistable_run(&worker_id)? {
+            if let Some(run) = store.next_assistable_run()? {
                 info!(run_id = run.id, worker_id = %worker_id, "assisting active run");
                 assist_run(&config, &worker_id, &store, detectors.clone(), run.id).await?;
                 continue;
+            }
+
+            if let Some(run) =
+                store.claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
+            {
+                info!(run_id = run.id, worker_id = %worker_id, "claimed runnable run");
+                process_run(&config, &worker_id, &store, detectors.clone(), run.id).await?;
+                continue;
+            }
+
+            match store.maybe_run_archive_pass() {
+                Ok(Some(job)) => {
+                    info!(
+                        archive_job_id = job.id,
+                        pressure_mode = ?job.pressure_mode,
+                        hot_retention_days = job.hot_retention_days,
+                        archived_record_count = job.archived_record_count,
+                        archived_object_count = job.archived_object_count,
+                        "completed archive pass"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    error!(%error, "failed to run archive pass");
+                }
             }
 
             let effective_config = load_effective_runtime_config(&config, &store)?;
@@ -265,54 +519,84 @@ async fn run_once(
     worker_runtime: &WorkerRuntime,
 ) -> Result<()> {
     let worker_registration_ttl = worker_registration_ttl_seconds(config);
-    register_worker_or_bail(
+    let worker_registration_interval =
+        worker_registration_refresh_interval(config, worker_registration_ttl);
+    let registered_worker = register_worker_or_bail(
         &store,
         &worker_runtime.registration,
         worker_registration_ttl,
     )?;
+    let (remote_update_tx, remote_update_rx) =
+        watch::channel(registered_worker.remote_update_requested_at);
     let (registration_shutdown_tx, registration_shutdown_rx) = oneshot::channel();
     let registration_handle = tokio::spawn(worker_registration_heartbeat(
         store.clone(),
         worker_runtime.registration.clone(),
         worker_registration_ttl,
+        worker_registration_interval,
+        remote_update_tx,
         registration_shutdown_rx,
     ));
 
     let once_result = async {
+        if let Some(requested_at) = remote_update_rx.borrow().clone() {
+            if maybe_schedule_remote_update(&store, worker_runtime, requested_at)? {
+                return Ok(());
+            }
+        }
+
+        if worker_runtime.registration.supports_remote_debug_commands {
+            if let Some(command) = store.claim_next_pending_remote_command()? {
+                process_remote_command(&store, worker_id, command).await?;
+                return Ok(());
+            }
+        }
+
         queue_due_schedules_with_events(&store, 10)?;
-        let run_id = if let Some(run) =
-            store.claim_next_runnable_run(worker_id, config.storage.redis_run_lease_seconds)?
-        {
-            run.id
-        } else {
+        let run_id = {
             if worker_runtime.registration.supports_bootstrap {
-                if let Some(bootstrap_job) = store.claim_next_pending_bootstrap_job(
-                    worker_id,
-                    config.storage.redis_run_lease_seconds,
-                )? {
+                if let Some(bootstrap_job) = store
+                    .claim_next_pending_bootstrap_job(config.storage.redis_run_lease_seconds)?
+                {
                     process_bootstrap_job(config, worker_runtime, worker_id, &store, bootstrap_job)
                         .await?;
                     return Ok(());
                 }
             }
             if worker_runtime.registration.supports_port_scans {
-                if let Some(port_scan) = store.claim_next_pending_port_scan(
-                    worker_id,
-                    config.storage.redis_run_lease_seconds,
-                )? {
+                if let Some(port_scan) =
+                    store.claim_next_pending_port_scan(config.storage.redis_run_lease_seconds)?
+                {
                     process_port_scan(config, worker_runtime, worker_id, &store, port_scan).await?;
                     return Ok(());
                 }
             }
-            if let Some(run) = store.next_assistable_run(worker_id)? {
+            if let Some(run) = store.next_assistable_run()? {
                 assist_run(config, worker_id, &store, detectors, run.id).await?;
                 return Ok(());
             }
-            queue_run_with_event(&store, "worker-once", None)?;
-            store
-                .claim_next_runnable_run(worker_id, config.storage.redis_run_lease_seconds)?
-                .map(|run| run.id)
-                .ok_or_else(|| anyhow!("queued run could not be claimed by {worker_id}"))?
+            if let Some(run) =
+                store.claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
+            {
+                run.id
+            } else {
+                if let Some(job) = store.maybe_run_archive_pass()? {
+                    info!(
+                        archive_job_id = job.id,
+                        pressure_mode = ?job.pressure_mode,
+                        hot_retention_days = job.hot_retention_days,
+                        archived_record_count = job.archived_record_count,
+                        archived_object_count = job.archived_object_count,
+                        "completed archive pass"
+                    );
+                    return Ok(());
+                }
+                queue_run_with_event(&store, "worker-once", None)?;
+                store
+                    .claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
+                    .map(|run| run.id)
+                    .ok_or_else(|| anyhow!("queued run could not be claimed by {worker_id}"))?
+            }
         };
 
         process_run(config, worker_id, &store, detectors, run_id).await
@@ -379,7 +663,7 @@ async fn process_run(
             Some(notes.join(" | "))
         };
         let Some(completed_run) =
-            store.mark_run_finished_if_owned(run_id, worker_id, notes_text.as_deref())?
+            store.mark_run_finished_if_owned(run_id, notes_text.as_deref())?
         else {
             if let Some(existing_run) = store.get_run(run_id)? {
                 if matches!(
@@ -460,6 +744,11 @@ async fn process_claimed_jobs(
     run_id: i64,
 ) -> Result<Vec<String>> {
     let effective_config = load_effective_runtime_config(config, store)?;
+    let allow_active_authorized = store
+        .get_run(run_id)?
+        .map(|run| run.active_authorized_plugins.is_enabled())
+        .unwrap_or(false)
+        || effective_config.scan.enable_all_plugins_for_testing;
     let fetcher = Arc::new(Fetcher::new(&effective_config)?);
     let worker_concurrency = effective_config.scan.concurrency.max(1);
     let job_claim_lease_seconds = config.storage.redis_run_lease_seconds;
@@ -479,6 +768,7 @@ async fn process_claimed_jobs(
                     run_id,
                     worker_id,
                     job_claim_lease_seconds,
+                    allow_active_authorized,
                 )
                 .await
             }
@@ -504,10 +794,11 @@ async fn claim_jobs_for_run(
     run_id: i64,
     worker_id: String,
     lease_seconds: u64,
+    allow_active_authorized: bool,
 ) -> Result<Vec<String>> {
     let mut notes = Vec::new();
     loop {
-        let Some(job) = store.claim_next_pending_job(run_id, &worker_id, lease_seconds)? else {
+        let Some(job) = store.claim_next_pending_job(run_id, lease_seconds)? else {
             break;
         };
         info!(run_id, job_id = job.id, worker_id = %worker_id, "claimed pending job");
@@ -518,6 +809,7 @@ async fn claim_jobs_for_run(
             worker_id.clone(),
             lease_seconds,
             job,
+            allow_active_authorized,
         )
         .await
         {
@@ -534,6 +826,7 @@ async fn process_job(
     worker_id: String,
     lease_seconds: u64,
     job: ScanJobRecord,
+    allow_active_authorized: bool,
 ) -> Result<()> {
     let (claim_shutdown_tx, claim_shutdown_rx) = oneshot::channel();
     let heartbeat_store = store.as_ref().clone();
@@ -590,6 +883,12 @@ async fn process_job(
                         detectors.scan_document(document)
                     };
                     for finding in matches {
+                        if finding.plugin_metadata.as_ref().is_some_and(|metadata| {
+                            metadata.execution_mode == PluginExecutionMode::ActiveAuthorized
+                        }) && !allow_active_authorized
+                        {
+                            continue;
+                        }
                         if let Some(record) = store.record_finding_if_new(&NewFinding {
                             run_id: job.run_id,
                             target_id: job.target.id,
@@ -599,6 +898,10 @@ async fn process_job(
                             redacted_value: finding.redacted_value,
                             evidence: finding.evidence,
                             fingerprint: finding.fingerprint,
+                            confidence: finding.confidence,
+                            matched_signals: finding.matched_signals,
+                            review_labels: finding.review_labels,
+                            plugin_metadata: finding.plugin_metadata,
                         })? {
                             findings_count += 1;
                             merge_coverage_source_stat(
@@ -638,7 +941,6 @@ async fn process_job(
 
         let completion_applied = store.mark_job_finished_if_owned(
             job.id,
-            &worker_id,
             findings_count,
             &telemetry,
             terminal_error.as_deref(),
@@ -713,6 +1015,11 @@ async fn process_port_scan(
 
         let execution =
             execute_scanner_adapter(&port_scan, &worker_runtime.scanner_adapters).await?;
+        let protocol_findings = derive_protocol_plugin_findings_with_active_mode(
+            &execution.discovered_endpoints,
+            port_scan.active_authorized_plugins.is_enabled()
+                || config.scan.enable_all_plugins_for_testing,
+        );
         let mut bootstrap_notes = create_bootstrap_candidates_for_port_scan(
             config,
             store,
@@ -728,6 +1035,7 @@ async fn process_port_scan(
         )?;
         let follow_on = queue_follow_on_run_for_targets(
             store,
+            &port_scan,
             port_scan
                 .requested_by
                 .as_deref()
@@ -736,13 +1044,30 @@ async fn process_port_scan(
         )?;
 
         let mut notes = execution.notes;
+        if !protocol_findings.is_empty() {
+            notes.push(format!(
+                "identified {} authless protocol plugin match(es)",
+                protocol_findings.len()
+            ));
+        }
         notes.append(&mut bootstrap_notes);
         notes.extend(imported.notes);
+        if !port_scan.follow_on_run_policy.is_enabled() && !imported.target_ids.is_empty() {
+            notes.push("follow-on scanning of imported targets is disabled".to_string());
+        }
         if let Some(queued_run) = &follow_on {
+            let pool_note = queued_run
+                .run
+                .scope
+                .as_ref()
+                .and_then(|scope| scope.worker_pool.as_deref())
+                .map(|pool| format!(" in pool {pool}"))
+                .unwrap_or_default();
             notes.push(format!(
-                "queued follow-on run {} for {} target(s)",
+                "queued follow-on run {} for {} target(s){}",
                 queued_run.run.id,
-                imported.target_ids.len()
+                imported.target_ids.len(),
+                pool_note
             ));
         }
         let notes = notes
@@ -754,9 +1079,9 @@ async fn process_port_scan(
         let completed = store
             .complete_port_scan_if_owned(
                 port_scan.id,
-                worker_id,
                 execution.discovered_endpoints.len() as u64,
                 imported.target_ids.len() as u64,
+                &protocol_findings,
                 follow_on.as_ref().map(|item| item.run.id),
                 notes_text.as_deref(),
             )?
@@ -783,9 +1108,7 @@ async fn process_port_scan(
 
     if let Err(error) = &outcome {
         let error_message = error.to_string();
-        if let Some(failed) =
-            store.fail_port_scan_if_owned(port_scan.id, worker_id, Some(&error_message))?
-        {
+        if let Some(failed) = store.fail_port_scan_if_owned(port_scan.id, Some(&error_message))? {
             store.append_event(
                 None,
                 &ApiEvent::PortScanFailed {
@@ -837,7 +1160,7 @@ async fn process_bootstrap_job(
 
     let outcome: Result<()> = async {
         let started = store
-            .mark_bootstrap_job_started_if_owned(bootstrap_job.job.id, worker_id)?
+            .mark_bootstrap_job_started_if_owned(bootstrap_job.job.id)?
             .ok_or_else(|| {
                 anyhow!(
                     "bootstrap job {} is no longer claimed by worker {} during start",
@@ -861,11 +1184,7 @@ async fn process_bootstrap_job(
         let notes_text = join_notes(&notes);
 
         let completed = store
-            .complete_bootstrap_job_if_owned(
-                bootstrap_job.job.id,
-                worker_id,
-                notes_text.as_deref(),
-            )?
+            .complete_bootstrap_job_if_owned(bootstrap_job.job.id, notes_text.as_deref())?
             .ok_or_else(|| {
                 anyhow!(
                     "bootstrap job {} is no longer claimed by worker {} during completion",
@@ -893,11 +1212,9 @@ async fn process_bootstrap_job(
             .collect::<Vec<_>>();
         notes.push(error_message.clone());
         let notes_text = join_notes(&notes);
-        if let Some(failed) = store.fail_bootstrap_job_if_owned(
-            bootstrap_job.job.id,
-            worker_id,
-            notes_text.as_deref(),
-        )? {
+        if let Some(failed) =
+            store.fail_bootstrap_job_if_owned(bootstrap_job.job.id, notes_text.as_deref())?
+        {
             store.append_event(
                 None,
                 &ApiEvent::WorkerBootstrapJobFailed {
@@ -924,6 +1241,137 @@ async fn process_bootstrap_job(
             "bootstrap job claim heartbeat also failed: {heartbeat_error}"
         )),
     }
+}
+
+async fn process_remote_command(
+    store: &AnyScanStore,
+    worker_id: &str,
+    command: WorkerRemoteCommandRecord,
+) -> Result<()> {
+    store.append_event(
+        None,
+        &ApiEvent::WorkerRemoteCommandStarted {
+            command: command.clone(),
+        },
+    )?;
+
+    let command_id = command.id;
+    let shell_command = command.command.clone();
+    let timeout_seconds = command.timeout_seconds;
+    let execution = tokio::task::spawn_blocking(move || {
+        run_remote_debug_command(shell_command, timeout_seconds)
+    })
+    .await
+    .map_err(|error| anyhow!("remote command task failed: {error}"))?;
+
+    let completed = match execution {
+        Ok(execution) => store.complete_remote_command(
+            command_id,
+            execution.exit_code,
+            execution.timed_out,
+            Some(&execution.stdout),
+            Some(&execution.stderr),
+            if execution.timed_out {
+                Some("remote command timed out")
+            } else {
+                None
+            },
+        )?,
+        Err(error) => store.complete_remote_command(
+            command_id,
+            None,
+            false,
+            None,
+            None,
+            Some(&error.to_string()),
+        )?,
+    };
+
+    if let Some(completed) = completed {
+        match completed.status {
+            anyscan::core::WorkerRemoteCommandStatus::Completed => {
+                store.append_event(
+                    None,
+                    &ApiEvent::WorkerRemoteCommandCompleted { command: completed },
+                )?;
+            }
+            anyscan::core::WorkerRemoteCommandStatus::Failed => {
+                store.append_event(
+                    None,
+                    &ApiEvent::WorkerRemoteCommandFailed {
+                        error: completed
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "remote command failed".to_string()),
+                        command: completed,
+                    },
+                )?;
+            }
+            anyscan::core::WorkerRemoteCommandStatus::Queued
+            | anyscan::core::WorkerRemoteCommandStatus::Running => {}
+        }
+    } else {
+        return Err(anyhow!(
+            "remote command {} is no longer owned by worker {}",
+            command_id,
+            worker_id
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_remote_debug_command(
+    command: String,
+    timeout_seconds: u64,
+) -> Result<RemoteCommandExecution> {
+    let mut child = ProcessCommand::new("/bin/sh")
+        .arg("-lc")
+        .arg(&command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn remote command `{command}`"))?;
+
+    let started_at = Instant::now();
+    let timed_out = loop {
+        if child
+            .try_wait()
+            .context("failed while waiting for remote command")?
+            .is_some()
+        {
+            break false;
+        }
+        if started_at.elapsed() >= Duration::from_secs(timeout_seconds.max(1)) {
+            let _ = child.kill();
+            break true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+
+    let output = child
+        .wait_with_output()
+        .context("failed to collect remote command output")?;
+
+    Ok(RemoteCommandExecution {
+        exit_code: output.status.code(),
+        timed_out,
+        stdout: truncate_output(String::from_utf8_lossy(&output.stdout).as_ref()),
+        stderr: truncate_output(String::from_utf8_lossy(&output.stderr).as_ref()),
+    })
+}
+
+fn truncate_output(value: &str) -> String {
+    let bytes = value.as_bytes();
+    if bytes.len() <= REMOTE_COMMAND_MAX_OUTPUT_BYTES {
+        return value.to_string();
+    }
+    let truncated = &bytes[..REMOTE_COMMAND_MAX_OUTPUT_BYTES];
+    format!(
+        "{}\n[truncated at {} bytes]",
+        String::from_utf8_lossy(truncated),
+        REMOTE_COMMAND_MAX_OUTPUT_BYTES
+    )
 }
 
 async fn execute_bootstrap_provisioner(
@@ -1308,7 +1756,7 @@ fn build_scanner_output_path(adapter_name: &str, port_scan_id: i64) -> PathBuf {
         })
         .collect::<String>();
     env::temp_dir().join(format!(
-        "anyscan-{}-{}-{}.out",
+        "agent-{}-{}-{}.out",
         safe_name, port_scan_id, timestamp
     ))
 }
@@ -1379,6 +1827,40 @@ fn parse_json_endpoint_lines(
         let endpoint = DiscoveredEndpoint {
             host: host.to_string(),
             port,
+            service_name: value
+                .get("service")
+                .and_then(|value| value.as_str())
+                .or_else(|| value.get("service_name").and_then(|value| value.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            transport: value
+                .get("protocol")
+                .and_then(|value| value.as_str())
+                .or_else(|| value.get("transport").and_then(|value| value.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            tags: value
+                .get("tags")
+                .and_then(|value| value.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            version: value
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            reported_plugins: parse_reported_protocol_plugins(&value)?,
         };
         if seen.insert((endpoint.host.clone(), endpoint.port)) {
             discovered.push(endpoint);
@@ -1405,6 +1887,11 @@ fn parse_endpoint_token(
         return Ok(Some(DiscoveredEndpoint {
             host: address.ip().to_string(),
             port: address.port(),
+            service_name: None,
+            transport: None,
+            tags: Vec::new(),
+            version: None,
+            reported_plugins: Vec::new(),
         }));
     }
 
@@ -1418,6 +1905,11 @@ fn parse_endpoint_token(
         return Ok(Some(DiscoveredEndpoint {
             host: ip.to_string(),
             port,
+            service_name: None,
+            transport: None,
+            tags: Vec::new(),
+            version: None,
+            reported_plugins: Vec::new(),
         }));
     }
 
@@ -1431,6 +1923,11 @@ fn parse_endpoint_token(
         return Ok(Some(DiscoveredEndpoint {
             host: host.trim().to_string(),
             port,
+            service_name: None,
+            transport: None,
+            tags: Vec::new(),
+            version: None,
+            reported_plugins: Vec::new(),
         }));
     }
 
@@ -1443,7 +1940,929 @@ fn parse_endpoint_token(
     Ok(Some(DiscoveredEndpoint {
         host: token.to_string(),
         port,
+        service_name: None,
+        transport: None,
+        tags: Vec::new(),
+        version: None,
+        reported_plugins: Vec::new(),
     }))
+}
+
+fn parse_reported_protocol_plugins(
+    value: &serde_json::Value,
+) -> Result<Vec<ReportedProtocolPluginFinding>> {
+    let mut reported = Vec::new();
+
+    if let Some(plugin_id) = value.get("plugin_id").and_then(|value| value.as_str()) {
+        let trimmed = plugin_id.trim();
+        if !trimmed.is_empty() {
+            reported.push(ReportedProtocolPluginFinding {
+                plugin_id: trimmed.to_string(),
+                summary: None,
+                severity: None,
+                product_name: None,
+                product_version: None,
+                cpe: None,
+                cve_ids: Vec::new(),
+                kev_matched: None,
+            });
+        }
+    }
+
+    if let Some(plugin_ids) = value.get("plugin_ids").and_then(|value| value.as_array()) {
+        for plugin_id in plugin_ids.iter().filter_map(|item| item.as_str()) {
+            let trimmed = plugin_id.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            reported.push(ReportedProtocolPluginFinding {
+                plugin_id: trimmed.to_string(),
+                summary: None,
+                severity: None,
+                product_name: None,
+                product_version: None,
+                cpe: None,
+                cve_ids: Vec::new(),
+                kev_matched: None,
+            });
+        }
+    }
+
+    if let Some(plugin_findings) = value
+        .get("plugin_findings")
+        .and_then(|value| value.as_array())
+    {
+        for finding in plugin_findings {
+            let record: ReportedProtocolPluginFinding = serde_json::from_value(finding.clone())
+                .with_context(|| format!("invalid scanner adapter plugin_finding: {finding}"))?;
+            if !record.plugin_id.trim().is_empty() {
+                reported.push(record);
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for item in reported {
+        let key = format!(
+            "{}:{}:{}",
+            item.plugin_id.to_ascii_lowercase(),
+            item.summary.as_deref().unwrap_or_default(),
+            item.product_version.as_deref().unwrap_or_default()
+        );
+        if seen.insert(key) {
+            deduped.push(item);
+        }
+    }
+    Ok(deduped)
+}
+
+fn derive_protocol_plugin_findings_with_active_mode(
+    discovered_endpoints: &[DiscoveredEndpoint],
+    allow_active_authorized: bool,
+) -> Vec<PortScanProtocolFindingRecord> {
+    let mut findings = Vec::new();
+    let mut seen = HashSet::new();
+
+    for endpoint in discovered_endpoints {
+        for reported in &endpoint.reported_plugins {
+            let plugin_id = reported.plugin_id.trim();
+            let Some(entry) = lookup_plugin(plugin_id) else {
+                continue;
+            };
+            if entry.execution_mode == PluginExecutionMode::ActiveAuthorized
+                && !allow_active_authorized
+            {
+                continue;
+            }
+            let cve_ids = reported
+                .cve_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            let Some(plugin_metadata) = build_plugin_metadata(
+                plugin_id,
+                reported
+                    .product_name
+                    .as_deref()
+                    .or(endpoint.service_name.as_deref()),
+                reported
+                    .product_version
+                    .as_deref()
+                    .or(endpoint.version.as_deref()),
+                reported.cpe.as_deref(),
+                &cve_ids,
+                reported.kev_matched,
+                endpoint.transport.as_deref(),
+                Some(endpoint.port),
+            ) else {
+                continue;
+            };
+            let severity = reported
+                .severity
+                .as_deref()
+                .and_then(|value| value.trim().to_ascii_lowercase().parse::<Severity>().ok())
+                .or_else(|| entry.default_severity.parse::<Severity>().ok())
+                .unwrap_or(Severity::Medium);
+            let summary = reported.summary.clone().unwrap_or_else(|| {
+                format!(
+                    "{} was reported by scanner adapter metadata.",
+                    entry.display_name
+                )
+            });
+            let dedupe_key = format!("{}:{}:{}", endpoint.host, endpoint.port, plugin_id);
+            if seen.insert(dedupe_key) {
+                findings.push(PortScanProtocolFindingRecord {
+                    host: endpoint.host.clone(),
+                    port: endpoint.port,
+                    service_name: endpoint.service_name.clone(),
+                    transport: endpoint.transport.clone(),
+                    severity,
+                    summary,
+                    plugin_metadata,
+                });
+            }
+        }
+
+        let Some((plugin_id, product_name, summary)) =
+            protocol_plugin_mapping_for_endpoint(endpoint)
+        else {
+            continue;
+        };
+        let Some(plugin_metadata) = build_plugin_metadata(
+            plugin_id,
+            Some(product_name),
+            endpoint.version.as_deref(),
+            None,
+            &[],
+            None,
+            endpoint.transport.as_deref(),
+            Some(endpoint.port),
+        ) else {
+            continue;
+        };
+        let severity = lookup_plugin(plugin_id)
+            .and_then(|entry| entry.default_severity.parse::<Severity>().ok())
+            .unwrap_or(Severity::Medium);
+        let dedupe_key = format!("{}:{}:{}", endpoint.host, endpoint.port, plugin_id);
+        if !seen.insert(dedupe_key) {
+            continue;
+        }
+        findings.push(PortScanProtocolFindingRecord {
+            host: endpoint.host.clone(),
+            port: endpoint.port,
+            service_name: endpoint.service_name.clone(),
+            transport: endpoint.transport.clone(),
+            severity,
+            summary: summary.to_string(),
+            plugin_metadata,
+        });
+    }
+
+    findings.sort_by(|left, right| {
+        left.host
+            .cmp(&right.host)
+            .then(left.port.cmp(&right.port))
+            .then(
+                left.plugin_metadata
+                    .plugin_id
+                    .cmp(&right.plugin_metadata.plugin_id),
+            )
+    });
+    findings
+}
+
+fn protocol_plugin_mapping_for_endpoint(
+    endpoint: &DiscoveredEndpoint,
+) -> Option<(&'static str, &'static str, &'static str)> {
+    let service = endpoint
+        .service_name
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let transport = endpoint
+        .transport
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let tags = endpoint
+        .tags
+        .iter()
+        .map(|tag| tag.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["ssh"], &[22])
+        && endpoint_version_matches_openssh_regresshion(endpoint.version.as_deref())
+    {
+        return Some((
+            "SshRegresshionPlugin",
+            "OpenSSH",
+            "OpenSSH version markers matched a regreSSHion-style vulnerable release during a port scan.",
+        ));
+    }
+
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["redis"], &[6379]) {
+        return Some((
+            "RedisOpenPlugin",
+            "Redis",
+            "Redis service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["arangodb", "arango"],
+        &[8529],
+    ) {
+        return Some((
+            "ArangoDBOpenPlugin",
+            "ArangoDB",
+            "ArangoDB service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["ajp", "apache jserv protocol"],
+        &[8009],
+    ) {
+        return Some((
+            "AjpPlugin",
+            "Apache JServ Protocol",
+            "AJP service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["mongo", "mongodb"],
+        &[27017],
+    ) && endpoint_has_tag(
+        &tags,
+        &["mongo-bleed", "mongobleed", "memory-leak", "memory_leak"],
+    ) {
+        return Some((
+            "MongoBleedPlugin",
+            "MongoDB",
+            "MongoDB service appears vulnerable to MongoBleed-style unauthenticated memory leakage during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["mongo", "mongodb"],
+        &[27017],
+    ) {
+        return Some((
+            "MongoOpenPlugin",
+            "MongoDB",
+            "MongoDB service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["typesense"],
+        &[8108],
+    ) && endpoint_has_tag(
+        &tags,
+        &[
+            "default-api-key",
+            "default_api_key",
+            "default-credentials",
+            "default_credentials",
+            "unauthenticated",
+            "no-auth",
+            "no_auth",
+        ],
+    ) {
+        return Some((
+            "TypesensePlugin",
+            "Typesense",
+            "Typesense API was identified with default API key or unauthenticated access during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["openedge", "progress openedge"],
+        &[20931, 30931, 2092],
+    ) {
+        return Some((
+            "OpenEdgePlugin",
+            "OpenEdge",
+            "OpenEdge service markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["firebird", "firebirdsql"],
+        &[3050],
+    ) {
+        return Some((
+            "FirebirdPlugin",
+            "Firebird",
+            "Firebird service markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["freeswitch"],
+        &[8021, 5060, 5080],
+    ) && (endpoint.port == 8021
+        || endpoint_has_tag(
+            &tags,
+            &[
+                "default-password",
+                "default_password",
+                "event-socket",
+                "event_socket",
+            ],
+        ))
+    {
+        return Some((
+            "FreeSWITCHOpenPlugin",
+            "FreeSWITCH",
+            "FreeSWITCH event socket markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(
+        &service,
+        &transport,
+        &tags,
+        &[
+            "jdwp",
+            "java-debug-wire-protocol",
+            "java debug wire protocol",
+        ],
+    ) || ([5005u16, 8000, 8001, 8787].contains(&endpoint.port)
+        && endpoint_has_tag(&tags, &["jdwp", "java-debug-wire-protocol", "java_debug"]))
+    {
+        return Some((
+            "JdwpPlugin",
+            "JDWP",
+            "Java Debug Wire Protocol markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["mysql", "mariadb"],
+        &[3306],
+    ) {
+        return Some((
+            "MysqlOpenPlugin",
+            "MySQL",
+            "MySQL-compatible service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["postgres", "postgresql"],
+        &[5432],
+    ) {
+        return Some((
+            "PostgreSQLOpenPlugin",
+            "PostgreSQL",
+            "PostgreSQL service was identified during a port scan; active/default-credential checks remain disabled.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["clickhouse"],
+        &[8123],
+    ) {
+        return Some((
+            "ClickHousePlugin",
+            "ClickHouse",
+            "ClickHouse service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["crate", "cratedb"],
+        &[4200],
+    ) {
+        return Some((
+            "CrateDBPlugin",
+            "CrateDB",
+            "CrateDB service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["memcached"],
+        &[11211],
+    ) {
+        return Some((
+            "MemcachedOpenPlugin",
+            "Memcached",
+            "Memcached service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["docker", "docker-api", "docker daemon"],
+        &[2375],
+    ) {
+        return Some((
+            "DockerAPIPlugin",
+            "Docker API",
+            "Docker API service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["epmd", "erlang port mapper"],
+        &[4369],
+    ) {
+        return Some((
+            "EpmdPlugin",
+            "Erlang Port Mapper Daemon",
+            "EPMD service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["dns"])
+        && endpoint_has_tag(
+            &tags,
+            &[
+                "axfr-allowed",
+                "axfr_allowed",
+                "zone-transfer",
+                "zone_transfer",
+            ],
+        )
+    {
+        return Some((
+            "DNSPlugin",
+            "DNS",
+            "DNS server was identified with zone transfer allowed during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(
+        &service,
+        &transport,
+        &tags,
+        &["dotnet-remoting", ".net-remoting", "dotnet remoting"],
+    ) {
+        return Some((
+            "DotnetRemotingPlugin",
+            ".NET Remoting",
+            ".NET Remoting TCP service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["mqtt", "mosquitto"],
+        &[1883, 8883],
+    ) {
+        return Some((
+            "MqttPlugin",
+            "MQTT",
+            "MQTT broker service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["influxdb", "influx"],
+        &[8086],
+    ) {
+        return Some((
+            "InfluxDBPlugin",
+            "InfluxDB",
+            "InfluxDB service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["php-fpm", "phpfpm", "fastcgi"],
+        &[9000],
+    ) {
+        return Some((
+            "PhpFpmPlugin",
+            "PHP-FPM",
+            "PHP-FPM / FastCGI service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["ldap", "ldaps"],
+        &[389, 636],
+    ) && endpoint_has_tag(
+        &tags,
+        &["anonymous-bind", "anonymous_bind", "ldap-anonymous-bind"],
+    ) {
+        return Some((
+            "LDAPPlugin",
+            "LDAP",
+            "LDAP service was identified during a port scan; anonymous-bind enumeration remains disabled in phase 1.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["h2", "h2tcp", "h2-tcp"]) {
+        return Some((
+            "H2TcpPlugin",
+            "H2 TCP Server",
+            "H2 TCP server was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["kafka"], &[9092]) {
+        return Some((
+            "KafkaOpenPlugin",
+            "Apache Kafka",
+            "Kafka service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["zookeeper", "zk"],
+        &[2181],
+    ) {
+        return Some((
+            "ZookeeperOpenPlugin",
+            "Apache ZooKeeper",
+            "ZooKeeper service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["nfs"], &[2049])
+        && endpoint_has_tag(&tags, &["export-enum", "export_enum", "nfs-export-enum"])
+    {
+        return Some((
+            "NFSOpenPlugin",
+            "NFS",
+            "NFS service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["etcd"],
+        &[2379, 2380],
+    ) {
+        return Some((
+            "EtcdOpenPlugin",
+            "etcd",
+            "etcd service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["modbus"], &[502]) {
+        return Some((
+            "ModbusPlugin",
+            "Modbus",
+            "Modbus service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["generic-dvr", "genericdvr"])
+        && endpoint_has_tag(&tags, &["vulnerable-family", "vulnerable_family"])
+    {
+        return Some((
+            "GenericDvrPlugin",
+            "Generic DVR",
+            "Generic DVR vulnerable-family markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["hisilicon-dvr", "hisilicon"])
+        && endpoint_has_tag(&tags, &["vulnerable-family", "vulnerable_family"])
+    {
+        return Some((
+            "HiSiliconDVR",
+            "HiSilicon DVR",
+            "HiSilicon DVR vulnerable-family markers were identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["rdp", "ms-wbt-server"],
+        &[3389],
+    ) && endpoint_has_tag(&tags, &["no-nla", "nla-disabled", "nla_disabled"])
+    {
+        return Some((
+            "RdpPlugin",
+            "RDP",
+            "RDP service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(
+        &service,
+        &transport,
+        &tags,
+        &["proxy", "http-proxy", "socks"],
+    ) && endpoint_has_tag(&tags, &["proxy-open", "open-proxy", "open_proxy"])
+    {
+        return Some((
+            "ProxyOpenPlugin",
+            "Open Proxy",
+            "Proxy service accepted open proxy behavior during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["opcua", "opc ua"],
+        &[4840],
+    ) {
+        return Some((
+            "OPCUAPlugin",
+            "OPC UA",
+            "OPC UA service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint.port >= 5900
+        && endpoint.port <= 5905
+        && (service.is_empty()
+            || service.contains("vnc")
+            || service.contains("rfb")
+            || tags
+                .iter()
+                .any(|tag| tag.contains("vnc") || tag.contains("rfb")))
+        && endpoint_has_tag(&tags, &["no-auth", "no_auth", "unauthenticated"])
+    {
+        return Some((
+            "VNCPlugin",
+            "VNC",
+            "VNC service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["rethinkdb"],
+        &[28015],
+    ) && endpoint_has_tag(
+        &tags,
+        &[
+            "admin-console-open",
+            "admin_console_open",
+            "unauthenticated",
+        ],
+    ) {
+        return Some((
+            "RethinkDBPlugin",
+            "RethinkDB",
+            "RethinkDB service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["riak"],
+        &[8087, 8098],
+    ) {
+        return Some((
+            "RiakPlugin",
+            "Riak",
+            "Riak service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["rmi", "java-rmi"],
+        &[1099],
+    ) {
+        return Some((
+            "RmiPlugin",
+            "Java RMI",
+            "Java RMI registry was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["rsync"], &[873]) {
+        return Some((
+            "RsyncOpenPlugin",
+            "rsync",
+            "rsync daemon service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["s7comm", "siemens-s7"],
+        &[102],
+    ) {
+        return Some((
+            "S7commPlugin",
+            "Siemens S7",
+            "Siemens S7 service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["smb", "microsoft-ds", "netbios-ssn"],
+        &[445, 139],
+    ) {
+        return Some((
+            "SmbPlugin",
+            "SMB",
+            "SMB file sharing service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["ssh"], &[22]) {
+        return Some((
+            "SSHOpenPlugin",
+            "SSH",
+            "SSH service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(endpoint, &service, &transport, &tags, &["telnet"], &[23])
+        && endpoint_has_tag(
+            &tags,
+            &[
+                "auth-bypass",
+                "auth_bypass",
+                "gnu-inetutils",
+                "gnu_inetutils",
+            ],
+        )
+    {
+        return Some((
+            "TelnetAuthBypassPlugin",
+            "Telnet",
+            "Telnet service markers suggested a GNU Inetutils-style authentication bypass during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["presto", "trino"]) {
+        return Some((
+            "PrestoPlugin",
+            "Presto/Trino",
+            "Presto/Trino service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["neo4j-bolt", "bolt"]) {
+        return Some((
+            "Neo4jBoltPlugin",
+            "Neo4j Bolt",
+            "Neo4j Bolt service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_alias(&service, &transport, &tags, &["t3", "weblogic"]) {
+        return Some((
+            "T3Plugin",
+            "Oracle WebLogic T3",
+            "WebLogic T3 service was identified during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["cassandra", "cassandra-thrift"],
+        &[9160],
+    ) {
+        return Some((
+            "CassandraOpenPlugin",
+            "Apache Cassandra",
+            "Apache Cassandra Thrift service was identified without authentication during a port scan.",
+        ));
+    }
+    if endpoint_matches_service(
+        endpoint,
+        &service,
+        &transport,
+        &tags,
+        &["adb", "android-debug-bridge"],
+        &[5555],
+    ) {
+        return Some((
+            "AdbPlugin",
+            "Android Debug Bridge",
+            "Android Debug Bridge service was identified without authentication during a port scan.",
+        ));
+    }
+    None
+}
+
+fn endpoint_matches_service(
+    endpoint: &DiscoveredEndpoint,
+    service: &str,
+    transport: &str,
+    tags: &[String],
+    aliases: &[&str],
+    ports: &[u16],
+) -> bool {
+    ports.contains(&endpoint.port)
+        || aliases.iter().any(|alias| {
+            service.contains(alias)
+                || transport.contains(alias)
+                || tags.iter().any(|tag| tag.contains(alias))
+        })
+}
+
+fn endpoint_matches_alias(
+    service: &str,
+    transport: &str,
+    tags: &[String],
+    aliases: &[&str],
+) -> bool {
+    aliases.iter().any(|alias| {
+        service.contains(alias)
+            || transport.contains(alias)
+            || tags.iter().any(|tag| tag.contains(alias))
+    })
+}
+
+fn endpoint_has_tag(tags: &[String], aliases: &[&str]) -> bool {
+    aliases
+        .iter()
+        .any(|alias| tags.iter().any(|tag| tag.contains(alias)))
+}
+
+fn endpoint_version_matches_openssh_regresshion(version: Option<&str>) -> bool {
+    let Some(version) = version else {
+        return false;
+    };
+    let lowered = version.to_ascii_lowercase();
+    if !lowered.contains("openssh") {
+        return false;
+    }
+    let Some(parsed) = parse_openssh_version(version) else {
+        return false;
+    };
+    parsed >= (8, 5) && parsed < (9, 8)
+}
+
+fn parse_openssh_version(version: &str) -> Option<(u16, u16)> {
+    let marker = version.to_ascii_lowercase().find("openssh")?;
+    let tail = &version[marker..];
+    let digits = tail
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+        .collect::<String>();
+    let mut parts = digits.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 fn single_requested_port(requested_ports: &str) -> Result<Option<u16>> {
@@ -1686,16 +3105,18 @@ fn format_target_base_url(host: &str, port: u16, scheme: &str) -> String {
 
 fn queue_follow_on_run_for_targets(
     store: &AnyScanStore,
+    port_scan: &PortScanRecord,
     requested_by: &str,
     target_ids: &[i64],
 ) -> Result<Option<QueuedFollowOnRun>> {
-    if target_ids.is_empty() {
+    if target_ids.is_empty() || !port_scan.follow_on_run_policy.is_enabled() {
         return Ok(None);
     }
 
     let scope = normalize_run_scope(Some(RunScope {
         target_ids: target_ids.to_vec(),
         tags: Vec::new(),
+        worker_pool: port_scan.follow_on_run_policy.worker_pool.clone(),
         failed_only: false,
     }));
     let run = queue_run_with_event(store, requested_by, scope.as_ref())?;
@@ -1725,7 +3146,7 @@ fn truncate_note(value: &str, max_len: usize) -> String {
 
 async fn port_scan_claim_heartbeat(
     store: AnyScanStore,
-    worker_id: String,
+    _worker_id: String,
     port_scan_id: i64,
     lease_seconds: u64,
     mut shutdown: oneshot::Receiver<()>,
@@ -1735,7 +3156,7 @@ async fn port_scan_claim_heartbeat(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(interval) => {
-                store.renew_port_scan_claim(port_scan_id, &worker_id, lease_seconds)?;
+                store.renew_port_scan_claim(port_scan_id, lease_seconds)?;
             }
         }
     }
@@ -1743,7 +3164,7 @@ async fn port_scan_claim_heartbeat(
 
 async fn bootstrap_job_claim_heartbeat(
     store: AnyScanStore,
-    worker_id: String,
+    _worker_id: String,
     bootstrap_job_id: i64,
     lease_seconds: u64,
     mut shutdown: oneshot::Receiver<()>,
@@ -1753,7 +3174,7 @@ async fn bootstrap_job_claim_heartbeat(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(interval) => {
-                store.renew_bootstrap_job_claim(bootstrap_job_id, &worker_id, lease_seconds)?;
+                store.renew_bootstrap_job_claim(bootstrap_job_id, lease_seconds)?;
             }
         }
     }
@@ -1761,7 +3182,7 @@ async fn bootstrap_job_claim_heartbeat(
 
 async fn job_claim_heartbeat(
     store: AnyScanStore,
-    worker_id: String,
+    _worker_id: String,
     job_id: i64,
     lease_seconds: u64,
     mut shutdown: oneshot::Receiver<()>,
@@ -1771,7 +3192,7 @@ async fn job_claim_heartbeat(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(interval) => {
-                store.renew_job_claim(job_id, &worker_id, lease_seconds)?;
+                store.renew_job_claim(job_id, lease_seconds)?;
             }
         }
     }
@@ -1779,7 +3200,7 @@ async fn job_claim_heartbeat(
 
 async fn run_claim_heartbeat(
     store: AnyScanStore,
-    worker_id: String,
+    _worker_id: String,
     run_id: i64,
     lease_seconds: u64,
     mut shutdown: oneshot::Receiver<()>,
@@ -1789,7 +3210,7 @@ async fn run_claim_heartbeat(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(interval) => {
-                store.renew_run_claim(run_id, &worker_id, lease_seconds)?;
+                store.renew_run_claim(run_id, lease_seconds)?;
             }
         }
     }
@@ -1853,11 +3274,12 @@ fn register_worker_or_bail(
     store: &AnyScanStore,
     registration: &WorkerRegistration,
     ttl_seconds: u64,
-) -> Result<()> {
-    store
-        .register_worker(registration, ttl_seconds)
+) -> Result<anyscan::core::WorkerRecord> {
+    let registration = refresh_dynamic_worker_registration(registration);
+    let worker = store
+        .register_worker(&registration, ttl_seconds)
         .with_context(|| format!("failed to register worker {}", registration.worker_id))?;
-    Ok(())
+    Ok(worker)
 }
 
 fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRuntime> {
@@ -1877,29 +3299,35 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
         .filter(|manifest| manifest.is_provisioner())
         .cloned()
         .collect::<Vec<_>>();
-    let display_name = env::var("ANYSCAN_WORKER_NAME")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            env::var("HOSTNAME")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        });
-    let worker_pool = resolve_optional_env("ANYSCAN_WORKER_POOL");
-    let enrollment_token = resolve_optional_env("ANYSCAN_WORKER_TOKEN")
-        .or_else(|| resolve_optional_env("ANYSCAN_WORKER_ENROLLMENT_TOKEN"));
+    let display_name = resolve_optional_env_aliases(WORKER_NAME_ENV_NAMES).or_else(|| {
+        env::var("HOSTNAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    let worker_pool = resolve_optional_env_aliases(WORKER_POOL_ENV_NAMES);
+    let enrollment_token = resolve_optional_env_aliases(WORKER_TOKEN_ENV_NAMES);
     let tags = resolve_worker_tags();
     let supports_bootstrap = resolve_worker_bootstrap_support() && !provisioners.is_empty();
+    let supports_remote_debug_commands =
+        resolve_bool_env_aliases(REMOTE_DEBUG_ENABLED_ENV_NAMES).unwrap_or(false);
+    let remote_update_plan = resolve_remote_update_plan();
+    let network_identity = detect_worker_network_identity();
+    let platform_identity = detect_worker_platform_identity();
+    let remote_update_state = read_remote_update_state();
     let registration = WorkerRegistration {
         worker_id: worker_id.to_string(),
         display_name,
         worker_pool,
         tags,
+        operating_system: platform_identity.operating_system,
+        architecture: platform_identity.architecture,
+        platform: platform_identity.platform,
         supports_runs: true,
         supports_port_scans: !scanner_adapters.is_empty(),
         supports_bootstrap,
+        supports_remote_updates: remote_update_plan.is_some(),
+        supports_remote_debug_commands,
         scanner_adapters: scanner_adapters
             .iter()
             .map(|adapter| adapter.name.clone())
@@ -1908,6 +3336,12 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
             .iter()
             .map(|provisioner| provisioner.name.clone())
             .collect(),
+        local_ip_addresses: network_identity.local_ip_addresses,
+        public_ip_address: network_identity.public_ip_address,
+        public_ip_checked_at: network_identity.public_ip_checked_at,
+        remote_update_status: remote_update_state.status,
+        remote_update_status_message: remote_update_state.message,
+        remote_update_status_updated_at: remote_update_state.updated_at,
         enrollment_token,
     };
 
@@ -1916,12 +3350,162 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
         scanner_adapters,
         importers,
         provisioners,
+        remote_update_plan,
     })
+}
+
+fn detect_worker_network_identity() -> WorkerNetworkIdentity {
+    let local_ip_addresses = match detect_local_ip_addresses() {
+        Ok(ip_addresses) => ip_addresses,
+        Err(error) => {
+            warn!(%error, "failed to collect worker local IP addresses");
+            Vec::new()
+        }
+    };
+
+    let (public_ip_address, public_ip_checked_at) = match detect_public_ip_address() {
+        Ok(Some(public_ip)) => (Some(public_ip), Some(chrono::Utc::now())),
+        Ok(None) => (None, None),
+        Err(error) => {
+            warn!(%error, "failed to collect worker public IP address");
+            (None, None)
+        }
+    };
+
+    WorkerNetworkIdentity {
+        local_ip_addresses,
+        public_ip_address,
+        public_ip_checked_at,
+    }
+}
+
+fn detect_worker_platform_identity() -> WorkerPlatformIdentity {
+    let operating_system = normalize_platform_operating_system(std::env::consts::OS);
+    let architecture = normalize_platform_architecture(std::env::consts::ARCH);
+    let platform = match (&operating_system, &architecture) {
+        (Some(os), Some(arch)) => Some(format!("{os}-{arch}")),
+        _ => None,
+    };
+    WorkerPlatformIdentity {
+        operating_system,
+        architecture,
+        platform,
+    }
+}
+
+fn normalize_platform_operating_system(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        match normalized.as_str() {
+            "macos" => "darwin",
+            other => other,
+        }
+        .to_string(),
+    )
+}
+
+fn normalize_platform_architecture(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    Some(
+        match normalized.as_str() {
+            "amd64" => "x86_64",
+            "x64" => "x86_64",
+            "arm64" => "aarch64",
+            "armv7l" | "armv7" => "armv7",
+            "armv6l" | "armv6" => "armv6",
+            other => other,
+        }
+        .to_string(),
+    )
+}
+
+fn detect_local_ip_addresses() -> Result<Vec<String>> {
+    let output = ProcessCommand::new("ip")
+        .args(["-o", "addr", "show", "up", "scope", "global"])
+        .output()
+        .context("failed to execute `ip -o addr show up scope global`")?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "`ip -o addr show up scope global` exited with status {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout).context("`ip` output was not valid UTF-8")?;
+    Ok(parse_ip_addr_show_output(&stdout))
+}
+
+fn parse_ip_addr_show_output(output: &str) -> Vec<String> {
+    let mut addresses = Vec::new();
+    for line in output.lines() {
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            if token != "inet" && token != "inet6" {
+                continue;
+            }
+            let Some(value) = tokens.next() else {
+                continue;
+            };
+            let ip_text = value.split('/').next().unwrap_or("").trim();
+            let Ok(ip_addr) = ip_text.parse::<IpAddr>() else {
+                continue;
+            };
+            if ip_addr.is_loopback() {
+                continue;
+            }
+            let normalized = ip_addr.to_string();
+            if !addresses.contains(&normalized) {
+                addresses.push(normalized);
+            }
+        }
+    }
+    addresses
+}
+
+fn detect_public_ip_address() -> Result<Option<String>> {
+    let client = BlockingHttpClient::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(PUBLIC_IP_CHECK_TIMEOUT_SECONDS))
+        .build()
+        .context("failed to build worker public IP client")?;
+
+    for url in PUBLIC_IP_CHECK_URLS {
+        let response = match client.get(*url).send() {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(url = %url, %error, "failed to query public IP endpoint");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            warn!(
+                url = %url,
+                status = response.status().as_u16(),
+                "public IP endpoint returned non-success status"
+            );
+            continue;
+        }
+        let body = response.text().unwrap_or_default();
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(ip_addr) = trimmed.parse::<IpAddr>() {
+            return Ok(Some(ip_addr.to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
 fn resolve_worker_tags() -> Vec<String> {
     let mut tags: Vec<String> = Vec::new();
-    if let Ok(raw_tags) = env::var("ANYSCAN_WORKER_TAGS") {
+    if let Some(raw_tags) = resolve_optional_env_aliases(WORKER_TAGS_ENV_NAMES) {
         for tag in raw_tags.split(',') {
             let trimmed = tag.trim();
             if trimmed.is_empty() {
@@ -1938,6 +3522,74 @@ fn resolve_worker_tags() -> Vec<String> {
     tags
 }
 
+fn resolve_remote_update_plan() -> Option<RemoteUpdatePlan> {
+    if !resolve_bool_env_aliases(REMOTE_UPDATE_ENABLED_ENV_NAMES).unwrap_or(false) {
+        return None;
+    }
+
+    let installer_url = resolve_optional_env_aliases(REMOTE_UPDATE_INSTALLER_URL_ENV_NAMES)
+        .or_else(resolve_management_installer_url)?;
+    let request_file = resolve_optional_env_aliases(REMOTE_UPDATE_REQUEST_FILE_ENV_NAMES)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/agentd/remote-update.request"));
+    Some(RemoteUpdatePlan {
+        request_file,
+        installer_url,
+    })
+}
+
+fn resolve_management_installer_url() -> Option<String> {
+    let management_url = resolve_optional_env_aliases(CONTROL_URL_ENV_NAMES)?;
+    let trimmed = management_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let encoded = url::form_urlencoded::byte_serialize(trimmed.as_bytes()).collect::<String>();
+    Some(format!(
+        "{trimmed}/api/agent/install.sh?rebuild=false&base_url={encoded}"
+    ))
+}
+
+fn read_remote_update_state() -> WorkerRemoteUpdateState {
+    let status_file = resolve_optional_env_aliases(REMOTE_UPDATE_STATUS_FILE_ENV_NAMES)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/agentd/remote-update.status"));
+    let Ok(contents) = fs::read_to_string(&status_file) else {
+        return WorkerRemoteUpdateState::default();
+    };
+
+    let mut status = None;
+    let mut message = None;
+    let mut updated_at = None;
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("STATUS=") {
+            status = match value.trim() {
+                "running" => Some(WorkerRemoteUpdateStatus::Running),
+                "success" => Some(WorkerRemoteUpdateStatus::Success),
+                "failed" => Some(WorkerRemoteUpdateStatus::Failed),
+                "rolled_back" => Some(WorkerRemoteUpdateStatus::RolledBack),
+                "rollback_failed" => Some(WorkerRemoteUpdateStatus::RollbackFailed),
+                _ => None,
+            };
+        } else if let Some(value) = line.strip_prefix("MESSAGE=") {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                message = Some(trimmed.to_string());
+            }
+        } else if let Some(value) = line.strip_prefix("UPDATED_AT=") {
+            updated_at = chrono::DateTime::parse_from_rfc3339(value.trim())
+                .ok()
+                .map(|value| value.with_timezone(&chrono::Utc));
+        }
+    }
+
+    WorkerRemoteUpdateState {
+        status,
+        message,
+        updated_at,
+    }
+}
+
 fn resolve_optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -1945,10 +3597,12 @@ fn resolve_optional_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn resolve_optional_env_aliases(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| resolve_optional_env(name))
+}
+
 fn resolve_worker_bootstrap_support() -> bool {
-    resolve_bool_env("ANYSCAN_WORKER_SUPPORTS_BOOTSTRAP")
-        .or_else(|| resolve_bool_env("ANYSCAN_WORKER_ENABLE_BOOTSTRAP"))
-        .unwrap_or(false)
+    resolve_bool_env_aliases(WORKER_BOOTSTRAP_SUPPORT_ENV_NAMES).unwrap_or(false)
 }
 
 fn resolve_bool_env(name: &str) -> Option<bool> {
@@ -1960,6 +3614,10 @@ fn resolve_bool_env(name: &str) -> Option<bool> {
     }
 }
 
+fn resolve_bool_env_aliases(names: &[&str]) -> Option<bool> {
+    names.iter().find_map(|name| resolve_bool_env(name))
+}
+
 fn worker_registration_ttl_seconds(config: &AppConfig) -> u64 {
     config
         .storage
@@ -1969,16 +3627,29 @@ fn worker_registration_ttl_seconds(config: &AppConfig) -> u64 {
         .max(30)
 }
 
+fn worker_registration_refresh_interval(config: &AppConfig, ttl_seconds: u64) -> Duration {
+    let ttl_interval = ttl_seconds.saturating_div(3).max(5);
+    let poll_interval = config.scan.poll_interval_seconds.max(5);
+    Duration::from_secs(ttl_interval.min(poll_interval))
+}
+
 async fn worker_registration_heartbeat(
     store: AnyScanStore,
     registration: WorkerRegistration,
     ttl_seconds: u64,
+    interval: Duration,
+    remote_update_tx: watch::Sender<Option<chrono::DateTime<chrono::Utc>>>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let interval = Duration::from_secs(ttl_seconds.saturating_div(3).max(5));
     loop {
-        if let Err(error) = store.register_worker(&registration, ttl_seconds) {
-            error!(worker_id = %registration.worker_id, %error, "failed to register worker");
+        let refreshed_registration = refresh_dynamic_worker_registration(&registration);
+        match store.register_worker(&refreshed_registration, ttl_seconds) {
+            Ok(worker) => {
+                let _ = remote_update_tx.send(worker.remote_update_requested_at);
+            }
+            Err(error) => {
+                error!(worker_id = %registration.worker_id, %error, "failed to register worker");
+            }
         }
 
         tokio::select! {
@@ -1988,18 +3659,97 @@ async fn worker_registration_heartbeat(
     }
 }
 
+fn refresh_dynamic_worker_registration(registration: &WorkerRegistration) -> WorkerRegistration {
+    let mut refreshed = registration.clone();
+    let remote_update_state = read_remote_update_state();
+    refreshed.remote_update_status = remote_update_state.status;
+    refreshed.remote_update_status_message = remote_update_state.message;
+    refreshed.remote_update_status_updated_at = remote_update_state.updated_at;
+    refreshed
+}
+
+fn maybe_schedule_remote_update(
+    store: &AnyScanStore,
+    worker_runtime: &WorkerRuntime,
+    requested_at: chrono::DateTime<chrono::Utc>,
+) -> Result<bool> {
+    let Some(plan) = worker_runtime.remote_update_plan.as_ref() else {
+        warn!(
+            worker_id = %worker_runtime.registration.worker_id,
+            requested_at = %requested_at,
+            "remote update was requested but this worker has no local update plan"
+        );
+        return Ok(false);
+    };
+
+    write_remote_update_request(plan, &worker_runtime.registration.worker_id, requested_at)?;
+    store
+        .acknowledge_remote_update(requested_at)
+        .with_context(|| {
+            format!(
+                "failed to acknowledge remote update request for worker {}",
+                worker_runtime.registration.worker_id
+            )
+        })?;
+    info!(
+        worker_id = %worker_runtime.registration.worker_id,
+        requested_at = %requested_at,
+        request_file = %plan.request_file.display(),
+        installer_url = %plan.installer_url,
+        "scheduled remote update request"
+    );
+    Ok(true)
+}
+
+fn write_remote_update_request(
+    plan: &RemoteUpdatePlan,
+    worker_id: &str,
+    requested_at: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    let parent = plan
+        .request_file
+        .parent()
+        .ok_or_else(|| anyhow!("remote update request file has no parent directory"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create remote update request directory {}",
+            parent.display()
+        )
+    })?;
+    let temp_path = plan.request_file.with_extension("request.tmp");
+    fs::write(
+        &temp_path,
+        format!(
+            "REQUESTED_AT={}\nWORKER_ID={}\n",
+            requested_at.to_rfc3339(),
+            worker_id
+        ),
+    )
+    .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &plan.request_file).with_context(|| {
+        format!(
+            "failed to move remote update request into place at {}",
+            plan.request_file.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn build_worker_id() -> String {
-    if let Some(worker_id) = resolve_optional_env("ANYSCAN_WORKER_ID") {
+    if let Some(worker_id) = resolve_optional_env_aliases(WORKER_ID_ENV_NAMES) {
         return worker_id;
     }
     env::var("HOSTNAME")
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("anyscan-worker-{}", std::process::id()))
+        .unwrap_or_else(|| format!("agent-{}", std::process::id()))
 }
 
 fn seed_bootstrap_inventory(store: &AnyScanStore, config: &AppConfig) -> Result<()> {
+    if resolve_optional_env_aliases(CONTROL_URL_ENV_NAMES).is_some() {
+        return Ok(());
+    }
     for target in config.normalized_bootstrap_targets()? {
         store.upsert_target(&target)?;
     }
@@ -2010,18 +3760,10 @@ fn seed_bootstrap_inventory(store: &AnyScanStore, config: &AppConfig) -> Result<
 }
 
 fn queue_due_schedules_with_events(store: &AnyScanStore, limit: usize) -> Result<()> {
-    for (schedule, run) in store.queue_due_schedule_runs(limit)? {
-        let summary = store.summary(run.id)?;
-        store.append_event(
-            Some(run.id),
-            &ApiEvent::RunQueued {
-                run: run.clone(),
-                summary,
-            },
-        )?;
+    for queued in store.queue_due_schedule_runs_with_events(limit)? {
         info!(
-            schedule = %schedule.label,
-            run_id = run.id,
+            schedule = %queued.schedule.label,
+            run_id = queued.run.id,
             "queued recurring schedule run"
         );
     }
@@ -2033,16 +3775,7 @@ fn queue_run_with_event(
     requested_by: &str,
     scope: Option<&RunScope>,
 ) -> Result<ScanRunRecord> {
-    let run = store.queue_run(Some(requested_by), scope)?;
-    let summary = store.summary(run.id)?;
-    store.append_event(
-        Some(run.id),
-        &ApiEvent::RunQueued {
-            run: run.clone(),
-            summary,
-        },
-    )?;
-    Ok(run)
+    Ok(store.queue_run_with_event(requested_by, scope)?.run)
 }
 
 fn load_effective_runtime_config(
@@ -2053,4 +3786,317 @@ fn load_effective_runtime_config(
         return Ok(base_config.clone());
     };
     base_config.with_scan_defaults_summary(&scan_settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DiscoveredEndpoint, ReportedProtocolPluginFinding,
+        derive_protocol_plugin_findings_with_active_mode, normalize_platform_architecture,
+        normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
+    };
+
+    fn endpoint(
+        host: &str,
+        port: u16,
+        service_name: &str,
+        transport: &str,
+        tags: &[&str],
+    ) -> DiscoveredEndpoint {
+        DiscoveredEndpoint {
+            host: host.to_string(),
+            port,
+            service_name: Some(service_name.to_string()),
+            transport: Some(transport.to_string()),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            version: None,
+            reported_plugins: Vec::new(),
+        }
+    }
+
+    fn endpoint_with_version(
+        host: &str,
+        port: u16,
+        service_name: &str,
+        transport: &str,
+        tags: &[&str],
+        version: &str,
+    ) -> DiscoveredEndpoint {
+        DiscoveredEndpoint {
+            host: host.to_string(),
+            port,
+            service_name: Some(service_name.to_string()),
+            transport: Some(transport.to_string()),
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+            version: Some(version.to_string()),
+            reported_plugins: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parse_json_endpoint_lines_preserves_service_transport_and_tags() {
+        let endpoints = parse_json_endpoint_lines(
+            r#"{"host":"10.0.0.10","port":6379,"service":"redis","protocol":"tcp","tags":["datastore","edge"]}"#,
+            "6379",
+        )
+        .expect("json endpoint lines should parse");
+
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].host, "10.0.0.10");
+        assert_eq!(endpoints[0].port, 6379);
+        assert_eq!(endpoints[0].service_name.as_deref(), Some("redis"));
+        assert_eq!(endpoints[0].transport.as_deref(), Some("tcp"));
+        assert_eq!(
+            endpoints[0].tags,
+            vec!["datastore".to_string(), "edge".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_ip_addr_show_output_collects_ipv4_and_ipv6_addresses() {
+        let addresses = parse_ip_addr_show_output(
+            "2: eth0    inet 10.10.0.5/24 brd 10.10.0.255 scope global eth0\n\
+             2: eth0    inet6 2001:db8::10/64 scope global dynamic\n\
+             1: lo      inet 127.0.0.1/8 scope host lo\n",
+        );
+
+        assert_eq!(
+            addresses,
+            vec!["10.10.0.5".to_string(), "2001:db8::10".to_string()]
+        );
+    }
+
+    #[test]
+    fn derive_protocol_plugin_findings_maps_known_authless_services() {
+        let findings = derive_protocol_plugin_findings_with_active_mode(
+            &[
+                endpoint("10.0.0.10", 6379, "redis", "tcp", &["datastore"]),
+                endpoint("10.0.0.11", 5432, "postgresql", "tcp", &["database"]),
+                endpoint("10.0.0.12", 5901, "rfb", "tcp", &["vnc", "no-auth"]),
+                endpoint("10.0.0.13", 27017, "mongodb", "tcp", &[]),
+                endpoint("10.0.0.13", 27017, "mongodb", "tcp", &["mongo-bleed"]),
+                endpoint("10.0.0.14", 3306, "mysql", "tcp", &[]),
+                endpoint("10.0.0.15", 11211, "memcached", "tcp", &[]),
+                endpoint("10.0.0.16", 1883, "mqtt", "tcp", &[]),
+                endpoint("10.0.0.17", 389, "ldap", "tcp", &["anonymous-bind"]),
+                endpoint("10.0.0.18", 9092, "kafka", "tcp", &[]),
+                endpoint("10.0.0.19", 2181, "zookeeper", "tcp", &[]),
+                endpoint("10.0.0.20", 2379, "etcd", "tcp", &[]),
+                endpoint("10.0.0.22", 9160, "cassandra-thrift", "tcp", &[]),
+                endpoint("10.0.0.23", 5555, "adb", "tcp", &[]),
+                endpoint("10.0.0.24", 8529, "arangodb", "tcp", &[]),
+                endpoint("10.0.0.25", 8009, "ajp", "tcp", &[]),
+                endpoint("10.0.0.26", 8123, "clickhouse", "tcp", &[]),
+                endpoint("10.0.0.26", 4200, "cratedb", "tcp", &[]),
+                endpoint("10.0.0.27", 2375, "docker-api", "tcp", &[]),
+                endpoint("10.0.0.28", 4369, "epmd", "tcp", &[]),
+                endpoint("10.0.0.28", 53, "dns", "udp", &["axfr-allowed"]),
+                endpoint("10.0.0.28", 9000, "php-fpm", "tcp", &[]),
+                endpoint("10.0.0.28", 9090, "dotnet-remoting", "tcp", &[]),
+                endpoint("10.0.0.29", 8086, "influxdb", "tcp", &[]),
+                endpoint("10.0.0.30", 2049, "nfs", "tcp", &["export-enum"]),
+                endpoint("10.0.0.31", 502, "modbus", "tcp", &[]),
+                endpoint(
+                    "10.0.0.31",
+                    80,
+                    "generic-dvr",
+                    "tcp",
+                    &["vulnerable-family"],
+                ),
+                endpoint(
+                    "10.0.0.31",
+                    8080,
+                    "hisilicon-dvr",
+                    "tcp",
+                    &["vulnerable-family"],
+                ),
+                endpoint("10.0.0.32", 4840, "opcua", "tcp", &[]),
+                endpoint(
+                    "10.0.0.33",
+                    28015,
+                    "rethinkdb",
+                    "tcp",
+                    &["admin-console-open"],
+                ),
+                endpoint("10.0.0.34", 8087, "riak", "tcp", &[]),
+                endpoint("10.0.0.35", 1099, "java-rmi", "tcp", &[]),
+                endpoint("10.0.0.36", 873, "rsync", "tcp", &[]),
+                endpoint("10.0.0.37", 102, "s7comm", "tcp", &[]),
+                endpoint("10.0.0.38", 445, "microsoft-ds", "tcp", &[]),
+                endpoint("10.0.0.39", 22, "ssh", "tcp", &[]),
+                endpoint_with_version("10.0.0.39", 22, "ssh", "tcp", &[], "OpenSSH_9.7p1 Debian-5"),
+                endpoint("10.0.0.39", 8080, "http-proxy", "tcp", &["proxy-open"]),
+                endpoint("10.0.0.40", 8080, "trino", "tcp", &[]),
+                endpoint("10.0.0.44", 3389, "rdp", "tcp", &["no-nla"]),
+                endpoint("10.0.0.41", 9092, "h2tcp", "tcp", &[]),
+                endpoint("10.0.0.42", 7687, "neo4j-bolt", "tcp", &[]),
+                endpoint("10.0.0.43", 7001, "weblogic", "tcp", &[]),
+                endpoint("10.0.0.43", 20931, "openedge", "tcp", &[]),
+                endpoint("10.0.0.43", 3050, "firebird", "tcp", &[]),
+                endpoint(
+                    "10.0.0.43",
+                    8021,
+                    "freeswitch",
+                    "tcp",
+                    &["default-password"],
+                ),
+                endpoint("10.0.0.43", 5005, "jdwp", "tcp", &["java-debug"]),
+                endpoint(
+                    "10.0.0.43",
+                    23,
+                    "telnet",
+                    "tcp",
+                    &["auth-bypass", "gnu-inetutils"],
+                ),
+                endpoint("10.0.0.45", 8108, "typesense", "tcp", &["default-api-key"]),
+            ],
+            false,
+        );
+
+        let plugin_ids = findings
+            .iter()
+            .map(|finding| finding.plugin_metadata.plugin_id.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(plugin_ids.contains(&"AdbPlugin"));
+        assert!(plugin_ids.contains(&"AjpPlugin"));
+        assert!(plugin_ids.contains(&"ArangoDBOpenPlugin"));
+        assert!(plugin_ids.contains(&"CassandraOpenPlugin"));
+        assert!(plugin_ids.contains(&"ClickHousePlugin"));
+        assert!(plugin_ids.contains(&"CrateDBPlugin"));
+        assert!(plugin_ids.contains(&"DockerAPIPlugin"));
+        assert!(plugin_ids.contains(&"DNSPlugin"));
+        assert!(plugin_ids.contains(&"DotnetRemotingPlugin"));
+        assert!(plugin_ids.contains(&"EpmdPlugin"));
+        assert!(plugin_ids.contains(&"EtcdOpenPlugin"));
+        assert!(plugin_ids.contains(&"GenericDvrPlugin"));
+        assert!(plugin_ids.contains(&"H2TcpPlugin"));
+        assert!(plugin_ids.contains(&"HiSiliconDVR"));
+        assert!(plugin_ids.contains(&"InfluxDBPlugin"));
+        assert!(plugin_ids.contains(&"KafkaOpenPlugin"));
+        assert!(plugin_ids.contains(&"LDAPPlugin"));
+        assert!(plugin_ids.contains(&"MemcachedOpenPlugin"));
+        assert!(plugin_ids.contains(&"ModbusPlugin"));
+        assert!(plugin_ids.contains(&"MongoBleedPlugin"));
+        assert!(plugin_ids.contains(&"MongoOpenPlugin"));
+        assert!(plugin_ids.contains(&"MqttPlugin"));
+        assert!(plugin_ids.contains(&"MysqlOpenPlugin"));
+        assert!(plugin_ids.contains(&"Neo4jBoltPlugin"));
+        assert!(plugin_ids.contains(&"NFSOpenPlugin"));
+        assert!(plugin_ids.contains(&"OPCUAPlugin"));
+        assert!(plugin_ids.contains(&"PrestoPlugin"));
+        assert!(plugin_ids.contains(&"ProxyOpenPlugin"));
+        assert!(plugin_ids.contains(&"RdpPlugin"));
+        assert!(plugin_ids.contains(&"RedisOpenPlugin"));
+        assert!(plugin_ids.contains(&"RethinkDBPlugin"));
+        assert!(plugin_ids.contains(&"RiakPlugin"));
+        assert!(plugin_ids.contains(&"RmiPlugin"));
+        assert!(plugin_ids.contains(&"RsyncOpenPlugin"));
+        assert!(plugin_ids.contains(&"S7commPlugin"));
+        assert!(plugin_ids.contains(&"SmbPlugin"));
+        assert!(plugin_ids.contains(&"SshRegresshionPlugin"));
+        assert!(plugin_ids.contains(&"SSHOpenPlugin"));
+        assert!(plugin_ids.contains(&"T3Plugin"));
+        assert!(plugin_ids.contains(&"OpenEdgePlugin"));
+        assert!(plugin_ids.contains(&"FirebirdPlugin"));
+        assert!(plugin_ids.contains(&"FreeSWITCHOpenPlugin"));
+        assert!(plugin_ids.contains(&"JdwpPlugin"));
+        assert!(plugin_ids.contains(&"TelnetAuthBypassPlugin"));
+        assert!(plugin_ids.contains(&"TypesensePlugin"));
+        assert!(plugin_ids.contains(&"PostgreSQLOpenPlugin"));
+        assert!(plugin_ids.contains(&"PhpFpmPlugin"));
+        assert!(plugin_ids.contains(&"VNCPlugin"));
+        assert!(plugin_ids.contains(&"ZookeeperOpenPlugin"));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.summary.trim().is_empty())
+        );
+    }
+
+    #[test]
+    fn derive_protocol_plugin_findings_accepts_explicit_reported_plugins() {
+        let findings = derive_protocol_plugin_findings_with_active_mode(
+            &[DiscoveredEndpoint {
+                host: "10.0.0.50".to_string(),
+                port: 8443,
+                service_name: Some("custom-scanner".to_string()),
+                transport: Some("tcp".to_string()),
+                tags: vec![],
+                version: Some("1.2.3".to_string()),
+                reported_plugins: vec![ReportedProtocolPluginFinding {
+                    plugin_id: "CraftCMSPlugin".to_string(),
+                    summary: Some(
+                        "Craft CMS vulnerable version was reported by an external scanner."
+                            .to_string(),
+                    ),
+                    severity: Some("high".to_string()),
+                    product_name: Some("Craft CMS".to_string()),
+                    product_version: Some("4.13.0".to_string()),
+                    cpe: None,
+                    cve_ids: vec!["CVE-2024-56145".to_string()],
+                    kev_matched: Some(false),
+                }],
+            }],
+            false,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].plugin_metadata.plugin_id, "CraftCMSPlugin");
+        assert_eq!(
+            findings[0].plugin_metadata.product_name.as_deref(),
+            Some("Craft CMS")
+        );
+        assert_eq!(
+            findings[0].plugin_metadata.product_version.as_deref(),
+            Some("4.13.0")
+        );
+        assert_eq!(findings[0].severity.as_str(), "high");
+    }
+
+    #[test]
+    fn derive_protocol_plugin_findings_suppresses_active_authorized_reports_by_default() {
+        let endpoint = DiscoveredEndpoint {
+            host: "10.0.0.60".to_string(),
+            port: 1880,
+            service_name: Some("nodered".to_string()),
+            transport: Some("tcp".to_string()),
+            tags: vec![],
+            version: None,
+            reported_plugins: vec![ReportedProtocolPluginFinding {
+                plugin_id: "NodeREDPlugin".to_string(),
+                summary: Some("Node-RED exposed without authentication".to_string()),
+                severity: Some("high".to_string()),
+                product_name: Some("Node-RED".to_string()),
+                product_version: Some("3.1.0".to_string()),
+                cpe: None,
+                cve_ids: Vec::new(),
+                kev_matched: None,
+            }],
+        };
+
+        let suppressed =
+            derive_protocol_plugin_findings_with_active_mode(&[endpoint.clone()], false);
+        assert!(suppressed.is_empty());
+
+        let allowed = derive_protocol_plugin_findings_with_active_mode(&[endpoint], true);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].plugin_metadata.plugin_id, "NodeREDPlugin");
+    }
+
+    #[test]
+    fn platform_normalization_maps_common_aliases() {
+        assert_eq!(
+            normalize_platform_operating_system("macos"),
+            Some("darwin".to_string())
+        );
+        assert_eq!(
+            normalize_platform_architecture("amd64"),
+            Some("x86_64".to_string())
+        );
+        assert_eq!(
+            normalize_platform_architecture("arm64"),
+            Some("aarch64".to_string())
+        );
+    }
 }

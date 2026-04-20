@@ -34,7 +34,9 @@ def env_string(name: str) -> str | None:
     if value is None:
         return None
     value = value.strip()
-    return value or None
+    if value:
+        return value
+    return None
 
 
 def env_int(name: str, default: int) -> int:
@@ -56,7 +58,7 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 def resolve_scanner_binary() -> Path:
     candidates: list[Path] = []
-    configured = env_string("ANYSCAN_VULNSCANNER_BIN")
+    configured = env_string("SCANNER_BIN")
     if configured is not None:
         candidates.append(Path(configured).expanduser())
 
@@ -78,7 +80,7 @@ def resolve_scanner_binary() -> Path:
 
     searched = ", ".join(str(candidate) for candidate in candidates)
     fail(
-        "unable to locate the VulnScanner binary; set ANYSCAN_VULNSCANNER_BIN or build the repository scanner binary "
+        "unable to locate the scanner binary; set SCANNER_BIN or provide the bundled scanner runtime "
         f"(searched: {searched})"
     )
 
@@ -87,14 +89,14 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
     scanner_binary = resolve_scanner_binary()
     target_range = require_string(invocation, "target_range")
     ports = require_string(invocation, "ports")
-    probe_module = env_string("ANYSCAN_VULNSCANNER_PROBE_MODULE") or "tcp"
-    senders = max(1, env_int("ANYSCAN_VULNSCANNER_SENDER_THREADS", DEFAULT_SENDER_THREADS))
-    receivers = max(1, env_int("ANYSCAN_VULNSCANNER_RECEIVER_THREADS", DEFAULT_RECEIVER_THREADS))
-    cooldown = max(0, env_int("ANYSCAN_VULNSCANNER_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS))
+    probe_module = env_string("SCANNER_PROBE_MODULE") or "tcp"
+    senders = max(1, env_int("SCANNER_SENDER_THREADS", DEFAULT_SENDER_THREADS))
+    receivers = max(1, env_int("SCANNER_RECEIVER_THREADS", DEFAULT_RECEIVER_THREADS))
+    cooldown = max(0, env_int("SCANNER_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS))
 
     rate_limit = invocation.get("rate_limit")
     if not isinstance(rate_limit, int) or rate_limit <= 0:
-        rate_limit = max(1, env_int("ANYSCAN_VULNSCANNER_DEFAULT_RATE", DEFAULT_RATE_LIMIT))
+        rate_limit = max(1, env_int("SCANNER_DEFAULT_RATE", DEFAULT_RATE_LIMIT))
 
     command = [
         str(scanner_binary),
@@ -118,23 +120,23 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
     ]
 
     optional_pairs = [
-        ("ANYSCAN_VULNSCANNER_INTERFACE", "--interface"),
-        ("ANYSCAN_VULNSCANNER_SOURCE_IP", "--source-ip"),
-        ("ANYSCAN_VULNSCANNER_GATEWAY_MAC", "--gateway-mac"),
-        ("ANYSCAN_VULNSCANNER_BANDWIDTH", "--bandwidth"),
-        ("ANYSCAN_VULNSCANNER_PROBE_ARGS", "--probe-args"),
-        ("ANYSCAN_VULNSCANNER_WHITELIST_FILE", "--whitelist-file"),
-        ("ANYSCAN_VULNSCANNER_BLACKLIST_FILE", "--blacklist-file"),
+        ("SCANNER_INTERFACE", "--interface"),
+        ("SCANNER_SOURCE_IP", "--source-ip"),
+        ("SCANNER_GATEWAY_MAC", "--gateway-mac"),
+        ("SCANNER_BANDWIDTH", "--bandwidth"),
+        ("SCANNER_PROBE_ARGS", "--probe-args"),
+        ("SCANNER_WHITELIST_FILE", "--whitelist-file"),
+        ("SCANNER_BLACKLIST_FILE", "--blacklist-file"),
     ]
     for env_name, flag in optional_pairs:
         value = env_string(env_name)
         if value is not None:
             command.extend([flag, value])
 
-    if env_flag("ANYSCAN_VULNSCANNER_ICMP_PRESCAN"):
+    if env_flag("SCANNER_ICMP_PRESCAN"):
         command.append("--icmp")
 
-    extra_args = env_string("ANYSCAN_VULNSCANNER_EXTRA_ARGS")
+    extra_args = env_string("SCANNER_EXTRA_ARGS")
     if extra_args is not None:
         command.extend(shlex.split(extra_args))
 

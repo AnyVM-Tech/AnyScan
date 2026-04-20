@@ -1,0 +1,15 @@
+{
+  "name": "bundled-http-plugin-pack",
+  "version": "0.1.0",
+  "kind": "detector_pack",
+  "enabled": true,
+  "description": "Bundled HTTP plugin detector pack scaffold for packaged LeakIX-style rules.",
+  "command": "../scripts/bundled-http-plugin-pack.py",
+  "args": [],
+  "tags": [
+    "bundled",
+    "http",
+    "plugins"
+  ],
+  "output_format": "finding_json_lines"
+}

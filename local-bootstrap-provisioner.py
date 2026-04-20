@@ -15,11 +15,22 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
+def env_string(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
 def artifact_dir() -> Path:
-    configured = os.environ.get("ANYSCAN_LOCAL_BOOTSTRAP_ARTIFACT_DIR", "").strip()
+    configured = env_string("ARTIFACT_DIR")
     if configured:
         return Path(configured)
-    return Path("/tmp/anyscan-bootstrap")
+    return Path("/tmp/agent-artifacts")
 
 
 def main() -> int:
@@ -76,19 +87,19 @@ def main() -> int:
     json_path.write_text(json.dumps(artifact_payload, indent=2, sort_keys=True) + "\n")
 
     env_lines = [
-        f"ANYSCAN_BOOTSTRAP_JOB_ID={job_id}",
-        f"ANYSCAN_BOOTSTRAP_CANDIDATE_ID={candidate_id}",
-        f"ANYSCAN_BOOTSTRAP_PROVISIONER={shell_quote(provisioner_name)}",
-        f"ANYSCAN_BOOTSTRAP_EXECUTOR_WORKER_ID={shell_quote(executor_worker_id)}",
-        f"ANYSCAN_BOOTSTRAP_DISCOVERED_HOST={shell_quote(discovered_host)}",
-        f"ANYSCAN_WORKER_TOKEN={shell_quote(enrollment_token)}",
+        f"AGENT_BOOTSTRAP_JOB_ID={job_id}",
+        f"AGENT_BOOTSTRAP_CANDIDATE_ID={candidate_id}",
+        f"AGENT_BOOTSTRAP_PROVISIONER={shell_quote(provisioner_name)}",
+        f"AGENT_BOOTSTRAP_EXECUTOR_ID={shell_quote(executor_worker_id)}",
+        f"AGENT_BOOTSTRAP_DISCOVERED_HOST={shell_quote(discovered_host)}",
+        f"AGENT_TOKEN={shell_quote(enrollment_token)}",
     ]
     if discovered_port is not None:
-        env_lines.append(f"ANYSCAN_BOOTSTRAP_DISCOVERED_PORT={shell_quote(str(discovered_port))}")
+        env_lines.append(f"AGENT_BOOTSTRAP_DISCOVERED_PORT={shell_quote(str(discovered_port))}")
     if worker_pool:
-        env_lines.append(f"ANYSCAN_BOOTSTRAP_WORKER_POOL={shell_quote(worker_pool)}")
+        env_lines.append(f"AGENT_POOL={shell_quote(worker_pool)}")
     if tags:
-        env_lines.append(f"ANYSCAN_BOOTSTRAP_TAG_CSV={shell_quote(','.join(tags))}")
+        env_lines.append(f"AGENT_TAGS={shell_quote(','.join(tags))}")
     env_lines.append("")
     env_path = target_dir / f"bootstrap-job-{job_id}.env"
     env_path.write_text("\n".join(env_lines))

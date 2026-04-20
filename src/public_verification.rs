@@ -95,8 +95,8 @@ async fn verify_dns_txt(
 
     let resource_owned = resource.to_string();
     let token_owned = token.clone();
-    let lookup_result = tokio::task::spawn_blocking(move || lookup_dns_txt_records(&resource_owned))
-        .await;
+    let lookup_result =
+        tokio::task::spawn_blocking(move || lookup_dns_txt_records(&resource_owned)).await;
 
     let records = match lookup_result {
         Ok(Ok(records)) => records,
@@ -114,7 +114,10 @@ async fn verify_dns_txt(
         }
     };
 
-    if records.iter().any(|record| dns_record_matches_token(record, &token_owned)) {
+    if records
+        .iter()
+        .any(|record| dns_record_matches_token(record, &token_owned))
+    {
         PublicVerificationResult::verified(
             format!(
                 "Verified automatically: a DNS TXT record on {resource} matched the provided token."
@@ -271,10 +274,7 @@ fn dns_record_matches_token(record: &str, token: &str) -> bool {
     normalized_record == normalized_token || normalized_record.contains(normalized_token)
 }
 
-fn http_verification_candidate_urls(
-    resource_kind: PublicResourceKind,
-    resource: &str,
-) -> Vec<Url> {
+fn http_verification_candidate_urls(resource_kind: PublicResourceKind, resource: &str) -> Vec<Url> {
     let host = match resource_kind {
         PublicResourceKind::Domain | PublicResourceKind::Ip => resource.trim(),
         PublicResourceKind::Cidr => return Vec::new(),
@@ -319,15 +319,22 @@ mod tests {
     #[test]
     fn dns_record_matching_accepts_exact_and_contained_tokens() {
         assert!(dns_record_matches_token("token-123", "token-123"));
-        assert!(dns_record_matches_token("anyscan-verification=token-123", "token-123"));
+        assert!(dns_record_matches_token(
+            "anyscan-verification=token-123",
+            "token-123"
+        ));
         assert!(!dns_record_matches_token("token-999", "token-123"));
     }
 
     #[test]
     fn http_candidate_urls_use_standard_anyscan_paths() {
         let urls = http_verification_candidate_urls(PublicResourceKind::Domain, "example.com");
-        let rendered = urls.iter().map(|url| url.as_str().to_string()).collect::<Vec<_>>();
-        assert!(rendered.contains(&"https://example.com/.well-known/anyscan-verification.txt".to_string()));
+        let rendered = urls
+            .iter()
+            .map(|url| url.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert!(rendered
+            .contains(&"https://example.com/.well-known/anyscan-verification.txt".to_string()));
         assert!(rendered.contains(&"http://example.com/anyscan-verification.txt".to_string()));
     }
 

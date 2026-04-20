@@ -1,0 +1,32 @@
+[Unit]
+Description=Bundled Network Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentd
+Group=agentd
+WorkingDirectory=/opt/agentd
+EnvironmentFile=-/etc/agentd/runtime.env
+ExecStart=/opt/agentd/bin/tor -f /var/lib/agentd/tor/torrc
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/agentd
+StateDirectory=agentd
+RuntimeDirectory=agentd
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

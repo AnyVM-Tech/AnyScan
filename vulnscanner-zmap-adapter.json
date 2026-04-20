@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "kind": "scanner_adapter",
   "enabled": true,
-  "description": "AnyScan worker adapter for the Lorikazzzz VulnScanner zmap alternative utility",
-  "command": "./vulnscanner-zmap-adapter.py",
+  "description": "Worker adapter for the bundled network scanner utility",
+  "command": "./portscan-adapter.py",
   "args": [],
   "tags": [
     "vulnscanner-zmap",

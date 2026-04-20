@@ -1,8 +1,11 @@
+pub mod archive;
 pub mod config;
 pub mod core;
 pub mod detectors;
 pub mod dragonfly_store;
 pub mod fetcher;
 pub mod ops;
+pub mod plugins;
 pub mod public_verification;
 pub mod store;
+pub mod worker_api;

@@ -1,20 +1,24 @@
 use crate::{
+    archive::{ArchivePressureDecision, ArchivedObject, PreparedArchivePayload},
     config::AppConfig,
     core::{
-        AbuseReportRecord, AbuseReportRequest, ApiEvent, BinDatasetImportRequest, BinDatasetStatus,
-        BinMetadataRecord, DashboardSnapshot, DiscoveryProvenanceRecord, FetchTelemetry,
-        FindingRecord, FindingsQuery, NewFinding, OptOutRecord, OptOutRequest,
-        OwnershipClaimRecord, OwnershipClaimRequest, PortScanRecord, PortScanRequest,
+        AbuseReportRecord, AbuseReportRequest, ActiveAuthorizedPluginExecution, ApiEvent,
+        ArchiveJobRecord, ArchivePointerRecord, ArchiveRecordKind, ArchiveStatusSnapshot,
+        BinDatasetImportRequest, BinDatasetStatus, BinMetadataRecord, DashboardSnapshot,
+        DiscoveryProvenanceRecord, FetchTelemetry, FindingRecord, FindingsQuery, NewFinding,
+        OptOutRecord, OptOutRequest, OwnershipClaimRecord, OwnershipClaimRequest,
+        PortScanProtocolFindingRecord, PortScanRecord, PortScanRequest,
         PublicFindingModerationRecord, PublicFindingModerationRequest, PublicFindingRecord,
-        PublicFindingSearchQuery, PublicWorkflowStatus, PublicWorkflowStatusUpdate, RecurringScheduleRecord,
-        RepositoryDefinition, RepositoryRecord, RunScope, RunSummary, ScanDefaultsSummary,
-        ScanJobRecord, ScanRunRecord, StoredEvent, TargetDefinition, TargetRecord,
-        WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
+        PublicFindingSearchQuery, PublicWorkflowStatus, PublicWorkflowStatusUpdate,
+        RecurringScheduleRecord, RepositoryDefinition, RepositoryRecord, RunScope, RunSummary,
+        ScanDefaultsSummary, ScanJobRecord, ScanRunRecord, StoredEvent, TargetDefinition,
+        TargetRecord, WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
+        WorkerBootstrapCodeExchange, WorkerBootstrapCodeIssueRequest, WorkerBootstrapCodeIssued,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord,
         WorkerBootstrapCandidateRejectionRequest, WorkerBootstrapJobClaim,
         WorkerBootstrapJobRecord, WorkerEnrollmentTokenIssueRequest, WorkerEnrollmentTokenIssued,
         WorkerEnrollmentTokenRecord, WorkerLifecycleState, WorkerPoolRecord, WorkerRecord,
-        WorkerRegistration,
+        WorkerRegistration, WorkerRemoteCommandRecord, WorkerRemoteCommandRequest,
     },
     dragonfly_store::DragonflyAnyScanStore,
 };
@@ -84,6 +88,19 @@ impl AnyScanStore {
         self.inner.queue_port_scan(requested_by, request)
     }
 
+    pub fn queue_port_scan_with_active_authorized_plugins(
+        &self,
+        requested_by: Option<&str>,
+        request: &PortScanRequest,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<PortScanRecord> {
+        self.inner.queue_port_scan_with_active_authorized_plugins(
+            requested_by,
+            request,
+            active_authorized_plugins,
+        )
+    }
+
     pub fn list_port_scans(&self, limit: usize) -> Result<Vec<PortScanRecord>> {
         self.inner.list_port_scans(limit)
     }
@@ -94,6 +111,24 @@ impl AnyScanStore {
         ttl_seconds: u64,
     ) -> Result<WorkerRecord> {
         self.inner.register_worker(registration, ttl_seconds)
+    }
+
+    pub fn authenticate_worker_registration_token(
+        &self,
+        worker_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.inner
+            .authenticate_worker_registration_token(worker_id, token)
+    }
+
+    pub fn authenticate_registered_worker_token(
+        &self,
+        worker_id: &str,
+        token: &str,
+    ) -> Result<()> {
+        self.inner
+            .authenticate_registered_worker_token(worker_id, token)
     }
 
     pub fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
@@ -117,6 +152,69 @@ impl AnyScanStore {
             .update_worker_lifecycle_state(worker_id, lifecycle_state)
     }
 
+    pub fn request_worker_remote_update(&self, worker_id: &str) -> Result<WorkerRecord> {
+        self.inner.request_worker_remote_update(worker_id)
+    }
+
+    pub fn request_all_worker_remote_updates(&self) -> Result<Vec<WorkerRecord>> {
+        self.inner.request_all_worker_remote_updates()
+    }
+
+    pub fn acknowledge_worker_remote_update(
+        &self,
+        worker_id: &str,
+        requested_at: DateTime<Utc>,
+    ) -> Result<WorkerRecord> {
+        self.inner
+            .acknowledge_worker_remote_update(worker_id, requested_at)
+    }
+
+    pub fn list_worker_remote_commands(
+        &self,
+        limit: usize,
+        worker_id: Option<&str>,
+    ) -> Result<Vec<WorkerRemoteCommandRecord>> {
+        self.inner.list_worker_remote_commands(limit, worker_id)
+    }
+
+    pub fn queue_worker_remote_command(
+        &self,
+        worker_id: &str,
+        requested_by: Option<&str>,
+        request: &WorkerRemoteCommandRequest,
+    ) -> Result<WorkerRemoteCommandRecord> {
+        self.inner
+            .queue_worker_remote_command(worker_id, requested_by, request)
+    }
+
+    pub fn claim_next_pending_worker_remote_command(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<WorkerRemoteCommandRecord>> {
+        self.inner.claim_next_pending_worker_remote_command(worker_id)
+    }
+
+    pub fn complete_worker_remote_command_if_owned(
+        &self,
+        command_id: i64,
+        worker_id: &str,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<Option<WorkerRemoteCommandRecord>> {
+        self.inner.complete_worker_remote_command_if_owned(
+            command_id,
+            worker_id,
+            exit_code,
+            timed_out,
+            stdout,
+            stderr,
+            error,
+        )
+    }
+
     pub fn list_worker_enrollment_tokens(&self) -> Result<Vec<WorkerEnrollmentTokenRecord>> {
         self.inner.list_worker_enrollment_tokens()
     }
@@ -135,6 +233,22 @@ impl AnyScanStore {
         token_id: i64,
     ) -> Result<WorkerEnrollmentTokenRecord> {
         self.inner.revoke_worker_enrollment_token(token_id)
+    }
+
+    pub fn issue_worker_bootstrap_code(
+        &self,
+        created_by: Option<&str>,
+        request: &WorkerBootstrapCodeIssueRequest,
+    ) -> Result<WorkerBootstrapCodeIssued> {
+        self.inner.issue_worker_bootstrap_code(created_by, request)
+    }
+
+    pub fn exchange_worker_bootstrap_code(
+        &self,
+        code: &str,
+        worker_id: &str,
+    ) -> Result<WorkerBootstrapCodeExchange> {
+        self.inner.exchange_worker_bootstrap_code(code, worker_id)
     }
 
     pub fn list_bootstrap_candidates(&self) -> Result<Vec<WorkerBootstrapCandidateRecord>> {
@@ -252,6 +366,7 @@ impl AnyScanStore {
         worker_id: &str,
         discovered_endpoints_total: u64,
         imported_targets_total: u64,
+        protocol_findings: &[PortScanProtocolFindingRecord],
         queued_run_id: Option<i64>,
         notes: Option<&str>,
     ) -> Result<Option<PortScanRecord>> {
@@ -260,6 +375,7 @@ impl AnyScanStore {
             worker_id,
             discovered_endpoints_total,
             imported_targets_total,
+            protocol_findings,
             queued_run_id,
             notes,
         )
@@ -287,6 +403,25 @@ impl AnyScanStore {
             .upsert_schedule(label, interval_seconds, enabled, requested_by, scope)
     }
 
+    pub fn upsert_schedule_with_active_authorized_plugins(
+        &self,
+        label: &str,
+        interval_seconds: u64,
+        enabled: bool,
+        requested_by: Option<&str>,
+        scope: Option<&RunScope>,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<RecurringScheduleRecord> {
+        self.inner.upsert_schedule_with_active_authorized_plugins(
+            label,
+            interval_seconds,
+            enabled,
+            requested_by,
+            scope,
+            active_authorized_plugins,
+        )
+    }
+
     pub fn list_schedules(&self) -> Result<Vec<RecurringScheduleRecord>> {
         self.inner.list_schedules()
     }
@@ -304,6 +439,19 @@ impl AnyScanStore {
         scope: Option<&RunScope>,
     ) -> Result<ScanRunRecord> {
         self.inner.queue_run(requested_by, scope)
+    }
+
+    pub fn queue_run_with_active_authorized_plugins(
+        &self,
+        requested_by: Option<&str>,
+        scope: Option<&RunScope>,
+        active_authorized_plugins: &ActiveAuthorizedPluginExecution,
+    ) -> Result<ScanRunRecord> {
+        self.inner.queue_run_with_active_authorized_plugins(
+            requested_by,
+            scope,
+            active_authorized_plugins,
+        )
     }
 
     pub fn claim_next_runnable_run(
@@ -475,6 +623,106 @@ impl AnyScanStore {
 
     pub fn dashboard_snapshot(&self) -> Result<DashboardSnapshot> {
         self.inner.dashboard_snapshot()
+    }
+
+    pub fn archive_due(&self, cadence_seconds: u64, now: DateTime<Utc>) -> Result<bool> {
+        self.inner.archive_due(cadence_seconds, now)
+    }
+
+    pub fn used_memory_bytes(&self) -> Result<u64> {
+        self.inner.used_memory_bytes()
+    }
+
+    pub fn namespace_storage_estimate_bytes(&self) -> Result<u64> {
+        self.inner.namespace_storage_estimate_bytes()
+    }
+
+    pub fn archive_status(&self, config: &AppConfig) -> Result<ArchiveStatusSnapshot> {
+        self.inner.archive_status(config)
+    }
+
+    pub fn list_archive_jobs(&self, limit: usize) -> Result<Vec<ArchiveJobRecord>> {
+        self.inner.list_archive_jobs(limit)
+    }
+
+    pub fn list_archive_pointers(
+        &self,
+        limit: usize,
+        kind: Option<ArchiveRecordKind>,
+    ) -> Result<Vec<ArchivePointerRecord>> {
+        self.inner.list_archive_pointers(limit, kind)
+    }
+
+    pub fn get_archive_pointer(&self, pointer_id: i64) -> Result<Option<ArchivePointerRecord>> {
+        self.inner.get_archive_pointer(pointer_id)
+    }
+
+    pub fn begin_archive_job(
+        &self,
+        decision: &ArchivePressureDecision,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.inner.begin_archive_job(decision, now)
+    }
+
+    pub fn complete_archive_job(
+        &self,
+        job_id: i64,
+        archived_counts: &std::collections::BTreeMap<ArchiveRecordKind, usize>,
+        archived_object_count: usize,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.inner
+            .complete_archive_job(job_id, archived_counts, archived_object_count, now)
+    }
+
+    pub fn fail_archive_job(
+        &self,
+        job_id: i64,
+        archived_counts: &std::collections::BTreeMap<ArchiveRecordKind, usize>,
+        archived_object_count: usize,
+        error: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ArchiveJobRecord> {
+        self.inner
+            .fail_archive_job(job_id, archived_counts, archived_object_count, error, now)
+    }
+
+    pub fn plan_archive_payloads(
+        &self,
+        hot_retention_days: u64,
+        max_records_per_batch: usize,
+        bootstrap_artifact_dir: Option<&std::path::Path>,
+    ) -> Result<Vec<PreparedArchivePayload>> {
+        self.inner.plan_archive_payloads(
+            hot_retention_days,
+            max_records_per_batch,
+            bootstrap_artifact_dir,
+        )
+    }
+
+    pub fn record_archived_payload(
+        &self,
+        payload: &PreparedArchivePayload,
+        archived: &ArchivedObject,
+    ) -> Result<ArchivePointerRecord> {
+        self.inner.record_archived_payload(payload, archived)
+    }
+
+    pub fn hydrate_archive_records(
+        &self,
+        kind: ArchiveRecordKind,
+        records: &[serde_json::Value],
+    ) -> Result<usize> {
+        self.inner.hydrate_archive_records(kind, records)
+    }
+
+    pub fn try_acquire_archive_lease(&self, token: &str, ttl_ms: u64) -> Result<bool> {
+        self.inner.try_acquire_archive_lease(token, ttl_ms)
+    }
+
+    pub fn release_archive_lease(&self, token: &str) -> Result<()> {
+        self.inner.release_archive_lease(token)
     }
 
     pub fn load_scan_settings(&self) -> Result<Option<ScanDefaultsSummary>> {

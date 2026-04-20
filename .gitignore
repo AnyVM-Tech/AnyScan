@@ -1,6 +1,12 @@
 target/
+dist/
+openwrt/package/anyscan-agent/staging/*
+!openwrt/package/anyscan-agent/staging/.gitkeep
 __pycache__/
-data/
+data/*
+!data/leakix_plugin_catalog.json
+!data/version_rule_advisories.json
 *.sqlite
 runtime.env
 .env
+.external-runtime.env

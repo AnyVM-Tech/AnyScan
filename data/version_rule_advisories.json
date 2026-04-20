@@ -1,0 +1,1761 @@
+{
+  "FlowiseVersionPlugin": [
+    {
+      "advisory_id": "GHSA-2jch-qc96-9f5g",
+      "cve_ids": [
+        "CVE-2024-36422"
+      ],
+      "summary": "Flowise Cross-site Scripting in api/v1/chatflows/id",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-2q4w-x8h2-2fvh",
+      "cve_ids": [
+        "CVE-2024-8181"
+      ],
+      "summary": "Flowise Authentication Bypass vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.8.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-2vv2-3x8x-4gv7",
+      "cve_ids": [
+        "CVE-2025-8943"
+      ],
+      "summary": "Flowise OS command remote code execution",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "3.0.5"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-35g6-rrw3-v6xc",
+      "cve_ids": [
+        "CVE-2025-61687"
+      ],
+      "summary": "FlowiseAI/Flosise has File Upload vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "3.0.7",
+          "fixed": "3.0.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-3gcm-f6qx-ff7p",
+      "cve_ids": [
+        "CVE-2025-59528"
+      ],
+      "summary": "Flowise has Remote Code Execution vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "3.0.5",
+          "fixed": "3.0.6"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-48x4-mx8f-gr4h",
+      "cve_ids": [
+        "CVE-2024-8182"
+      ],
+      "summary": "Flowise Unauthenticated Denial of Service (DoS) vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.8.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-5f53-522j-j454",
+      "cve_ids": [
+        "CVE-2026-30824"
+      ],
+      "summary": "Flowise Missing Authentication on NVIDIA NIM Endpoints",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-66f2-xxgm-f6xp",
+      "cve_ids": [
+        "CVE-2024-36421"
+      ],
+      "summary": "Flowise Cors Misconfiguration in packages/server/src/index.ts",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-69jq-qr7w-j7qh",
+      "cve_ids": [
+        "CVE-2025-26319"
+      ],
+      "summary": "FlowiseAI Flowise arbitrary file upload vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "2.2.6"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-6wp6-22x5-rr3w",
+      "cve_ids": [
+        "CVE-2024-31621"
+      ],
+      "summary": "Flowise vulnerable to code injection via api/v1",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.8.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-7944-7c6r-55vv",
+      "cve_ids": [
+        "CVE-2025-57164"
+      ],
+      "summary": "FlowiseAI Pre-Auth Arbitrary Code Execution",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "3.0.5",
+          "fixed": "3.0.6"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-7r4h-vmj9-wg42",
+      "cve_ids": [
+        "CVE-2025-29192"
+      ],
+      "summary": "Flowise Stored XSS vulnerability through logs in chatbot",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.5"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-858c-qxvx-rg9v",
+      "cve_ids": [
+        "CVE-2024-37145"
+      ],
+      "summary": "Flowise Cross-site Scripting in /api/v1/chatflows-streaming/id",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-964p-j4gg-mhwc",
+      "cve_ids": [
+        "CVE-2025-50538"
+      ],
+      "summary": "Flowise is vulnerable to stored XSS via \"View Messages\" allows credential theft in FlowiseAI admin panel",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-c9gw-hvqq-f33r",
+      "cve_ids": [
+        "CVE-2026-40933"
+      ],
+      "summary": "Flowise: Authenticated RCE Via MCP Adapters",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.1.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-cwc3-p92j-g7qm",
+      "cve_ids": [
+        "CVE-2026-30823"
+      ],
+      "summary": "Flowise has IDOR leading to Account Takeover and Enterprise Feature Bypass via SSO Configuration",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-fccx-2pwj-hrq7",
+      "cve_ids": [
+        "CVE-2024-36423"
+      ],
+      "summary": "Flowise Cross-site Scripting in /api/v1/public-chatflows/id",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-fvcw-9w9r-pxc7",
+      "cve_ids": [
+        "CVE-2026-31829"
+      ],
+      "summary": "Flowise affected by Server-Side Request Forgery (SSRF) in HTTP Node Leading to Internal Network Access",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-h997-3fxj-p5j8",
+      "cve_ids": [
+        "CVE-2024-36420"
+      ],
+      "summary": "Flowise Path Injection at /api/v1/openai-assistants-file",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-hmgh-466j-fx4c",
+      "cve_ids": [
+        "CVE-2025-55346"
+      ],
+      "summary": "Flowise vulnerable to RCE via Dynamic function constructor injection",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "2.2.7-patch.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-hr92-4q35-4j3m",
+      "cve_ids": [
+        "CVE-2025-59527"
+      ],
+      "summary": "FlowiseAI/Flowise has Server-Side Request Forgery (SSRF) vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "3.0.5",
+          "fixed": "3.0.6"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-j8g8-j7fc-43v6",
+      "cve_ids": [
+        "CVE-2026-30821"
+      ],
+      "summary": "Flowise has Arbitrary File Upload via MIME Spoofing",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-jv9m-vf54-chjj",
+      "cve_ids": [
+        "CVE-2025-61913"
+      ],
+      "summary": "Flowise is vulnerable to arbitrary file write through its WriteFileTool ",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-m5p9-xvxj-64c8",
+      "cve_ids": [
+        "CVE-2024-9148"
+      ],
+      "summary": "Flowise and Flowise Chat Embed vulnerable to Stored Cross-site Scripting",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "2.1.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-mq4r-h2gh-qv7x",
+      "cve_ids": [
+        "CVE-2026-30822"
+      ],
+      "summary": "Flowise Allows Mass Assignment in `/api/v1/leads` Endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-r4hh-pcgx-j5r2",
+      "cve_ids": [
+        "CVE-2025-34267"
+      ],
+      "summary": "Flowise: Authenticated Command Execution and Sandbox Bypass via Puppeteer and Playwright Packages",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "3.0.1",
+          "fixed": "3.0.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-wgpv-6j63-x5ph",
+      "cve_ids": [
+        "CVE-2025-58434"
+      ],
+      "summary": "Flowise Cloud and Local Deployments have Unauthenticated Password Reset Token Disclosure that Leads to Account Takeover",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.6"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-wvhq-wp8g-c7vq",
+      "cve_ids": [
+        "CVE-2026-30820"
+      ],
+      "summary": "Flowise has Authorization Bypass via Spoofed x-request-from Header",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "3.0.13"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-wxm4-9f8p-gggv",
+      "cve_ids": [
+        "CVE-2024-37146"
+      ],
+      "summary": "Flowise Cross-site Scripting in/api/v1/credentials/id",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.4.3"
+        }
+      ]
+    }
+  ],
+  "LiteLLMPlugin": [
+    {
+      "advisory_id": "GHSA-3xr8-qfvj-9p9j",
+      "cve_ids": [
+        "CVE-2024-4888"
+      ],
+      "summary": "Arbitrary file deletion in litellm",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.35.36"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-46cm-pfwv-cgf8",
+      "cve_ids": [
+        "CVE-2024-2952"
+      ],
+      "summary": "LiteLLM has Server-Side Template Injection vulnerability in /completions endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.34.42"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-53gh-p8jc-7rg8",
+      "cve_ids": [
+        "CVE-2024-6825"
+      ],
+      "summary": "LiteLLM Vulnerable to Remote Code Execution (RCE)",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.40.3.dev2",
+          "last_affected": "1.40.12"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-53mr-6c8q-9789",
+      "cve_ids": [
+        "CVE-2026-35029"
+      ],
+      "summary": "LiteLLM: Privilege escalation via unrestricted proxy configuration endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.83.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-7ggm-4rjg-594w",
+      "cve_ids": [
+        "CVE-2024-4264"
+      ],
+      "summary": "litellm passes untrusted data to `eval` function without sanitization",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.28.11"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-879v-fggm-vxw2",
+      "cve_ids": [
+        "CVE-2025-0330"
+      ],
+      "summary": "LiteLLM Has a Leakage of Langfuse API Keys",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.52.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-8j42-pcfm-3467",
+      "cve_ids": [
+        "CVE-2024-4890"
+      ],
+      "summary": "SQL injection in litellm",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "1.27.14"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-fh2c-86xm-pm2x",
+      "cve_ids": [
+        "CVE-2024-8984"
+      ],
+      "summary": "LiteLLM Vulnerable to Denial of Service (DoS) via Crafted HTTP Request",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.56.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-fjcf-3j3r-78rp",
+      "cve_ids": [
+        "CVE-2025-0628"
+      ],
+      "summary": "LiteLLM Has an Improper Authorization Vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.61.15"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-g26j-5385-hhw3",
+      "cve_ids": [
+        "CVE-2024-6587"
+      ],
+      "summary": "LiteLLM Server-Side Request Forgery (SSRF) vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.44.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-g5pg-73fc-hjwq",
+      "cve_ids": [
+        "CVE-2024-9606"
+      ],
+      "summary": "LiteLLM Reveals Portion of API Key via a Logging File",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.44.12"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-gppg-gqw8-wh9g",
+      "cve_ids": [
+        "CVE-2024-5751"
+      ],
+      "summary": "litellm vulnerable to remote code execution based on using eval unsafely",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.40.16"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-gw2q-qw9j-rgv7",
+      "cve_ids": [
+        "CVE-2024-10188"
+      ],
+      "summary": "LiteLLM Vulnerable to Denial of Service (DoS)",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.53.1.dev1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-h6m6-jj8v-94jj",
+      "cve_ids": [
+        "CVE-2024-5225"
+      ],
+      "summary": "SQL injection in litellm",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.40.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-jjhc-v7c2-5hh6",
+      "cve_ids": [
+        "CVE-2026-35030"
+      ],
+      "summary": "LiteLLM: Authentication bypass via OIDC userinfo cache key collision",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.83.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-qqcv-vg9f-5rr3",
+      "cve_ids": [
+        "CVE-2024-5710"
+      ],
+      "summary": "litellm vulnerable to improper access control in team management",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.40.15"
+        }
+      ]
+    }
+  ],
+  "N8nPlugin": [
+    {
+      "advisory_id": "GHSA-2p9h-rqjw-gm92",
+      "cve_ids": [
+        "CVE-2026-27578"
+      ],
+      "summary": "n8n Vulnerable to Stored XSS via Various Nodes",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-2xcx-75h9-vr9h",
+      "cve_ids": [
+        "CVE-2026-25631"
+      ],
+      "summary": "n8n's domain allowlist bypass enables credential exfiltration",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.121.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-43v7-fp2v-68f6",
+      "cve_ids": [
+        "CVE-2026-33724"
+      ],
+      "summary": "n8n's Source Control SSH Configuration Uses StrictHostKeyChecking=no",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "2.5.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-49mx-fj45-q3p6",
+      "cve_ids": [
+        "CVE-2025-61917"
+      ],
+      "summary": "n8n's Unsafe Buffer Allocation Allows In-Process Memory Disclosure in Task Runner",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.65.0",
+          "fixed": "1.114.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-58jc-rcg5-95f3",
+      "cve_ids": [
+        "CVE-2025-61914"
+      ],
+      "summary": "n8n's Possible Stored XSS in \"Respond to Webhook\" Node May Execute Outside iframe Sandbox",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.114.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-58qr-rcgv-642v",
+      "cve_ids": [
+        "CVE-2026-33660"
+      ],
+      "summary": "n8n has Multiple Remote Code Execution Vulnerabilities in Merge Node AlaSQL SQL Mode",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.27"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-5vj6-wjr7-5v9f",
+      "cve_ids": [
+        "CVE-2025-49592"
+      ],
+      "summary": "n8n allows open redirects via the /signin endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.98.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-5xrp-6693-jjx9",
+      "cve_ids": [
+        "CVE-2026-1470"
+      ],
+      "summary": "n8n Unsafe Workflow Expression Evaluation Allows Remote Code Execution",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.17"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.4.5"
+        },
+        {
+          "introduced": "2.5.0",
+          "fixed": "2.5.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-62r4-hw23-cc8v",
+      "cve_ids": [
+        "CVE-2025-68668"
+      ],
+      "summary": "n8n Vulnerable to Arbitrary Command Execution in Pyodide based Python Code Node ",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.0.0",
+          "fixed": "2.0.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-6cqr-8cfr-67f8",
+      "cve_ids": [
+        "CVE-2026-25049"
+      ],
+      "summary": "n8n Has Expression Escape Vulnerability Leading to RCE",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.17"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.5.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-75g8-rv7v-32f7",
+      "cve_ids": [
+        "CVE-2026-27493"
+      ],
+      "summary": "n8n has Unauthenticated Expression Evaluation via Form Node",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-7c4h-vh2m-743m",
+      "cve_ids": [
+        "CVE-2026-21893"
+      ],
+      "summary": "n8n Vulnerable to Command Injection in Community Package Installation",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0.187.0",
+          "fixed": "1.120.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-825q-w924-xhgx",
+      "cve_ids": [
+        "CVE-2026-25051"
+      ],
+      "summary": "n8n's Improper CSP Enforcement in Webhook Responses May Allow Stored XSS",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.123.0",
+          "fixed": "1.123.2"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.122.5"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-8398-gmmx-564h",
+      "cve_ids": [
+        "CVE-2026-25115"
+      ],
+      "summary": "n8n has a Python sandbox escape",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "2.4.8"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-97cp-mr4m-9mcf",
+      "cve_ids": [
+        "CVE-2023-27563"
+      ],
+      "summary": "n8n Privilege Escalation vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "0.216.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-98c2-4cr3-4jc3",
+      "cve_ids": [
+        "CVE-2026-33713"
+      ],
+      "summary": "n8n has SQL Injection in Data Table Node via orderByColumn Expression",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.26"
+        },
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-9g95-qf3f-ggrw",
+      "cve_ids": [
+        "CVE-2026-25053"
+      ],
+      "summary": "n8n has OS Command Injection in Git Node",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.5.0"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.10"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-c545-x2rh-82fc",
+      "cve_ids": [
+        "CVE-2026-33665"
+      ],
+      "summary": "n8n: LDAP Email-Based Account Linking Allows Privilege Escalation and Account Takeover",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.4.0"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.121.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-c8hm-hr8h-5xjw",
+      "cve_ids": [
+        "CVE-2025-46343"
+      ],
+      "summary": "n8n Vulnerable to Stored XSS through Attachments View Endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.90.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-fxcw-h3qj-8m8p",
+      "cve_ids": [
+        "CVE-2026-33722"
+      ],
+      "summary": "n8n Has External Secrets Authorization Bypass in Credential Saving",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.23"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.6.4"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-gfvg-qv54-r4pc",
+      "cve_ids": [
+        "CVE-2026-25052"
+      ],
+      "summary": "n8n's Improper File Access Controls Allow Arbitrary File Read by Authenticated Users",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.5.0"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.18"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-ggjm-f3g4-rwmm",
+      "cve_ids": [
+        "CVE-2025-57749"
+      ],
+      "summary": "n8n symlink traversal vulnerability in \"Read/Write File\" node allows access to restricted files",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.106.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-gq57-v332-7666",
+      "cve_ids": [
+        "CVE-2025-52554"
+      ],
+      "summary": "n8n is vulnerable to Improper Authorization through its `/stop` endpoint",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.99.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-hfmv-hhh3-43f2",
+      "cve_ids": [
+        "CVE-2025-52478"
+      ],
+      "summary": "Stored XSS in n8n Form Trigger allows Account Takeover via injected iframe and video/source",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.77.0",
+          "fixed": "1.98.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-hv53-3329-vmrm",
+      "cve_ids": [
+        "CVE-2026-25056"
+      ],
+      "summary": "n8n Merge Node has Arbitrary File Write leading to RCE",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.118.0"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.4.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-j4p8-h8mh-rh8q",
+      "cve_ids": [
+        "CVE-2025-68697"
+      ],
+      "summary": "Self-hosted n8n has Legacy Code node that enables arbitrary file read/write",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.2.1",
+          "fixed": "2.0.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-jf52-3f2h-h9j5",
+      "cve_ids": [
+        "CVE-2026-21894"
+      ],
+      "summary": "n8n's Missing Stripe-Signature Verification Allows Unauthenticated Forged Webhooks",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0.150.0",
+          "fixed": "2.2.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-jjpj-p2wh-qf23",
+      "cve_ids": [
+        "CVE-2026-27495"
+      ],
+      "summary": "n8n has a Sandbox Escape in its JavaScript Task Runner",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-m63j-689w-3j35",
+      "cve_ids": [
+        "CVE-2026-33663"
+      ],
+      "summary": "n8n is Vulnerable to Credential Theft via Name-Based Resolution and Permission Checker Bypass in Community Edition",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.27"
+        },
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-m82q-59gv-mcr9",
+      "cve_ids": [
+        "CVE-2026-25055"
+      ],
+      "summary": "n8n Vulnerable to Arbitrary File Write on Remote Systems via SSH Node",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.4.0"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.12"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-mmgg-m5j7-f83h",
+      "cve_ids": [
+        "CVE-2026-27494"
+      ],
+      "summary": "n8n has Arbitrary File Read via Python Code Node Sandbox Escape",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-mvh4-2cm2-6hpg",
+      "cve_ids": [
+        "CVE-2025-58177"
+      ],
+      "summary": "Stored XSS in n8n LangChain Chat Trigger Node via initialMessages Parameter",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.24.0",
+          "fixed": "1.107.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-mxrg-77hm-89hv",
+      "cve_ids": [
+        "CVE-2026-33696"
+      ],
+      "summary": "n8n: Prototype Pollution in XML and GSuiteAdmin node parameters lead to RCE",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.27"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-p58x-7733-vp9m",
+      "cve_ids": [
+        "CVE-2023-27562"
+      ],
+      "summary": "n8n Directory Traversal vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "0.216.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-pr9r-gxgp-9rm8",
+      "cve_ids": [
+        "CVE-2025-49595"
+      ],
+      "summary": "n8n Vulnerable to Denial of Service via Malformed Binary Data Requests",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.99.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-qfc3-hm4j-7q77",
+      "cve_ids": [
+        "CVE-2026-33749"
+      ],
+      "summary": "n8n Vulnerable to XSS via Binary Data Inline HTML Rendering",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.27"
+        },
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-qpq4-pw7f-pp8w",
+      "cve_ids": [
+        "CVE-2026-25054"
+      ],
+      "summary": "n8n Has Stored Cross-site Scripting via Markdown Rendering in Workflow UI",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.2.1"
+        },
+        {
+          "introduced": "0",
+          "fixed": "1.123.9"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-r9xw-p7wj-w792",
+      "cve_ids": [
+        "CVE-2023-27564"
+      ],
+      "summary": "n8n Information Disclosure vulnerability",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "0.216.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-v364-rw7m-3263",
+      "cve_ids": [
+        "CVE-2026-21877"
+      ],
+      "summary": "n8n Vulnerable to RCE via Arbitrary File Write",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0.123.0",
+          "fixed": "1.121.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-v4pr-fm98-w9pg",
+      "cve_ids": [
+        "CVE-2026-21858"
+      ],
+      "summary": "n8n Vulnerable to Unauthenticated File Access via Improper Webhook Request Handling",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.65.0",
+          "fixed": "1.121.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-v98v-ff95-f3cp",
+      "cve_ids": [
+        "CVE-2025-68613"
+      ],
+      "summary": "n8n Vulnerable to Remote Code Execution via Expression Injection",
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "0.211.0",
+          "fixed": "1.120.4"
+        },
+        {
+          "introduced": "1.121.0",
+          "fixed": "1.121.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-vpcf-gvg4-6qwr",
+      "cve_ids": [
+        "CVE-2026-27577"
+      ],
+      "summary": "n8n: Expression Sandbox Escape Leads to RCE",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-vpgc-2f6g-7w7x",
+      "cve_ids": [
+        "CVE-2026-33720"
+      ],
+      "summary": "n8n Has Authorization Bypass in OAuth Callback via N8N_SKIP_AUTH_ON_OAUTH_CALLBACK",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "2.8.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-w83q-mcmx-mh42",
+      "cve_ids": [
+        "CVE-2026-33751"
+      ],
+      "summary": "n8n Vulnerable to LDAP Filter Injection in LDAP Node",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.27"
+        },
+        {
+          "introduced": "2.14.0",
+          "fixed": "2.14.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.13.3"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-w96v-gf22-crwp",
+      "cve_ids": [
+        "CVE-2025-68949"
+      ],
+      "summary": "n8n: Webhook Node IP Whitelist Bypass via Partial String Matching",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "1.36.0",
+          "fixed": "2.2.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-wpqc-h9wp-chmq",
+      "cve_ids": [
+        "CVE-2025-65964"
+      ],
+      "summary": "n8n vulnerable to Remote Code Execution via Git Node Custom Pre-Commit Hook",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0.123.1",
+          "fixed": "1.119.2"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-wxx7-mcgf-j869",
+      "cve_ids": [
+        "CVE-2026-27497"
+      ],
+      "summary": "n8n has Potential Remote Code Execution via Merge Node",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.9.3"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-x2mw-7j39-93xq",
+      "cve_ids": [
+        "CVE-2026-27498"
+      ],
+      "summary": "n8n has Arbitrary Command Execution via File Write and Git Operations",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.8"
+        },
+        {
+          "introduced": "2.0.0",
+          "fixed": "2.2.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-xgp7-7qjq-vg47",
+      "cve_ids": [
+        "CVE-2025-62726"
+      ],
+      "summary": "n8n Vulnerable to Remote Code Execution via Git Node Pre-Commit Hook",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.113.0"
+        }
+      ]
+    },
+    {
+      "advisory_id": "GHSA-xvh5-5qg4-x9qp",
+      "cve_ids": [
+        "CVE-2026-27496"
+      ],
+      "summary": "n8n has In-Process Memory Disclosure in its Task Runner",
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.123.22"
+        },
+        {
+          "introduced": "2.10.0",
+          "fixed": "2.10.1"
+        },
+        {
+          "introduced": "2.0.0-rc.0",
+          "fixed": "2.9.3"
+        }
+      ]
+    }
+  ],
+  "AppsmithPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2024-55965",
+      "cve_ids": [
+        "CVE-2024-55965"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.51"
+        }
+      ],
+      "summary": "Appsmith viewers can access workspace development datasource information before 1.51."
+    }
+  ],
+  "BitbucketPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2022-36804",
+      "cve_ids": [
+        "CVE-2022-36804"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "7.0.0",
+          "last_affected": "8.3.0"
+        }
+      ],
+      "summary": "Bitbucket Server and Data Center command injection affected the 7.0.0 through 8.3.0 line."
+    }
+  ],
+  "CalcomPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2025-66489",
+      "cve_ids": [
+        "CVE-2025-66489"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "last_affected": "5.9.7"
+        }
+      ],
+      "summary": "Cal.com authentication bypass via bad TOTP and password checks prior to 5.9.8."
+    }
+  ],
+  "ConfluenceVersionIssue": [
+    {
+      "advisory_id": "MANUAL-CVE-2023-22515",
+      "cve_ids": [
+        "CVE-2023-22515"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "8.0.0",
+          "fixed": "8.3.3"
+        },
+        {
+          "introduced": "8.4.0",
+          "fixed": "8.4.3"
+        },
+        {
+          "introduced": "8.5.0",
+          "fixed": "8.5.2"
+        }
+      ],
+      "summary": "Confluence admin account creation flaw affecting 8.0.0 through 8.5.1 on the listed branches."
+    }
+  ],
+  "GitlabPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2023-7028",
+      "cve_ids": [
+        "CVE-2023-7028"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "16.1.0",
+          "fixed": "16.1.6"
+        },
+        {
+          "introduced": "16.2.0",
+          "fixed": "16.2.9"
+        },
+        {
+          "introduced": "16.3.0",
+          "fixed": "16.3.7"
+        },
+        {
+          "introduced": "16.4.0",
+          "fixed": "16.4.5"
+        },
+        {
+          "introduced": "16.5.0",
+          "fixed": "16.5.6"
+        },
+        {
+          "introduced": "16.6.0",
+          "fixed": "16.6.4"
+        },
+        {
+          "introduced": "16.7.0",
+          "fixed": "16.7.2"
+        }
+      ],
+      "summary": "GitLab password reset account takeover issue on 16.1.0 through 16.7.1 across the listed trains."
+    }
+  ],
+  "JiraPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2021-26086",
+      "cve_ids": [
+        "CVE-2021-26086"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "8.5.14"
+        },
+        {
+          "introduced": "8.6.0",
+          "fixed": "8.13.6"
+        },
+        {
+          "introduced": "8.14.0",
+          "fixed": "8.16.1"
+        }
+      ],
+      "summary": "Jira Server and Data Center path traversal affecting the listed release trains prior to their fixed versions."
+    }
+  ],
+  "MetabaseHttpPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2026-22805",
+      "cve_ids": [
+        "CVE-2026-22805"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "0.55.13"
+        },
+        {
+          "introduced": "0.56.0",
+          "fixed": "0.56.3"
+        },
+        {
+          "introduced": "0.57.0",
+          "fixed": "0.57.1"
+        }
+      ],
+      "summary": "Metabase SSRF-style issue affecting the listed 55.x, 56.x, and 57.0 builds before their patch levels."
+    }
+  ],
+  "SharePoint202501": [
+    {
+      "advisory_id": "MANUAL-SharePoint-2025-01",
+      "cve_ids": [
+        "CVE-2025-21344",
+        "CVE-2025-21348",
+        "CVE-2025-21393"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "16.0.17928.20356"
+        }
+      ],
+      "summary": "SharePoint January 2025 security-update baseline before build 16.0.17928.20356."
+    }
+  ],
+  "SharePoint202502": [
+    {
+      "advisory_id": "MANUAL-CVE-2025-21400",
+      "cve_ids": [
+        "CVE-2025-21400"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "16.0.17928.20396"
+        }
+      ],
+      "summary": "SharePoint February 2025 remote code execution issue before build 16.0.17928.20396."
+    }
+  ],
+  "SharePointPlugin": [
+    {
+      "advisory_id": "MANUAL-SharePoint-ToolShell",
+      "cve_ids": [
+        "CVE-2025-49704",
+        "CVE-2025-49706",
+        "CVE-2025-53770",
+        "CVE-2025-53771"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "16.0.18526.20508"
+        }
+      ],
+      "summary": "SharePoint ToolShell chain and bypasses before the July 21 2025 16.0.18526.20508 security build."
+    }
+  ],
+  "TeamCityPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2024-27198",
+      "cve_ids": [
+        "CVE-2024-27198"
+      ],
+      "kev_matched": true,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "2023.11.4"
+        }
+      ],
+      "summary": "TeamCity on-premises authentication bypass affecting all versions through 2023.11.3."
+    }
+  ],
+  "WazuhPlugin": [
+    {
+      "advisory_id": "MANUAL-CVE-2025-24016",
+      "cve_ids": [
+        "CVE-2025-24016"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "4.4.0",
+          "fixed": "4.9.1"
+        }
+      ],
+      "summary": "Wazuh unsafe deserialization remote code execution affecting 4.4.0 through 4.9.0."
+    }
+  ],
+  "ZoneMinderPlugin": [
+    {
+      "advisory_id": "MANUAL-ZoneMinder-2023-Batch",
+      "cve_ids": [
+        "CVE-2023-25825",
+        "CVE-2023-26032",
+        "CVE-2023-26034",
+        "CVE-2023-26035",
+        "CVE-2023-26036",
+        "CVE-2023-26037",
+        "CVE-2023-26039"
+      ],
+      "kev_matched": false,
+      "affected_ranges": [
+        {
+          "introduced": "0",
+          "fixed": "1.36.33"
+        }
+      ],
+      "summary": "ZoneMinder 2023 vulnerability batch affecting versions before 1.36.33."
+    }
+  ]
+}

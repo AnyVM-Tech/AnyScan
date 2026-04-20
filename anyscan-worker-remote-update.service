@@ -1,0 +1,16 @@
+[Unit]
+Description=Remote Agent Self Update
+After=network-online.target agentd-tunnel.service
+Wants=network-online.target agentd-tunnel.service
+ConditionPathExists=/var/lib/agentd/remote-update.request
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+EnvironmentFile=-/etc/agentd/runtime.env
+ExecStart=/opt/agentd/bin/agentd-remote-update.sh
+TimeoutStartSec=20min
+NoNewPrivileges=true
+PrivateTmp=true
+

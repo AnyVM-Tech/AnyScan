@@ -1,0 +1,3587 @@
+[
+  {
+    "plugin_id": "AdbPlugin",
+    "display_name": "Android Debug Bridge - Unauthenticated Access",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "AirflowPlugin",
+    "display_name": "Apache Airflow with default credentials",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "AjpPlugin",
+    "display_name": "Apache JServ Protocol (AJP) Connector Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ApacheActiveMQ",
+    "display_name": "Apache ActiveMQ is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ApacheOFBizPlugin",
+    "display_name": "Apache OFBiz is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ApacheStatusPlugin",
+    "display_name": "Apache server-status page is publicly available",
+    "leakix_label": "public",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "AppsmithPlugin",
+    "display_name": "Appsmith with Known Vulnerabilities",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ArangoDBOpenPlugin",
+    "display_name": "ArangoDB Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "AttuPlugin",
+    "display_name": "Attu (Milvus GUI) Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "BeyondTrustRSPlugin",
+    "display_name": "BeyondTrust Remote Support / Privileged Remote Access - Known Vulnerabilities",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "BitbucketPlugin",
+    "display_name": "BitBucket instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "BrowserlessPlugin",
+    "display_name": "Browserless - Unauthenticated Headless Chrome (SSRF + LFI)",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CAdvisorPlugin",
+    "display_name": "cAdvisor exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CalcomPlugin",
+    "display_name": "Cal.com with Known Vulnerabilities",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CassandraOpenPlugin",
+    "display_name": "Exposed Apache Cassandra (Thrift API)",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CentosWebPanelPlugin",
+    "display_name": "CentOS Web Panel outdated",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CheckMkPlugin",
+    "display_name": "CheckMK monitoring endpoint publicly available",
+    "leakix_label": "public",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CheckpointGwPlugin",
+    "display_name": "Check Point Gateway is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ChromaPlugin",
+    "display_name": "Chroma Vector Database Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ChromeDevToolsPlugin",
+    "display_name": "Chrome DevTools Protocol - Exposed Debug Port",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CiscoASAPlugin",
+    "display_name": "Cisco ASA appliance outdated",
+    "leakix_label": "public",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CiscoRV",
+    "display_name": "Cisco RV hardware outdated",
+    "leakix_label": "public",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CiscoSDWANPlugin",
+    "display_name": "Cisco SD-WAN (vManage) - Vulnerable Instance",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CitrixADCPlugin",
+    "display_name": "Citrix ADC appliance is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ClickHousePlugin",
+    "display_name": "ClickHouse database exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CloudPanelPlugin",
+    "display_name": "CloudPanel is outdated",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CockroachDBPlugin",
+    "display_name": "CockroachDB Console Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ComfyUIPlugin",
+    "display_name": "ComfyUI with Known Vulnerabilities",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ConfigJsonHttp",
+    "display_name": "A JSON configuration file has been found",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ConfluenceVersionIssue",
+    "display_name": "Confluence instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ConnectWiseScreenConnect",
+    "display_name": "ConnectWise ScreenConnect is vulnerable",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_version_correlation",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "Consul",
+    "display_name": "Consul server is public",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CouchDbOpenPlugin",
+    "display_name": "CouchDB instance is public",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CraftCMSPlugin",
+    "display_name": "Craft CMS is vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "bundled_detector_pack",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CrateDBPlugin",
+    "display_name": "CrateDB Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CrushFTPPlugin",
+    "display_name": "CrushFTP service outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "CyberPanelPlugin",
+    "display_name": "CyberPanel is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DagsterPlugin",
+    "display_name": "Dagster Data Orchestration Platform Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DeadMon",
+    "display_name": "NAS has been infected by DeadBolt",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DjangoPlugin",
+    "display_name": "Django debug mode exposed",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DNSPlugin",
+    "display_name": "DNS Zone Transfer (AXFR) allowed",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DockerAPIPlugin",
+    "display_name": "Docker API - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DockerRegistryHttpPlugin",
+    "display_name": "Docker registry is public",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DotDsStoreOpenPlugin",
+    "display_name": "MacOS file listing through .DS_Store file",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DotEnvConfigPlugin",
+    "display_name": "Dotenv file configuration is publicly accessible",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DotnetRemotingPlugin",
+    "display_name": ".NET Remoting TCP Channel Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "DruidPlugin",
+    "display_name": "Apache Druid exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ElasticSearchOpenPlugin",
+    "display_name": "ElasticSearch is publicly available",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "EpmdPlugin",
+    "display_name": "Erlang Port Mapper Daemon (EPMD) Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "EsxVersionPlugin",
+    "display_name": "ESXi hypervisor outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "EtcdOpenPlugin",
+    "display_name": "etcd Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ExchangeVersion",
+    "display_name": "Microsoft Exchange Server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "EzGED3Plugin",
+    "display_name": "EzGED3 is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FirebirdPlugin",
+    "display_name": "Firebird Database - Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FlaskPlugin",
+    "display_name": "Flask debug mode exposed",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FlinkPlugin",
+    "display_name": "Apache Flink dashboard exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FlowiseVersionPlugin",
+    "display_name": "Flowise instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "bundled_version_rule",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FortiGatePlugin",
+    "display_name": "FortiGate instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FortiOSPlugin",
+    "display_name": "FortiGate instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FortiWebPlugin",
+    "display_name": "FortiWeb instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FreePBXPlugin",
+    "display_name": "FreePBX instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "FreeSWITCHOpenPlugin",
+    "display_name": "FreeSWITCH Event Socket Exposed With Default Password",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GenericDvrPlugin",
+    "display_name": "Vulnerable Generic DVR",
+    "leakix_label": "public",
+    "family": "ot_ics_iot",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GeoserverRcePlugin",
+    "display_name": "GeoServer is vulnerable to RCE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GeoserverXxePlugin",
+    "display_name": "GeoServer is vulnerable to XXE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GitConfigHttpPlugin",
+    "display_name": "Git configuration and history exposed",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GitlabPlugin",
+    "display_name": "Gitlab instance looks outdated",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GladinetPlugin",
+    "display_name": "Gladinet CentreStack/Triofox is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GLPIVersionPlugin",
+    "display_name": "GLPI is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GoAnywhereMFT",
+    "display_name": "Exposed GoAnywhere MFT administration interface",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GoAnywhereMFT202501",
+    "display_name": "Exposed GoAnywhere MFT vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_version_correlation",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GrafanaOpenPlugin",
+    "display_name": "Grafana instance publicly available",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GraphQLIntrospectionPlugin",
+    "display_name": "GraphQL introspection is enabled.",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "GuacamolePlugin",
+    "display_name": "Apache Guacamole - Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "H2ConsolePlugin",
+    "display_name": "H2 Database Console Exposed with Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "H2TcpPlugin",
+    "display_name": "H2 Database TCP Server Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "HarborPlugin",
+    "display_name": "Harbor Container Registry",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "HdfsOpenPlugin",
+    "display_name": "Hadoop HDFS NameNode Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "HiSiliconDVR",
+    "display_name": "Vulnerable HiSilicon family DVR",
+    "leakix_label": "public",
+    "family": "ot_ics_iot",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "HttpNTLM",
+    "display_name": "Server accepting anonymous credentials",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "IceWarpPlugin",
+    "display_name": "IceWarp Mail Server - Vulnerable Version Detected",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ICTBroadcastRcePlugin",
+    "display_name": "ICTBroadcast is vulnerable to RCE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "InfluxDBPlugin",
+    "display_name": "InfluxDB Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "IOSEXPlugin",
+    "display_name": "Cisco IOS EX implant detected",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "IvantiConnectSecure",
+    "display_name": "Ivanti Connect Secure outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "IvantiEPMMPlugin",
+    "display_name": "Ivanti EPMM is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JdwpPlugin",
+    "display_name": "Java Debug Wire Protocol - Unauthenticated Remote Code Execution",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JenkinsOpenPlugin",
+    "display_name": "Jenkins is publicly available",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JenkinsVersionPlugin",
+    "display_name": "Jenkins service outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_version_correlation",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JiraPlugin",
+    "display_name": "Jira instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JunosJWebPlugin",
+    "display_name": "Juniper device is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "JupyterPlugin",
+    "display_name": "Jupyter Notebook/Lab exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "KafkaOpenPlugin",
+    "display_name": "Kafka instance is public",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "KerioControlPlugin",
+    "display_name": "Kerio Control vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "KestrelPlugin",
+    "display_name": "Kestrel is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "LangflowPlugin",
+    "display_name": "Langflow is vulnerable RCE",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "LaravelTelescopeHttpPlugin",
+    "display_name": "Laravel development panel enabled",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "LDAPPlugin",
+    "display_name": "LDAP Server with Anonymous Bind and Directory Enumeration",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "LiteLLMPlugin",
+    "display_name": "LiteLLM Proxy Exposed with Known Vulnerabilities",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "bundled_version_rule",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "LocalAIPlugin",
+    "display_name": "LocalAI Server Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "Log4JOpportunistic",
+    "display_name": "Server vulnerable to Log4J CVE-2021-44228",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MagentoXxePlugin",
+    "display_name": "Magento is vulnerable to XXE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MagicInfoPlugin",
+    "display_name": "MagicInfo CMS is vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MalwareHttpPlugin",
+    "display_name": "Unsolicited HTTP Response (Malware Indicator)",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MarqoPlugin",
+    "display_name": "Marqo Vector Search Engine Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MeilisearchPlugin",
+    "display_name": "Meilisearch Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MemcachedOpenPlugin",
+    "display_name": "Memcached Server Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MeshCentralPlugin",
+    "display_name": "MeshCentral - Open Account Registration",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MetabaseHttpPlugin",
+    "display_name": "Metabase is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MilvusPlugin",
+    "display_name": "Milvus Vector Database - Unauthenticated Management API",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MinioPlugin",
+    "display_name": "MinIO instance is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MirthPlugin",
+    "display_name": "Mirth Connect is out-dated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "bundled_detector_pack",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MitelMiCollabPlugin",
+    "display_name": "Mitel MiCollab is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MLflowPlugin",
+    "display_name": "MLflow Tracking Server Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MobileIronCorePlugin",
+    "display_name": "Ivanti MobileIron core is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MobileIronSentryPlugin",
+    "display_name": "Ivanti MobileIron Sentry is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ModbusPlugin",
+    "display_name": "Modbus TCP Controller - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "ot_ics_iot",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MongoBleedPlugin",
+    "display_name": "MongoBleed - Unauthenticated Memory Leak",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_scanner_adapter_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MongoExpressPlugin",
+    "display_name": "Mongo Express exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MongoOpenPlugin",
+    "display_name": "MongoDB is publicly available",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MonstaFtpVersionPlugin",
+    "display_name": "Monsta FTP is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MoodlePlugin",
+    "display_name": "Moodle is vulnerable",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "bundled_detector_pack",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MqttPlugin",
+    "display_name": "MQTT Broker - Unauthenticated Access",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "MysqlOpenPlugin",
+    "display_name": "MySQL is publicly available",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "N8nPlugin",
+    "display_name": "N8N instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NATSPlugin",
+    "display_name": "NATS Monitoring Interface Exposed",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NCentralPlugin",
+    "display_name": "N-able N-central is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "Neo4jBoltPlugin",
+    "display_name": "Neo4j Graph Database Exposed via Bolt Protocol",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "Neo4jOpenPlugin",
+    "display_name": "Neo4j Graph Database Exposed via HTTP API",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NetBoxPlugin",
+    "display_name": "NetBox DCIM/IPAM - Default API Token / Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NexusRepoPlugin",
+    "display_name": "Nexus Repository is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NFSOpenPlugin",
+    "display_name": "NFS - Unauthenticated Export Enumeration",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NginxUIPlugin",
+    "display_name": "Nginx UI - Unauthenticated Backup Download",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NodeREDPlugin",
+    "display_name": "Node-RED exposed without authentication - RCE possible",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NomadPlugin",
+    "display_name": "HashiCorp Nomad Exposed with ACL Disabled",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NoVncPlugin",
+    "display_name": "noVNC - Unauthenticated Remote Desktop Access",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "NsqAdminPlugin",
+    "display_name": "NSQ Admin Panel Exposed Without Authentication",
+    "leakix_label": "public",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "OllamaPlugin",
+    "display_name": "Ollama LLM Server Exposed Without Authentication",
+    "leakix_label": "public",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "OPCUAPlugin",
+    "display_name": "OPC UA Server - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "ot_ics_iot",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "OpenEdgePlugin",
+    "display_name": "OpenEdge is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_scanner_adapter_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "OracleEBSPlugin",
+    "display_name": "Oracle E-Business Suite is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PaloAltoPlugin",
+    "display_name": "Palo Alto firewall outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PaperCutPlugin",
+    "display_name": "PaperCut is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PhpCgiRcePlugin",
+    "display_name": "CGI executing PHP code",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PhpFpmPlugin",
+    "display_name": "PHP-FPM FastCGI Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PhpInfoHttpPlugin",
+    "display_name": "Found php information file",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PhpStdinPlugin",
+    "display_name": "Application executing PHP code",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PostgreSQLOpenPlugin",
+    "display_name": "PostgreSQL - Unauthenticated or Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PostgRESTPlugin",
+    "display_name": "PostgREST Database API Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PrefectPlugin",
+    "display_name": "Prefect Server Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PrestoPlugin",
+    "display_name": "Exposed Presto/Trino SQL Query Engine",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PrometheusPlugin",
+    "display_name": "Prometheus server is public",
+    "leakix_label": "public",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ProxyOpenPlugin",
+    "display_name": "Server accepting proxy connections",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PublicEnvPlugin",
+    "display_name": "NextJS/Vite variable environments is publicly accessible",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "PulseConnectPlugin",
+    "display_name": "Pulse Connect Secure outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "QdrantPlugin",
+    "display_name": "Qdrant Vector Database Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "QnapVersion",
+    "display_name": "QNAP NAS outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "QuestDBPlugin",
+    "display_name": "QuestDB Time-Series Database Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RabbitMQPlugin",
+    "display_name": "RabbitMQ management interface with default credentials",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RailsPlugin",
+    "display_name": "Ruby on Rails debug mode exposed",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RayDashboardPlugin",
+    "display_name": "Ray Dashboard Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ops_observability",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RdpPlugin",
+    "display_name": "RDP Server Without Network Level Authentication",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "React2ShellPlugin",
+    "display_name": "React/Next.js is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RedisCommanderPlugin",
+    "display_name": "Redis Commander exposed without authentication",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RedisOpenPlugin",
+    "display_name": "Redis instance is public",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RethinkDBPlugin",
+    "display_name": "RethinkDB Admin Console Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RiakPlugin",
+    "display_name": "Exposed Riak Database (Protocol Buffers API)",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RmiPlugin",
+    "display_name": "Java RMI Registry Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RsyncOpenPlugin",
+    "display_name": "Rsync Daemon - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "RustFSPlugin",
+    "display_name": "RustFS with Hardcoded gRPC Token",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "S7commPlugin",
+    "display_name": "Siemens S7 PLC - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "ot_ics_iot",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SAPNetWeaverPlugin",
+    "display_name": "SAP NetWeaver is vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "bundled_detector_pack",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SecurityTxtPlugin",
+    "display_name": "Expired security.txt detected",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SeleniumGridPlugin",
+    "display_name": "Selenium Grid - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SelenoidPlugin",
+    "display_name": "Selenoid - Unauthenticated Browser Automation Hub (RCE)",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SessionReaperPlugin",
+    "display_name": "Magento / Adobe Commerce is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SharePoint202501",
+    "display_name": "Microsoft SharePoint Server is backdoored",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SharePoint202502",
+    "display_name": "Microsoft SharePoint Server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SharePointPlugin",
+    "display_name": "Microsoft SharePoint Server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SmarterMailPlugin",
+    "display_name": "SmarterMail is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SmbPlugin",
+    "display_name": "Open SMB file sharing detected",
+    "leakix_label": "public",
+    "family": "infra_platform_data",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SolarWindsWHDPlugin",
+    "display_name": "SolarWinds Web Help Desk looks outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SolrOpenPlugin",
+    "display_name": "Solr administration is publicly available",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SolrVersionPlugin",
+    "display_name": "Solr instance is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_version_correlation",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SonarQubePlugin",
+    "display_name": "SonarQube instance is public",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SonicWallGMSPlugin",
+    "display_name": "SonicWall GMS oudated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SonicWallSMA202501",
+    "display_name": "SonicWall firewall oudated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SonicWallSMAPlugin",
+    "display_name": "SonicWall firewall oudated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SophosPlugin",
+    "display_name": "Sophos firewall outdated",
+    "leakix_label": "public",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SpipRcePlugin",
+    "display_name": "Spip is vulnerable RCE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SplashPlugin",
+    "display_name": "Splash JS Rendering Service - Unauthenticated Access",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SplunkPlugin",
+    "display_name": "Splunk Enterprise outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SpringBootActuatorPlugin",
+    "display_name": "Spring Boot sensitive actuators are publicly accessible",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SSHOpenPlugin",
+    "display_name": "SSH Service Detected",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SshRegresshionPlugin",
+    "display_name": "SSH is potenitally vulnerable",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SupersetPlugin",
+    "display_name": "Apache Superset - Default SECRET_KEY (CVE-2023-27524)",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SurrealDBPlugin",
+    "display_name": "SurrealDB with Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SwaggerUIPlugin",
+    "display_name": "Swagger API description is publicly available",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SymfonyProfilerPlugin",
+    "display_name": "Symfony developement panel enabled",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SymfonyVerbosePlugin",
+    "display_name": "Symfony error leaking informations",
+    "leakix_label": "public",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "SysAidPlugin",
+    "display_name": "SysAid instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "T3Plugin",
+    "display_name": "Oracle WebLogic T3 Protocol Exposed",
+    "leakix_label": "trusted_pro",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TacticalRMMPlugin",
+    "display_name": "Tactical RMM - Default Credentials",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TeamCityPlugin",
+    "display_name": "TeamCity Server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TelnetAuthBypassPlugin",
+    "display_name": "GNU Inetutils Telnet Authentication Bypass",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TiDBPlugin",
+    "display_name": "TiDB Status Server Exposed",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TikaPlugin",
+    "display_name": "Apache Tika is vulnerable XXE",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TraccarPlugin",
+    "display_name": "Traccar is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TraceAxdPlugin",
+    "display_name": "ASP.NET trace.axd Information Disclosure",
+    "leakix_label": "public",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TraversalHttpPlugin",
+    "display_name": "Detected HTTP traversal vulnerability",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TwonkyPlugin",
+    "display_name": "Twonky Server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "TypesensePlugin",
+    "display_name": "Typesense with Default API Key",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_scanner_adapter_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VBulletinPlugin",
+    "display_name": "VBulletin looks outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VCenterVersionPlugin",
+    "display_name": "VMWare vSphere/vCenter outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "veeaml9",
+    "display_name": "Veeam distribution service outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VeeamPlugin",
+    "display_name": "Veeam Backup & Recovery outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VespaPlugin",
+    "display_name": "Vespa Vector Search Engine Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ViciboxPlugin",
+    "display_name": "Vicidial Recordings exposure",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ViciboxVersionPlugin",
+    "display_name": "Vicibox outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VinChinBackupPlugin",
+    "display_name": "VinChin VMWare Backup exposed and vulnerable",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ViteJSPlugin",
+    "display_name": "Finds vulnerable Vite development environment",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VMWareCloudDirector",
+    "display_name": "VMWare Cloud Director exposed and vulnerable",
+    "leakix_label": "public",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VNCPlugin",
+    "display_name": "VNC Server Exposed Without Authentication",
+    "leakix_label": "public",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "VsCodeSFTPPlugin",
+    "display_name": "VSCode SFTP configuration exposed",
+    "leakix_label": "trusted_pro",
+    "family": "leakage_debug_config",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WatchGuardFireboxPlugin",
+    "display_name": "WatchGuard Firebox is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WazuhPlugin",
+    "display_name": "Wazuh is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WeaviatePlugin",
+    "display_name": "Weaviate Vector Database Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "ai_llm_vector",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WebDAVPlugin",
+    "display_name": "WebDAV Server Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WpUserEnumHttp",
+    "display_name": "Wordpress user enumeration",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "active_authorized",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": true,
+    "notes": "phase_1_active_authorized_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "WsFTPPlugin",
+    "display_name": "WS_FTP service is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "Wso2Plugin",
+    "display_name": "WSO2 product looks outdated",
+    "leakix_label": "public",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "XWikiPlugin",
+    "display_name": "XWiki is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "YarnOpenPlugin",
+    "display_name": "Hadoop YARN ResourceManager Exposed Without Authentication",
+    "leakix_label": "trusted_pro",
+    "family": "infra_platform_data",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "YiiDebugPlugin",
+    "display_name": "Yii developement panel enabled",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "passive_http",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_passive_http",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ZimbraPlugin",
+    "display_name": "Zimbra server is outdated",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ZitadelPlugin",
+    "display_name": "Zitadel instance outdated",
+    "leakix_label": "trusted_pro",
+    "family": "enterprise_web_apps",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ZoneMinderPlugin",
+    "display_name": "ZoneMinder - Unauthenticated Access / Vulnerable Version",
+    "leakix_label": "trusted_pro",
+    "family": "exposure_vulnerability_misc",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ZookeeperOpenPlugin",
+    "display_name": "Zookeeper server is public",
+    "leakix_label": "public",
+    "family": "databases_search",
+    "execution_mode": "authless_protocol",
+    "status": "implemented",
+    "implementation_source": "built_in",
+    "default_severity": "high",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_authless_protocol",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  },
+  {
+    "plugin_id": "ZyxelVersion",
+    "display_name": "Zyxel firewall outdated",
+    "leakix_label": "trusted_pro",
+    "family": "network_security_appliances",
+    "execution_mode": "version_correlation",
+    "status": "implemented",
+    "implementation_source": "external_reported",
+    "default_severity": "medium",
+    "requires_authorized_active_mode": false,
+    "notes": "phase_1_detector_pack_ready",
+    "references": [
+      "leakix_catalog_seed"
+    ]
+  }
+]

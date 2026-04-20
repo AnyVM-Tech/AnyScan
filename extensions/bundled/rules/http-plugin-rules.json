@@ -1,0 +1,696 @@
+[
+  {
+    "plugin_id": "BrowserlessPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "rce_surface",
+      "headless_browser"
+    ],
+    "summary": "Browserless - Unauthenticated Headless Chrome (SSRF + LFI) markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Browserless - Unauthenticated Headless Chrome (SSRF + LFI) markers were observed in a public response.",
+    "aliases": [
+      "browserless"
+    ],
+    "any_of_path_contains": [
+      "/json/version",
+      "/content",
+      "/download",
+      "/function",
+      "/pdf",
+      "/screenshot",
+      "/scrape",
+      "/unblock"
+    ],
+    "path_not_contains": [
+      "/docs",
+      "/blog",
+      "/changelog"
+    ],
+    "min_score": 2,
+    "product_name": "browserless"
+  },
+  {
+    "plugin_id": "CraftCMSPlugin",
+    "detector": "craftcms_exposed_panel",
+    "severity": "medium",
+    "confidence": "high",
+    "body_contains": [
+      "craft cms",
+      "craft\\\\web\\\\application"
+    ],
+    "product_name": "Craft CMS",
+    "redacted_value": "craftcms_exposed_panel",
+    "summary": "Craft CMS markers were observed in a public response.",
+    "evidence_template": "{product_name} panel markers were observed at {path}.",
+    "evidence": "Craft CMS panel markers were observed in a public response."
+  },
+  {
+    "plugin_id": "GeoserverRcePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "rce_surface"
+    ],
+    "summary": "GeoServer is vulnerable to RCE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "GeoServer is vulnerable to RCE markers were observed in a public response.",
+    "aliases": [
+      "geoserver"
+    ],
+    "any_of_path_contains": [
+      "/geoserver",
+      "/web/"
+    ],
+    "min_score": 2,
+    "product_name": "geoserver"
+  },
+  {
+    "plugin_id": "GeoserverXxePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "xxe_surface"
+    ],
+    "summary": "GeoServer is vulnerable to XXE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "GeoServer is vulnerable to XXE markers were observed in a public response.",
+    "aliases": [
+      "geoserver"
+    ],
+    "any_of_path_contains": [
+      "/geoserver",
+      "/web/"
+    ],
+    "min_score": 2,
+    "product_name": "geoserver"
+  },
+  {
+    "plugin_id": "GuacamolePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "enterprise_web",
+      "admin_panel",
+      "default_creds"
+    ],
+    "summary": "Apache Guacamole - Default Credentials markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Apache Guacamole - Default Credentials markers were observed in a public response.",
+    "aliases": [
+      "apache guacamole",
+      "guacamole"
+    ],
+    "any_of_path_contains": [
+      "/guacamole/",
+      "/api/tokens",
+      "/#/client/"
+    ],
+    "path_not_contains": [
+      "/documentation",
+      "/manual"
+    ],
+    "min_score": 2,
+    "product_name": "apache guacamole"
+  },
+  {
+    "plugin_id": "ICTBroadcastRcePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "ICTBroadcast is vulnerable to RCE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "ICTBroadcast is vulnerable to RCE markers were observed in a public response.",
+    "aliases": [
+      "ictbroadcast"
+    ],
+    "any_of_path_contains": [
+      "/ictbroadcast",
+      "/broadcast",
+      "/livecallcenter"
+    ],
+    "min_score": 2,
+    "product_name": "ictbroadcast"
+  },
+  {
+    "plugin_id": "LangflowPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "ai_llm",
+      "rce_surface"
+    ],
+    "summary": "Langflow is vulnerable RCE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Langflow is vulnerable RCE markers were observed in a public response.",
+    "aliases": [
+      "langflow"
+    ],
+    "any_of_path_contains": [
+      "/api/v1",
+      "/health",
+      "/login",
+      "/lf/"
+    ],
+    "path_not_contains": [
+      "/docs",
+      "/blog"
+    ],
+    "min_score": 2,
+    "product_name": "langflow"
+  },
+  {
+    "plugin_id": "Log4JOpportunistic",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "Log4J exploit markers were observed in a public response.",
+    "evidence_template": "Log4J exploit markers were observed in the response at {path}.",
+    "evidence": "Log4J exploit markers were observed in a public response.",
+    "aliases": [],
+    "detector": "log4j_opportunistic_marker",
+    "body_regex": "(?i)(?:\\$\\{jndi:(?:ldap|rmi|dns|nis|iiop):|log4shell|log4j)",
+    "product_name": "Log4JOpportunistic"
+  },
+  {
+    "plugin_id": "MagentoXxePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "xxe_surface"
+    ],
+    "summary": "Magento is vulnerable to XXE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Magento is vulnerable to XXE markers were observed in a public response.",
+    "aliases": [
+      "magento",
+      "adobe commerce"
+    ],
+    "any_of_path_contains": [
+      "/rest/",
+      "/graphql",
+      "/admin"
+    ],
+    "path_not_contains": [
+      "/docs",
+      "/developer"
+    ],
+    "min_score": 2,
+    "product_name": "magento"
+  },
+  {
+    "plugin_id": "MalwareHttpPlugin",
+    "severity": "medium",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http"
+    ],
+    "summary": "Suspicious malware/operator markers were observed in an unsolicited HTTP response.",
+    "evidence_template": "Suspicious malware/operator markers were observed in the response at {path}.",
+    "evidence": "Suspicious malware/operator markers were observed in an unsolicited HTTP response.",
+    "aliases": [],
+    "detector": "malware_http_indicator",
+    "body_regex": "(?i)(?:mirai|gafgyt|botnet|cobalt strike|sliver|metasploit|malware|webshell)",
+    "product_name": "MalwareHttpPlugin"
+  },
+  {
+    "plugin_id": "MeshCentralPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "registration_surface"
+    ],
+    "summary": "MeshCentral - Open Account Registration markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "MeshCentral - Open Account Registration markers were observed in a public response.",
+    "aliases": [
+      "meshcentral",
+      "mesh central"
+    ],
+    "any_of_path_contains": [
+      "/meshagents",
+      "/control.ashx",
+      "/agentinvite",
+      "/login"
+    ],
+    "min_score": 2,
+    "product_name": "meshcentral"
+  },
+  {
+    "plugin_id": "MirthPlugin",
+    "detector": "mirth_connect_exposed_panel",
+    "severity": "medium",
+    "confidence": "high",
+    "body_contains": [
+      "mirth connect",
+      "nextgen health care"
+    ],
+    "product_name": "Mirth Connect",
+    "redacted_value": "mirth_connect_exposed_panel",
+    "summary": "Mirth Connect markers were observed in a public response.",
+    "evidence_template": "{product_name} panel markers were observed at {path}.",
+    "evidence": "Mirth Connect panel markers were observed in a public response."
+  },
+  {
+    "plugin_id": "MoodlePlugin",
+    "detector": "moodle_exposed_panel",
+    "severity": "medium",
+    "confidence": "high",
+    "body_contains": [
+      "moodle",
+      "moodleform"
+    ],
+    "product_name": "Moodle",
+    "redacted_value": "moodle_exposed_panel",
+    "summary": "Moodle markers were observed in a public response.",
+    "evidence_template": "{product_name} application markers were observed at {path}.",
+    "evidence": "Moodle application markers were observed in a public response."
+  },
+  {
+    "plugin_id": "NetBoxPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "enterprise_web",
+      "admin_panel",
+      "api_token"
+    ],
+    "summary": "NetBox DCIM/IPAM - Default API Token / Default Credentials markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "NetBox DCIM/IPAM - Default API Token / Default Credentials markers were observed in a public response.",
+    "aliases": [
+      "netbox"
+    ],
+    "any_of_path_contains": [
+      "/api/status",
+      "/dcim/",
+      "/ipam/",
+      "/circuits/"
+    ],
+    "min_score": 2,
+    "product_name": "netbox"
+  },
+  {
+    "plugin_id": "NodeREDPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "rce_surface",
+      "admin_panel"
+    ],
+    "summary": "Node-RED exposed without authentication - RCE possible markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Node-RED exposed without authentication - RCE possible markers were observed in a public response.",
+    "aliases": [
+      "node-red",
+      "nodered"
+    ],
+    "any_of_path_contains": [
+      "/red/",
+      "/flows",
+      "/settings"
+    ],
+    "min_score": 2,
+    "product_name": "node-red"
+  },
+  {
+    "plugin_id": "PhpCgiRcePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "PHP CGI markers were observed in a potentially unsafe execution path.",
+    "evidence_template": "PHP CGI execution markers were observed at {path}.",
+    "evidence": "PHP CGI markers were observed in a potentially unsafe execution path.",
+    "aliases": [],
+    "detector": "php_cgi_rce_best_effort",
+    "body_regex": "(?i)(?:php[- ]cgi|cgi-bin/.+\\.php|php/[\\d.]+)",
+    "any_of_path_contains": [
+      "/cgi-bin/",
+      ".php"
+    ],
+    "product_name": "PhpCgiRcePlugin"
+  },
+  {
+    "plugin_id": "PhpStdinPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "PHP stdin/input execution markers were observed in a public response.",
+    "evidence_template": "PHP stdin/input execution markers were observed at {path}.",
+    "evidence": "PHP stdin/input execution markers were observed in a public response.",
+    "aliases": [],
+    "detector": "php_stdin_best_effort",
+    "body_regex": "(?i)(?:php://input|stdin|auto_prepend_file)",
+    "product_name": "PhpStdinPlugin"
+  },
+  {
+    "plugin_id": "RabbitMQPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "default_creds",
+      "admin_panel"
+    ],
+    "summary": "RabbitMQ management interface with default credentials markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "RabbitMQ management interface with default credentials markers were observed in a public response.",
+    "aliases": [
+      "rabbitmq management",
+      "rabbitmq"
+    ],
+    "any_of_path_contains": [
+      "/api/overview",
+      "/api/whoami",
+      "/api/nodes",
+      "/rabbitmq/"
+    ],
+    "min_score": 2,
+    "product_name": "rabbitmq management"
+  },
+  {
+    "plugin_id": "RustFSPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "RustFS with Hardcoded gRPC Token markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "RustFS with Hardcoded gRPC Token markers were observed in a public response.",
+    "aliases": [
+      "rustfs"
+    ],
+    "any_of_path_contains": [
+      "/minio/health",
+      "/rpc/",
+      "/console/"
+    ],
+    "min_score": 2,
+    "product_name": "rustfs"
+  },
+  {
+    "plugin_id": "SAPNetWeaverPlugin",
+    "detector": "sap_netweaver_exposed_panel",
+    "severity": "medium",
+    "confidence": "high",
+    "body_contains": [
+      "sap netweaver",
+      "sap enterprise portal"
+    ],
+    "product_name": "SAP NetWeaver",
+    "redacted_value": "sap_netweaver_exposed_panel",
+    "summary": "SAP NetWeaver markers were observed in a public response.",
+    "evidence_template": "{product_name} panel markers were observed at {path}.",
+    "evidence": "SAP NetWeaver panel markers were observed in a public response."
+  },
+  {
+    "plugin_id": "SelenoidPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "browser_automation",
+      "rce_surface"
+    ],
+    "summary": "Selenoid - Unauthenticated Browser Automation Hub (RCE) markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Selenoid - Unauthenticated Browser Automation Hub (RCE) markers were observed in a public response.",
+    "aliases": [
+      "selenoid"
+    ],
+    "any_of_path_contains": [
+      "/status",
+      "/wd/hub",
+      "/video/",
+      "/vnc/"
+    ],
+    "min_score": 2,
+    "product_name": "selenoid"
+  },
+  {
+    "plugin_id": "SpipRcePlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "Spip is vulnerable RCE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Spip is vulnerable RCE markers were observed in a public response.",
+    "aliases": [
+      "spip"
+    ],
+    "any_of_path_contains": [
+      "/spip.php",
+      "/ecrire/",
+      "/spip/"
+    ],
+    "min_score": 2,
+    "product_name": "spip"
+  },
+  {
+    "plugin_id": "SupersetPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "admin_panel",
+      "secret_key"
+    ],
+    "summary": "Apache Superset - Default SECRET_KEY (CVE-2023-27524) markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Apache Superset - Default SECRET_KEY (CVE-2023-27524) markers were observed in a public response.",
+    "aliases": [
+      "apache superset",
+      "superset"
+    ],
+    "any_of_path_contains": [
+      "/superset/welcome",
+      "/api/v1",
+      "/login/"
+    ],
+    "path_not_contains": [
+      "/docs",
+      "/faq"
+    ],
+    "min_score": 2,
+    "product_name": "apache superset"
+  },
+  {
+    "plugin_id": "SurrealDBPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "ai_llm"
+    ],
+    "summary": "SurrealDB with Default Credentials markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "SurrealDB with Default Credentials markers were observed in a public response.",
+    "aliases": [
+      "surrealdb",
+      "surreal db"
+    ],
+    "any_of_path_contains": [
+      "/health",
+      "/signin",
+      "/sql"
+    ],
+    "min_score": 2,
+    "product_name": "surrealdb"
+  },
+  {
+    "plugin_id": "TacticalRMMPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "Tactical RMM - Default Credentials markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Tactical RMM - Default Credentials markers were observed in a public response.",
+    "aliases": [
+      "tactical rmm",
+      "tacticalrmm"
+    ],
+    "any_of_path_contains": [
+      "/api/v3",
+      "/login",
+      "/mesh/"
+    ],
+    "min_score": 2,
+    "product_name": "tactical rmm"
+  },
+  {
+    "plugin_id": "TikaPlugin",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized"
+    ],
+    "summary": "Apache Tika is vulnerable XXE markers were observed in a public response.",
+    "evidence_template": "{product_name} markers were observed at {path}.",
+    "evidence": "Apache Tika is vulnerable XXE markers were observed in a public response.",
+    "aliases": [
+      "apache tika",
+      "tika"
+    ],
+    "any_of_path_contains": [
+      "/tika",
+      "/meta",
+      "/rmeta",
+      "/detect/stream"
+    ],
+    "min_score": 2,
+    "product_name": "apache tika"
+  },
+  {
+    "plugin_id": "TraversalHttpPlugin",
+    "severity": "high",
+    "confidence": "high",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "path_traversal"
+    ],
+    "summary": "Traversal markers were observed in a public HTTP response.",
+    "evidence_template": "Traversal response markers were observed at {path}.",
+    "evidence": "Traversal markers were observed in a public HTTP response.",
+    "aliases": [],
+    "detector": "traversal_http_best_effort",
+    "body_regex": "(?i)(?:root:.:0:0:|for 16-bit app support|\\[extensions\\]|boot loader|zone\\.transfer|<!doctype html public)",
+    "product_name": "TraversalHttpPlugin"
+  },
+  {
+    "plugin_id": "WpUserEnumHttp",
+    "severity": "high",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "active_authorized",
+      "enterprise_web",
+      "enumeration"
+    ],
+    "summary": "WordPress user enumeration markers were observed in a public response.",
+    "evidence_template": "WordPress user-enumeration markers were observed at {path}.",
+    "evidence": "WordPress user enumeration markers were observed in a public response.",
+    "aliases": [],
+    "detector": "wordpress_user_enumeration_best_effort",
+    "path_regex": "(?i)(?:/wp-json/wp/v2/users|[?&]author=\\d+)",
+    "body_regex": "(?i)\"slug\"\\s*:\\s*\"[^\"]+\"",
+    "product_name": "WpUserEnumHttp"
+  }
+]

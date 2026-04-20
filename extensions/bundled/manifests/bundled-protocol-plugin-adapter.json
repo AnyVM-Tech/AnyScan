@@ -1,0 +1,15 @@
+{
+  "name": "bundled-protocol-plugin-adapter",
+  "version": "0.1.0",
+  "kind": "scanner_adapter",
+  "enabled": false,
+  "description": "Bundled protocol plugin adapter scaffold. Disabled by default to avoid replacing primary port-scan adapters until explicitly configured.",
+  "command": "../scripts/bundled-protocol-plugin-adapter.py",
+  "args": [],
+  "tags": [
+    "bundled",
+    "protocol",
+    "plugins"
+  ],
+  "output_format": "json_lines"
+}
