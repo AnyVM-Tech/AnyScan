@@ -8503,7 +8503,8 @@
 			syncActiveAuthorizedGateUi();
 			ensureSession();
 
-			// Mobile section-nav toggle. Layout-only — no API calls.
+			// Mobile section-nav toggle + sticky-header height tracking.
+			// Layout-only — no API calls.
 			(() => {
 				const appbar = document.getElementById('appbar');
 				const toggle = document.getElementById('appbar-nav-toggle');
@@ -8532,6 +8533,30 @@
 						toggle.focus();
 					}
 				});
+
+				// Keep --appbar-height in sync with the actual rendered height
+				// so scroll-padding-top / scroll-margin-top on anchor targets
+				// land below the appbar even when responsive rules wrap the
+				// nav/status onto extra rows. The CSS fallback (64px) applies
+				// while the appbar is still hidden (pre-auth).
+				const root = document.documentElement;
+				const updateAppbarHeight = () => {
+					const h = Math.round(
+						appbar.getBoundingClientRect().height
+					);
+					if (h > 0) {
+						root.style.setProperty(
+							'--appbar-height',
+							h + 'px'
+						);
+					}
+				};
+				updateAppbarHeight();
+				if (typeof ResizeObserver !== 'undefined') {
+					new ResizeObserver(updateAppbarHeight).observe(appbar);
+				} else {
+					window.addEventListener('resize', updateAppbarHeight);
+				}
 			})();
 		</script>
 	</body>
