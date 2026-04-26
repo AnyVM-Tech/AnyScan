@@ -79,7 +79,7 @@
 				color: var(--text);
 			}
 
-			:focus {
+			:focus:not(:focus-visible) {
 				outline: none;
 			}
 
@@ -856,21 +856,26 @@
 			}
 
 			/* Connection-state pill displayed in the appbar — gives operators
-			   a persistent at-a-glance signal of API/event-stream status. */
-			.appbar__session span {
-				display: inline-flex;
-				align-items: center;
-				gap: 6px;
+			   a persistent at-a-glance signal of API/event-stream status.
+			   Uses an absolutely-positioned dot + padding-left so the parent
+			   span retains text-overflow: ellipsis truncation for long
+			   status strings. */
+			#connection-state {
+				position: relative;
+				padding-left: 14px;
 			}
 
-			.appbar__session span::before {
+			#connection-state::before {
 				content: '';
+				position: absolute;
+				left: 0;
+				top: 50%;
 				width: 8px;
 				height: 8px;
+				margin-top: -4px;
 				border-radius: 50%;
 				background: var(--accent);
 				box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.18);
-				flex-shrink: 0;
 			}
 
 			/* Empty-state visual lift */
@@ -1123,6 +1128,8 @@
 				</p>
 			</header>
 
+			<div id="main-content" tabindex="-1"></div>
+
 			<section id="auth-card" class="card auth-card">
 				<h2>Sign in</h2>
 				<form id="login-form">
@@ -1214,8 +1221,6 @@
 						</div>
 					</div>
 				</header>
-
-				<div id="main-content" tabindex="-1"></div>
 
 				<h2 class="section-group-heading" id="section-overview">
 					<span>Overview</span>
