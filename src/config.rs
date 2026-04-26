@@ -473,6 +473,18 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "client-configs",
     "legacy-configs",
     "backup-configs",
+    "tech-spring-actuator",
+    "tech-php-admin",
+    "tech-wordpress",
+    "tech-jenkins",
+    "tech-gitlab",
+    "tech-confluence-jira",
+    "tech-rails-django",
+    "tech-laravel",
+    "tech-tomcat-iis",
+    "vcs-and-ide-leaks",
+    "container-registry",
+    "extended-debug-endpoints",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -672,6 +684,226 @@ const BACKUP_CONFIG_PATHS: &[&str] = &[
     "/config.yml.bak",
     "/application.yml.bak",
     "/settings.json.bak",
+];
+
+const TECH_SPRING_ACTUATOR_PATHS: &[&str] = &[
+    "/actuator",
+    "/actuator/",
+    "/actuator/env",
+    "/actuator/configprops",
+    "/actuator/heapdump",
+    "/actuator/threaddump",
+    "/actuator/beans",
+    "/actuator/mappings",
+    "/actuator/metrics",
+    "/actuator/info",
+    "/actuator/loggers",
+    "/actuator/auditevents",
+    "/actuator/httptrace",
+    "/actuator/jolokia",
+    "/actuator/jolokia/list",
+    "/actuator/gateway/routes",
+    "/jolokia",
+    "/jolokia/list",
+    "/env",
+    "/heapdump",
+    "/threaddump",
+    "/configprops",
+    "/dump",
+    "/trace",
+];
+
+const TECH_PHP_ADMIN_PATHS: &[&str] = &[
+    "/phpmyadmin/",
+    "/phpmyadmin/index.php",
+    "/phpmyadmin/setup/index.php",
+    "/pma/",
+    "/pma/index.php",
+    "/myadmin/",
+    "/dbadmin/",
+    "/adminer.php",
+    "/adminer/",
+    "/info.php",
+    "/phpinfo.php",
+    "/server-info.php",
+];
+
+const TECH_WORDPRESS_PATHS: &[&str] = &[
+    "/wp-login.php",
+    "/wp-admin/",
+    "/wp-admin/install.php",
+    "/wp-admin/setup-config.php",
+    "/wp-config.php",
+    "/wp-config.php.bak",
+    "/wp-config.php.save",
+    "/wp-config.php~",
+    "/xmlrpc.php",
+    "/wp-cron.php",
+    "/wp-json/",
+    "/wp-json/wp/v2/users",
+    "/wp-content/debug.log",
+    "/wp-content/backup-db/",
+    "/?author=1",
+    "/readme.html",
+];
+
+const TECH_JENKINS_PATHS: &[&str] = &[
+    "/login",
+    "/manage",
+    "/script",
+    "/scriptText",
+    "/asynchPeople/",
+    "/computer/",
+    "/credentials/",
+    "/api/json",
+    "/api/json?pretty=true",
+    "/whoAmI/",
+    "/people/",
+    "/cli",
+    "/configureSecurity/",
+    "/jenkins/login",
+    "/jenkins/script",
+];
+
+const TECH_GITLAB_PATHS: &[&str] = &[
+    "/users/sign_in",
+    "/admin",
+    "/admin/sidekiq",
+    "/api/v4/version",
+    "/api/v4/projects",
+    "/api/v4/users",
+    "/api/v4/runners",
+    "/api/v4/internal/",
+    "/api/v4/metadata",
+    "/-/metrics",
+    "/-/health",
+    "/-/readiness",
+    "/-/liveness",
+];
+
+const TECH_CONFLUENCE_JIRA_PATHS: &[&str] = &[
+    "/login.action",
+    "/dologin.action",
+    "/admin/users/browseusers.action",
+    "/admin/license.action",
+    "/setup/setupserver.action",
+    "/wiki/login.action",
+    "/login.jsp",
+    "/secure/Dashboard.jspa",
+    "/secure/admin/ViewLicense.jspa",
+    "/secure/admin/user/UserBrowser.jspa",
+    "/rest/api/2/serverInfo",
+    "/rest/api/3/serverInfo",
+    "/rest/auth/1/session",
+    "/rest/api/2/dashboard",
+];
+
+const TECH_RAILS_DJANGO_PATHS: &[&str] = &[
+    "/rails/info/properties",
+    "/rails/info/routes",
+    "/rails/info",
+    "/rails/db/",
+    "/sidekiq",
+    "/admin/sidekiq",
+    "/resque/",
+    "/resque/overview",
+    "/blazer",
+    "/active_admin/",
+    "/__debug__/",
+    "/admin/",
+    "/admin/login/",
+    "/admin/auth/user/",
+    "/silk/",
+];
+
+const TECH_LARAVEL_PATHS: &[&str] = &[
+    "/.env",
+    "/.env.example",
+    "/.env.backup",
+    "/.env.production",
+    "/.env.dev",
+    "/.env.local",
+    "/storage/logs/laravel.log",
+    "/_ignition/health-check",
+    "/_ignition/execute-solution",
+    "/_debugbar/open",
+    "/telescope/",
+    "/horizon/",
+    "/horizon/api/jobs",
+    "/index.php?REBEL=MEOW",
+];
+
+const TECH_TOMCAT_IIS_PATHS: &[&str] = &[
+    "/manager/html",
+    "/manager/status",
+    "/manager/text",
+    "/manager/jmxproxy",
+    "/host-manager/html",
+    "/host-manager/text",
+    "/examples/servlets/",
+    "/Trace.axd",
+    "/elmah.axd",
+    "/web.config",
+    "/web.config.bak",
+    "/global.asax",
+    "/iisstart.htm",
+];
+
+const VCS_AND_IDE_LEAK_PATHS: &[&str] = &[
+    "/.git/HEAD",
+    "/.git/config",
+    "/.git/index",
+    "/.git/logs/HEAD",
+    "/.git/refs/heads/main",
+    "/.git/refs/heads/master",
+    "/.git/packed-refs",
+    "/.svn/entries",
+    "/.svn/wc.db",
+    "/.hg/store/00manifest.i",
+    "/.bzr/branch/last-revision",
+    "/.DS_Store",
+    "/.idea/workspace.xml",
+    "/.idea/modules.xml",
+    "/.idea/vcs.xml",
+    "/.vscode/sftp.json",
+    "/.vscode/launch.json",
+    "/.vscode/settings.json",
+];
+
+const CONTAINER_REGISTRY_PATHS: &[&str] = &[
+    "/v2/",
+    "/v2/_catalog",
+    "/v2/_catalog?n=10000",
+    "/info",
+    "/version",
+    "/containers/json",
+    "/images/json",
+    "/networks",
+    "/volumes",
+    "/services",
+    "/secrets",
+];
+
+const EXTENDED_DEBUG_ENDPOINT_PATHS: &[&str] = &[
+    "/debug/pprof/",
+    "/debug/pprof/heap",
+    "/debug/pprof/profile",
+    "/debug/pprof/goroutine",
+    "/debug/pprof/cmdline",
+    "/debug/pprof/trace",
+    "/debug/vars",
+    "/debug/requests",
+    "/debug/events",
+    "/__debug__/",
+    "/jmx-console/",
+    "/jmx",
+    "/management/",
+    "/_status",
+    "/_status/details",
+    "/_health",
+    "/_metrics",
+    "/__profiler__/",
+    "/_cat/",
 ];
 
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
@@ -1204,6 +1436,18 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "client-configs" => Some(CLIENT_CONFIG_PATHS),
         "legacy-configs" => Some(LEGACY_CONFIG_PATHS),
         "backup-configs" => Some(BACKUP_CONFIG_PATHS),
+        "tech-spring-actuator" => Some(TECH_SPRING_ACTUATOR_PATHS),
+        "tech-php-admin" => Some(TECH_PHP_ADMIN_PATHS),
+        "tech-wordpress" => Some(TECH_WORDPRESS_PATHS),
+        "tech-jenkins" => Some(TECH_JENKINS_PATHS),
+        "tech-gitlab" => Some(TECH_GITLAB_PATHS),
+        "tech-confluence-jira" => Some(TECH_CONFLUENCE_JIRA_PATHS),
+        "tech-rails-django" => Some(TECH_RAILS_DJANGO_PATHS),
+        "tech-laravel" => Some(TECH_LARAVEL_PATHS),
+        "tech-tomcat-iis" => Some(TECH_TOMCAT_IIS_PATHS),
+        "vcs-and-ide-leaks" => Some(VCS_AND_IDE_LEAK_PATHS),
+        "container-registry" => Some(CONTAINER_REGISTRY_PATHS),
+        "extended-debug-endpoints" => Some(EXTENDED_DEBUG_ENDPOINT_PATHS),
         _ => None,
     }
 }
@@ -3466,6 +3710,45 @@ mod tests {
             .expect("framework leak paths should resolve");
         assert!(paths.contains(&"/@fs//proc/self/environ?raw".to_string()));
         assert!(paths.contains(&"/@fs/..%2f..%2f..%2f..%2f.env?raw".to_string()));
+    }
+
+    #[test]
+    fn tech_path_profiles_expand_curated_wordlists() {
+        let mut config = AppConfig::default();
+        config.inventory.path_profiles = vec![
+            "tech-spring-actuator".to_string(),
+            "tech-wordpress".to_string(),
+            "tech-jenkins".to_string(),
+            "tech-laravel".to_string(),
+            "vcs-and-ide-leaks".to_string(),
+            "extended-debug-endpoints".to_string(),
+            "container-registry".to_string(),
+        ];
+        config.inventory.default_paths.clear();
+        config
+            .validate()
+            .expect("tech path profiles should validate");
+
+        let paths = config
+            .resolved_default_paths()
+            .expect("tech path profiles should resolve");
+
+        assert!(paths.contains(&"/actuator/heapdump".to_string()));
+        assert!(paths.contains(&"/actuator/jolokia".to_string()));
+        assert!(paths.contains(&"/jolokia/list".to_string()));
+        assert!(paths.contains(&"/wp-login.php".to_string()));
+        assert!(paths.contains(&"/wp-json/wp/v2/users".to_string()));
+        assert!(paths.contains(&"/script".to_string()));
+        assert!(paths.contains(&"/scriptText".to_string()));
+        assert!(paths.contains(&"/_ignition/execute-solution".to_string()));
+        assert!(paths.contains(&"/telescope/".to_string()));
+        assert!(paths.contains(&"/.git/HEAD".to_string()));
+        assert!(paths.contains(&"/.svn/entries".to_string()));
+        assert!(paths.contains(&"/.DS_Store".to_string()));
+        assert!(paths.contains(&"/.idea/workspace.xml".to_string()));
+        assert!(paths.contains(&"/debug/pprof/".to_string()));
+        assert!(paths.contains(&"/debug/vars".to_string()));
+        assert!(paths.contains(&"/v2/_catalog".to_string()));
     }
 
     #[test]
