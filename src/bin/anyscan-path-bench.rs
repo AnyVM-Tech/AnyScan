@@ -98,10 +98,17 @@ fn main() -> Result<()> {
 /// Raise `RLIMIT_NOFILE` to `1<<20` (1,048,576) on Unix. No-op on Windows
 /// (which has no equivalent) so the bench still builds cross-platform.
 ///
-/// Returns `(cur, max)` after the call. `(0, 0)` means we couldn't query
-/// (Windows path or `getrlimit` failure) so the caller can suppress the log.
+/// Returns `(cur, max)` after the call as `(u64, u64)` so `main()` doesn't
+/// need its own cfg cascade. `libc::rlim_t` is `u64` on most modern Unix
+/// targets but `u32` on some 32-bit ones; we cast unconditionally so the
+/// signature stays portable. `(0, 0)` means we couldn't query (Windows path
+/// or `getrlimit` failure) so the caller can suppress the log.
+// `libc::rlim_t` is `u64` on 64-bit Unix targets but `u32` on some 32-bit
+// ones; the casts below are no-ops on the former and load-bearing on the
+// latter. Suppress the lint here so the function compiles cleanly on both.
 #[cfg(unix)]
-fn raise_fd_limit() -> (libc::rlim_t, libc::rlim_t) {
+#[allow(clippy::unnecessary_cast)]
+fn raise_fd_limit() -> (u64, u64) {
     const TARGET: libc::rlim_t = 1 << 20;
     let mut current = libc::rlimit {
         rlim_cur: 0,
@@ -128,7 +135,7 @@ fn raise_fd_limit() -> (libc::rlim_t, libc::rlim_t) {
             std::io::Error::last_os_error(),
             current.rlim_cur
         );
-        return (current.rlim_cur, current.rlim_max);
+        return (current.rlim_cur as u64, current.rlim_max as u64);
     }
     let mut after = libc::rlimit {
         rlim_cur: 0,
@@ -137,7 +144,7 @@ fn raise_fd_limit() -> (libc::rlim_t, libc::rlim_t) {
     unsafe {
         let _ = libc::getrlimit(libc::RLIMIT_NOFILE, &mut after);
     }
-    (after.rlim_cur, after.rlim_max)
+    (after.rlim_cur as u64, after.rlim_max as u64)
 }
 
 #[cfg(not(unix))]
@@ -145,16 +152,6 @@ fn raise_fd_limit() -> (u64, u64) {
     // Windows has no RLIMIT_NOFILE; the default per-process handle limit is
     // already in the millions. Nothing to do, and we suppress the log.
     (0, 0)
-}
-
-/// Mirror the unix return type so `main()` doesn't need its own cfg cascade
-/// to read the values back. On unix `libc::rlim_t` is `u64` on every target
-/// triple cargo currently builds for, so the comparison `cur > 0` works
-/// uniformly.
-#[allow(dead_code)]
-fn _assert_rlim_is_u64() {
-    #[cfg(unix)]
-    let _: libc::rlim_t = 0u64;
 }
 
 #[derive(Debug, Default)]

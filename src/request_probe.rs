@@ -27,7 +27,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -149,6 +149,11 @@ pub enum ProbeError {
     /// Returned for slots after `server_closed_early`.
     #[error("server closed connection before response {index}")]
     ServerClosedEarly { index: usize },
+    /// Returned for slots after a local write to the upstream connection
+    /// failed in sequential mode. The connection is unusable but the cause
+    /// is local (timeout / write error), not a server-signalled close.
+    #[error("request {index} aborted: prior write to upstream failed")]
+    WriteAborted { index: usize },
     #[error("per-connection time budget exhausted before response {index}")]
     BudgetExhausted { index: usize },
     #[error("response too large (header section exceeded {limit} bytes)")]
@@ -172,6 +177,7 @@ impl ProbeError {
             ProbeError::ConnectionReset => "connection_reset",
             ProbeError::MalformedResponse(_) => "malformed_response",
             ProbeError::ServerClosedEarly { .. } => "server_closed_early",
+            ProbeError::WriteAborted { .. } => "write_aborted",
             ProbeError::BudgetExhausted { .. } => "budget_exhausted",
             ProbeError::HeadersTooLarge { .. } => "headers_too_large",
         }
@@ -307,12 +313,24 @@ pub async fn probe_host_paths(
 /// Per-RFC-7230 §5.4 the `Host` header MUST include the port when it differs
 /// from the scheme default. Some virtual-host configurations route requests
 /// differently (or 400) when the authority is missing the port.
+///
+/// IPv6 literals are bracketed per RFC 3986 §3.2.2 / RFC 7230 §2.7.1 — without
+/// brackets, a value like `::1:8080` is ambiguous (and rejected by compliant
+/// servers).
 fn format_host_header(host: &str, port: u16, is_https: bool) -> String {
     let default = if is_https { 443 } else { 80 };
-    if port == default {
-        host.to_string()
+    let needs_brackets = host.contains(':') && !host.starts_with('[');
+    let bracketed: String;
+    let host_for_header: &str = if needs_brackets {
+        bracketed = format!("[{host}]");
+        &bracketed
     } else {
-        format!("{host}:{port}")
+        host
+    };
+    if port == default {
+        host_for_header.to_string()
+    } else {
+        format!("{host_for_header}:{port}")
     }
 }
 
@@ -375,11 +393,16 @@ where
             let last = idx + 1 == paths.len();
             write_request_into(&mut buf, host_header, paths[idx], last, config);
             if let Err(e) = write_with_timeout(&mut write_half, &buf, config.write_timeout).await {
+                // Local write failure: the connection is unusable but the
+                // cause is local (timeout / write error). Do NOT set
+                // `server_closed_early` — that field is reserved for cases
+                // where the server signalled `Connection: close`. Fill the
+                // remaining slots with `WriteAborted` so callers can tell
+                // these apart from server-side closes.
                 responses.push(Err(e));
                 for filler in (idx + 1)..paths.len() {
-                    responses.push(Err(ProbeError::ServerClosedEarly { index: filler }));
+                    responses.push(Err(ProbeError::WriteAborted { index: filler }));
                 }
-                server_closed_early.get_or_insert(idx);
                 break;
             }
         }
@@ -527,6 +550,10 @@ where
 /// Uses [`AsyncBufReadExt::read_until`] so the inner `BufReader` services
 /// reads in 16 KiB chunks rather than one syscall per byte. This matters
 /// at high RPS: per-byte was ~50× slower in profiling.
+///
+/// The cap is enforced *during* the read by wrapping the reader in
+/// `take(limit + 1)`: a peer streaming a very long unterminated header line
+/// can't grow `out` past `limit + 1` bytes before we detect overflow.
 async fn read_line<R>(
     reader: &mut BufReader<R>,
     out: &mut Vec<u8>,
@@ -536,20 +563,22 @@ where
     R: tokio::io::AsyncRead + Unpin,
 {
     let initial_len = out.len();
-    match reader.read_until(b'\n', out).await {
+    let cap = (limit as u64).saturating_add(1);
+    let mut limited = (&mut *reader).take(cap);
+    match limited.read_until(b'\n', out).await {
         Ok(0) => Ok(0),
         Ok(_) => {
             let read = out.len() - initial_len;
-            // No newline was ever seen and the read returned because the inner
-            // buffer drained at EOF: classify as connection reset.
+            if read > limit {
+                return Err(ProbeError::HeadersTooLarge { limit });
+            }
+            // No newline was seen and the inner buffer drained at EOF before
+            // the cap: classify as connection reset.
             if !out.ends_with(b"\n") {
                 if read == 0 {
                     return Ok(0);
                 }
                 return Err(ProbeError::ConnectionReset);
-            }
-            if read > limit {
-                return Err(ProbeError::HeadersTooLarge { limit });
             }
             Ok(read)
         }
@@ -1088,5 +1117,98 @@ mod tests {
             .map(|r| r.as_ref().unwrap().status)
             .collect();
         assert_eq!(codes, vec![201, 202, 203]);
+    }
+
+    #[tokio::test]
+    async fn read_line_caps_during_read_on_unterminated_line() {
+        // 70 KiB of `A`s with no `\n`: a peer that streams a long line without
+        // a terminator should not be allowed to grow `out` past `limit + 1`
+        // before we detect the overflow.
+        let limit: usize = 64 * 1024;
+        let payload = vec![b'A'; 70 * 1024];
+        let mut reader = BufReader::with_capacity(16 * 1024, &payload[..]);
+        let mut out: Vec<u8> = Vec::new();
+        let result = read_line(&mut reader, &mut out, limit).await;
+        match result {
+            Err(ProbeError::HeadersTooLarge { limit: l }) => assert_eq!(l, limit),
+            other => panic!("expected HeadersTooLarge, got {other:?}"),
+        }
+        assert!(
+            out.len() <= limit + 1,
+            "out grew past limit + 1: out.len()={} limit+1={}",
+            out.len(),
+            limit + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn host_header_brackets_ipv6_literals() {
+        // RFC 3986 §3.2.2 / RFC 7230 §2.7.1: IPv6 literals must be bracketed
+        // in the Host header. The bench input parser strips brackets for
+        // `[::1]:port`, so the helper has to put them back when emitting.
+        assert_eq!(format_host_header("::1", 8080, false), "[::1]:8080");
+        // Default port: omit the port but keep the brackets.
+        assert_eq!(format_host_header("::1", 80, false), "[::1]");
+        assert_eq!(format_host_header("::1", 443, true), "[::1]");
+        // Idempotent for already-bracketed input.
+        assert_eq!(format_host_header("[::1]", 8080, false), "[::1]:8080");
+        assert_eq!(format_host_header("[::1]", 80, false), "[::1]");
+        // Full-form IPv6 also handled.
+        assert_eq!(
+            format_host_header("2001:db8::1", 8443, true),
+            "[2001:db8::1]:8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_write_failure_does_not_set_server_closed_early() {
+        // Drive run_pipeline directly with a half-dropped duplex stream so
+        // the very first write returns BrokenPipe deterministically. We
+        // assert two things:
+        //   1. server_closed_early stays None (the failure is local, not a
+        //      server-signalled close).
+        //   2. Filler slots after the failure carry WriteAborted, not
+        //      ServerClosedEarly.
+        let (client, server) = tokio::io::duplex(8);
+        drop(server);
+
+        let mut config = cfg();
+        config.pipeline = false;
+        config.write_timeout = Duration::from_millis(200);
+        config.read_timeout = Duration::from_millis(200);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let paths = ["/a", "/b", "/c", "/d"];
+        let outcome = run_pipeline(client, "test.local", &paths, &config, deadline)
+            .await
+            .expect("run_pipeline returns outcome");
+
+        assert!(
+            outcome.server_closed_early.is_none(),
+            "write failure should NOT set server_closed_early; got {:?}",
+            outcome.server_closed_early
+        );
+        let first_err_idx = outcome
+            .responses
+            .iter()
+            .position(|r| r.is_err())
+            .expect("at least one slot should error after dropped peer");
+        // The first error is the actual write error (WriteError / WriteTimeout
+        // / ConnectionReset); subsequent slots must be WriteAborted.
+        match &outcome.responses[first_err_idx] {
+            Err(ProbeError::WriteError(_))
+            | Err(ProbeError::WriteTimeout)
+            | Err(ProbeError::ConnectionReset) => {}
+            other => panic!("first error slot {first_err_idx}: expected a write-side error, got {other:?}"),
+        }
+        for (i, resp) in outcome.responses.iter().enumerate().skip(first_err_idx + 1) {
+            match resp {
+                Err(ProbeError::WriteAborted { index }) => assert_eq!(*index, i),
+                other => panic!(
+                    "slot {i}: expected WriteAborted (write failure should not masquerade as \
+                     server close), got {other:?}"
+                ),
+            }
+        }
     }
 }
