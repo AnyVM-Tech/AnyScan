@@ -4229,6 +4229,51 @@ mod tests {
         (handle, format!("http://{}", address))
     }
 
+    async fn spawn_container_orchestration_test_server() -> (JoinHandle<()>, String) {
+        let app = Router::new()
+            .route(
+                "/docker-compose.yml",
+                get(|| async {
+                    (
+                        [(CONTENT_TYPE, "application/yaml")],
+                        "version: \"3.9\"\nservices:\n  api:\n    image: anyscan/api:latest\n    ports:\n      - \"8080:8080\"\n",
+                    )
+                }),
+            )
+            .route(
+                "/Dockerfile",
+                get(|| async {
+                    (
+                        [(CONTENT_TYPE, "text/plain")],
+                        "FROM rust:1.82-slim\nWORKDIR /app\nCOPY . .\nRUN cargo build --release\nCMD [\"/app/target/release/anyscan-api\"]\n",
+                    )
+                }),
+            )
+            .route(
+                "/values.yaml",
+                get(|| async {
+                    (
+                        [(CONTENT_TYPE, "application/yaml")],
+                        "replicaCount: 2\nimage:\n  repository: anyscan/api\n  tag: \"latest\"\nservice:\n  type: ClusterIP\n  port: 8080\n",
+                    )
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("container orchestration listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("container orchestration listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("container orchestration server should stay available")
+        });
+
+        (handle, format!("http://{}", address))
+    }
+
     async fn spawn_priority_discovery_test_server() -> (JoinHandle<()>, String) {
         let app = Router::new()
             .route(
@@ -6035,6 +6080,64 @@ paths:
             findings
                 .iter()
                 .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn container_orchestration_profile_fetches_docker_compose_through_fetcher() {
+        let (server, base_url) = spawn_container_orchestration_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.inventory.path_profiles = vec!["container-orchestration".to_string()];
+        config.scan.max_paths_per_target = 50;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+        config
+            .validate()
+            .expect("container-orchestration config should validate");
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 42,
+            label: "container-orchestration".to_string(),
+            base_url,
+            paths: Vec::new(),
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("container orchestration fetch should succeed");
+
+        let served_paths = ["/docker-compose.yml", "/Dockerfile", "/values.yaml"];
+        let reached: Vec<&str> = served_paths
+            .iter()
+            .filter(|expected| {
+                report
+                    .documents
+                    .iter()
+                    .any(|document| document.path == **expected)
+            })
+            .copied()
+            .collect();
+        assert!(
+            reached.len() >= 2,
+            "expected at least 2 container-orchestration paths to reach the server, got {:?} (documents: {:?})",
+            reached,
+            report
+                .documents
+                .iter()
+                .map(|document| document.path.clone())
                 .collect::<Vec<_>>()
         );
 

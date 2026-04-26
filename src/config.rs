@@ -486,6 +486,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "container-registry",
     "extended-debug-endpoints",
     "dependency-manifests",
+    "container-orchestration",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -943,6 +944,37 @@ const DEPENDENCY_MANIFEST_PATHS: &[&str] = &[
     "/pom.xml",
     "/Package.swift",
     "/Package.resolved",
+];
+
+const CONTAINER_ORCHESTRATION_PATHS: &[&str] = &[
+    "/Dockerfile",
+    "/Dockerfile.dev",
+    "/Dockerfile.prod",
+    "/docker-compose.yml",
+    "/docker-compose.yaml",
+    "/docker-compose.override.yml",
+    "/docker-compose.prod.yml",
+    "/docker-compose.dev.yml",
+    "/.dockerignore",
+    "/Chart.yaml",
+    "/values.yaml",
+    "/values.prod.yaml",
+    "/values.dev.yaml",
+    "/kustomization.yaml",
+    "/kustomization.yml",
+    "/.helmignore",
+    "/skaffold.yaml",
+    "/deployment.yaml",
+    "/deployment.yml",
+    "/service.yaml",
+    "/ingress.yaml",
+    "/configmap.yaml",
+    "/secret.yaml",
+    "/k8s/deployment.yaml",
+    "/k8s/secret.yaml",
+    "/manifests/deployment.yaml",
+    "/devcontainer.json",
+    "/.devcontainer/devcontainer.json",
 ];
 
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
@@ -1488,6 +1520,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "container-registry" => Some(CONTAINER_REGISTRY_PATHS),
         "extended-debug-endpoints" => Some(EXTENDED_DEBUG_ENDPOINT_PATHS),
         "dependency-manifests" => Some(DEPENDENCY_MANIFEST_PATHS),
+        "container-orchestration" => Some(CONTAINER_ORCHESTRATION_PATHS),
         _ => None,
     }
 }
