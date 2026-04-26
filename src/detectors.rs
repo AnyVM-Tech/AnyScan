@@ -5390,6 +5390,9 @@ fn candidate_detectors(document: &FetchedDocument) -> Vec<&'static DetectorDefin
 }
 
 fn contextual_assignment_rule(key: &str) -> Option<&'static ContextualAssignmentRule> {
+    if key_is_identifier_field(key) {
+        return None;
+    }
     CONTEXTUAL_ASSIGNMENT_RULES.iter().find(|rule| {
         rule.keywords
             .iter()
@@ -5402,6 +5405,16 @@ fn key_matches_keyword(key: &str, keyword: &str) -> bool {
         || key.starts_with(&format!("{keyword}_"))
         || key.ends_with(&format!("_{keyword}"))
         || key.contains(&format!("_{keyword}_"))
+}
+
+// Field names ending in an identifier suffix (e.g. `private_key_id`, `client_uuid`)
+// describe a public reference to a credential, not the credential itself, and so
+// must not be matched by the generic secret/key/token assignment rules.
+fn key_is_identifier_field(key: &str) -> bool {
+    const IDENTIFIER_SUFFIXES: &[&str] = &["_id", "_uuid", "_arn", "_urn"];
+    IDENTIFIER_SUFFIXES
+        .iter()
+        .any(|suffix| key.ends_with(suffix) && key.len() > suffix.len())
 }
 
 impl DetectorPrefilter {
