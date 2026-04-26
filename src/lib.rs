@@ -9,4 +9,5 @@ pub mod plugins;
 pub mod public_verification;
 pub mod request_probe;
 pub mod store;
+pub mod tech_paths;
 pub mod worker_api;
