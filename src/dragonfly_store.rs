@@ -1379,6 +1379,27 @@ impl DragonflyAnyScanStore {
         })
     }
 
+    /// Record a follow-on host-scan run that the streaming flusher just queued
+    /// while the port scan is still running. Returns the updated record so the
+    /// worker can emit progress events.
+    pub fn append_port_scan_follow_on_run_id_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        run_id: i64,
+    ) -> Result<Option<PortScanRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            append_port_scan_follow_on_run_id_in_state(
+                state,
+                port_scan_id,
+                worker_id,
+                run_id,
+                now,
+            )
+        })
+    }
+
     pub fn fail_port_scan_if_owned(
         &self,
         port_scan_id: i64,
@@ -2048,6 +2069,16 @@ impl DragonflyAnyScanStore {
             jobs.sort_by(|left, right| left.id.cmp(&right.id));
             Ok(jobs)
         })
+    }
+
+    /// Count jobs across the supplied runs that are still consuming worker
+    /// capacity (`Pending` or `InProgress`). Used by the streaming follow-on
+    /// flusher to apply backpressure when host-scan workers are saturated.
+    pub fn count_active_jobs_for_runs(&self, run_ids: &[i64]) -> Result<u64> {
+        if run_ids.is_empty() {
+            return Ok(0);
+        }
+        self.with_state(|state| Ok(count_active_jobs_for_runs_in_state(state, run_ids)))
     }
 
     pub fn record_finding(&self, finding: &NewFinding) -> Result<FindingRecord> {
@@ -7737,13 +7768,76 @@ fn complete_port_scan_if_owned_in_state(
     record.port_scan.discovered_endpoints_total = discovered_endpoints_total;
     record.port_scan.imported_targets_total = imported_targets_total;
     record.port_scan.protocol_findings = protocol_findings.to_vec();
-    record.port_scan.queued_run_id = queued_run_id;
-    record.port_scan.follow_on_run_ids = queued_run_id.into_iter().collect();
+    if let Some(run_id) = queued_run_id {
+        if !record.port_scan.follow_on_run_ids.contains(&run_id) {
+            record.port_scan.follow_on_run_ids.push(run_id);
+        }
+    }
+    record.port_scan.follow_on_run_ids.sort_unstable();
+    record.port_scan.follow_on_run_ids.dedup();
+    record.port_scan.queued_run_id = record
+        .port_scan
+        .follow_on_run_ids
+        .first()
+        .copied()
+        .or(queued_run_id);
     if let Some(notes) = notes {
         record.port_scan.notes = Some(notes.to_string());
     }
     clear_port_scan_resume_state(record);
     clear_port_scan_claim(record);
+    Ok(Some(record.port_scan.clone()))
+}
+
+fn count_active_jobs_for_runs_in_state(
+    state: &DragonflyRuntimeState,
+    run_ids: &[i64],
+) -> u64 {
+    if run_ids.is_empty() {
+        return 0;
+    }
+    let run_set: HashSet<i64> = run_ids.iter().copied().collect();
+    state
+        .jobs
+        .iter()
+        .filter(|job| {
+            run_set.contains(&job.run_id)
+                && matches!(job.status, JobStatus::Pending | JobStatus::InProgress)
+        })
+        .count() as u64
+}
+
+fn append_port_scan_follow_on_run_id_in_state(
+    state: &mut DragonflyRuntimeState,
+    port_scan_id: i64,
+    worker_id: &str,
+    run_id: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<PortScanRecord>> {
+    let record = state
+        .port_scans
+        .iter_mut()
+        .find(|record| record.port_scan.id == port_scan_id)
+        .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
+    if record.claimed_by.as_deref() != Some(worker_id)
+        || record
+            .claim_expires_at
+            .is_none_or(|expires_at| expires_at <= now)
+    {
+        return Ok(None);
+    }
+    if matches!(
+        record.port_scan.status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Stopping
+    ) {
+        return Ok(None);
+    }
+    if !record.port_scan.follow_on_run_ids.contains(&run_id) {
+        record.port_scan.follow_on_run_ids.push(run_id);
+    }
+    if record.port_scan.queued_run_id.is_none() {
+        record.port_scan.queued_run_id = Some(run_id);
+    }
     Ok(Some(record.port_scan.clone()))
 }
 
@@ -8951,6 +9045,7 @@ mod tests {
     };
     use anyhow::{Context, Result};
     use chrono::{Duration as ChronoDuration, Utc};
+    use std::collections::HashSet;
 
     use redis::Commands;
     use std::{
@@ -10971,6 +11066,125 @@ mod tests {
         .expect("expected completion");
         assert!(matches!(completed.status, RunStatus::Completed));
         assert_eq!(completed.notes.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn append_port_scan_follow_on_run_id_extends_list_and_completion_merges() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState {
+            port_scans: vec![super::StoredPortScan {
+                port_scan: crate::core::PortScanRecord {
+                    id: 700,
+                    shard_group_id: None,
+                    aggregate_target_range: None,
+                    shard_index: None,
+                    shard_total: None,
+                    requested_by: Some("admin".to_string()),
+                    target_range: "10.0.0.1".to_string(),
+                    ports: "80".to_string(),
+                    schemes: Default::default(),
+                    tags: Vec::new(),
+                    rate_limit: 0,
+                    scanner_sender_threads: None,
+                    scanner_receiver_threads: None,
+                    worker_pool: None,
+                    bootstrap_policy: Default::default(),
+                    follow_on_run_policy: Default::default(),
+                    active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                    status: RunStatus::InProgress,
+                    started_at: now,
+                    completed_at: None,
+                    discovered_endpoints_total: 0,
+                    imported_targets_total: 0,
+                    bootstrap_candidates_total: 0,
+                    queued_run_id: None,
+                    follow_on_run_ids: Vec::new(),
+                    protocol_findings: Vec::new(),
+                    current_probe_rate_millis: 0,
+                    current_receive_rate_millis: 0,
+                    current_progress_percent: None,
+                    notes: None,
+                },
+                claimed_by: Some("edge-1".to_string()),
+                claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+                resume_state: PortScanResumeStateRecord::default(),
+            }],
+            ..Default::default()
+        };
+
+        // Streaming flusher records two follow-on runs as the scan proceeds.
+        let updated = super::append_port_scan_follow_on_run_id_in_state(
+            &mut state,
+            700,
+            "edge-1",
+            901,
+            now,
+        )
+        .unwrap()
+        .expect("first append should succeed");
+        assert_eq!(updated.follow_on_run_ids, vec![901]);
+        assert_eq!(updated.queued_run_id, Some(901));
+
+        let updated = super::append_port_scan_follow_on_run_id_in_state(
+            &mut state,
+            700,
+            "edge-1",
+            902,
+            now,
+        )
+        .unwrap()
+        .expect("second append should succeed");
+        assert_eq!(updated.follow_on_run_ids, vec![901, 902]);
+
+        // Duplicate appends are no-ops.
+        super::append_port_scan_follow_on_run_id_in_state(&mut state, 700, "edge-1", 901, now)
+            .unwrap();
+        assert_eq!(state.port_scans[0].port_scan.follow_on_run_ids, vec![901, 902]);
+
+        // Wrong worker_id → no update.
+        let none = super::append_port_scan_follow_on_run_id_in_state(
+            &mut state, 700, "edge-9", 999, now,
+        )
+        .unwrap();
+        assert!(none.is_none());
+
+        // Final completion merges the new queued_run_id with the streamed
+        // history rather than overwriting it.
+        let completed = super::complete_port_scan_if_owned_in_state(
+            &mut state,
+            700,
+            "edge-1",
+            42,
+            7,
+            &[],
+            Some(903),
+            Some("done"),
+            now,
+        )
+        .unwrap()
+        .expect("completion succeeds");
+        assert_eq!(completed.follow_on_run_ids, vec![901, 902, 903]);
+        assert_eq!(completed.queued_run_id, Some(901));
+    }
+
+    #[test]
+    fn count_active_jobs_for_runs_counts_pending_and_in_progress() {
+        let mut state = DragonflyRuntimeState::default();
+        state.jobs.push(sample_job(1, 100, JobStatus::Pending));
+        state.jobs.push(sample_job(2, 100, JobStatus::InProgress));
+        state.jobs.push(sample_job(3, 100, JobStatus::Completed));
+        state.jobs.push(sample_job(4, 200, JobStatus::Pending));
+
+        // Drive the same in-state helper the production
+        // `DragonflyAnyScanStore::count_active_jobs_for_runs` invokes,
+        // so a regression in the filter logic fails this test.
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[100]), 2);
+        assert_eq!(
+            super::count_active_jobs_for_runs_in_state(&state, &[100, 200]),
+            3
+        );
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[200]), 1);
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[]), 0);
     }
 
     #[test]

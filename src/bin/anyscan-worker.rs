@@ -1274,6 +1274,26 @@ async fn process_port_scan(
         .await
     });
 
+    let (streaming_shutdown_tx, streaming_shutdown_rx) = oneshot::channel();
+    let streaming_handle = if port_scan.follow_on_run_policy.is_enabled() {
+        let streaming_ctx = StreamingFollowOnContext {
+            config: config.clone(),
+            store: store.clone(),
+            worker_runtime: worker_runtime.clone(),
+            port_scan: port_scan.clone(),
+            output_path: output_path.clone(),
+            output_format: adapter.output_format().to_string(),
+            cancelled: cancelled.clone(),
+            should_resume,
+        };
+        Some(tokio::spawn(async move {
+            streaming_followon_flusher(streaming_ctx, streaming_shutdown_rx).await
+        }))
+    } else {
+        // No flusher needed; the shutdown sender will be dropped naturally.
+        None
+    };
+
     let outcome: Result<()> = async {
         if let Some(started) = store.mark_port_scan_started_if_queued(port_scan.id)? {
             store.append_event(None, &ApiEvent::PortScanStarted { port_scan: started })?;
@@ -1288,6 +1308,34 @@ async fn process_port_scan(
             cancelled.clone(),
         )
         .await?;
+
+        // Signal the streaming flusher to drain any remaining endpoints and
+        // exit, then collect what it queued during the scan so the final
+        // import can avoid double-queueing those targets.
+        let _ = streaming_shutdown_tx.send(());
+        let streaming_summary = match streaming_handle {
+            Some(handle) => match handle.await {
+                Ok(Ok(summary)) => summary,
+                Ok(Err(error)) => {
+                    warn!(
+                        port_scan_id = port_scan.id,
+                        %error,
+                        "streaming follow-on flusher returned error"
+                    );
+                    StreamingFollowOnSummary::default()
+                }
+                Err(error) => {
+                    warn!(
+                        port_scan_id = port_scan.id,
+                        %error,
+                        "streaming follow-on flusher join failed"
+                    );
+                    StreamingFollowOnSummary::default()
+                }
+            },
+            None => StreamingFollowOnSummary::default(),
+        };
+
         let protocol_findings = derive_protocol_plugin_findings_with_active_mode(
             &execution.discovered_endpoints,
             port_scan.active_authorized_plugins.is_enabled()
@@ -1299,11 +1347,15 @@ async fn process_port_scan(
             &port_scan,
             &execution.discovered_endpoints,
         )?;
+        let final_endpoints = filter_endpoints_excluding_streamed(
+            &execution.discovered_endpoints,
+            &streaming_summary.flushed_endpoint_keys,
+        );
         let imported = import_port_scan_targets(
             config,
             store,
             &port_scan,
-            &execution.discovered_endpoints,
+            &final_endpoints,
             &worker_runtime.importers,
         )
         .await?;
@@ -1332,6 +1384,20 @@ async fn process_port_scan(
         if !port_scan.follow_on_run_policy.is_enabled() && !imported.target_ids.is_empty() {
             notes.push("follow-on scanning of imported targets is disabled".to_string());
         }
+        if !streaming_summary.queued_run_ids.is_empty() {
+            notes.push(format!(
+                "streamed {} follow-on run(s) during scan covering {} endpoint(s)",
+                streaming_summary.queued_run_ids.len(),
+                streaming_summary.flushed_endpoint_keys.len()
+            ));
+        }
+        if streaming_summary.backpressure_events > 0 {
+            notes.push(format!(
+                "streaming follow-on backpressure events: {}",
+                streaming_summary.backpressure_events
+            ));
+        }
+        notes.extend(streaming_summary.notes.iter().cloned());
         if let Some(queued_run) = &follow_on {
             let pool_note = queued_run
                 .run
@@ -1353,11 +1419,13 @@ async fn process_port_scan(
             .collect::<Vec<_>>();
         let notes_text = join_notes(&notes);
 
+        let total_imported_targets = (imported.target_ids.len() as u64)
+            .saturating_add(streaming_summary.imported_targets_total);
         let completed = store
             .complete_port_scan_if_owned(
                 port_scan.id,
                 execution.discovered_endpoints.len() as u64,
-                imported.target_ids.len() as u64,
+                total_imported_targets,
                 &protocol_findings,
                 follow_on.as_ref().map(|item| item.run.id),
                 notes_text.as_deref(),
@@ -4060,6 +4128,363 @@ fn should_push_resume_state(
     output_size.is_some() && (interval_elapsed || bytes_grew_enough)
 }
 
+const FOLLOWON_FLUSH_MIN_RESULTS_ENV: &str = "ANYSCAN_FOLLOWON_FLUSH_MIN_RESULTS";
+const FOLLOWON_FLUSH_INTERVAL_SECONDS_ENV: &str = "ANYSCAN_FOLLOWON_FLUSH_INTERVAL_SECONDS";
+const FOLLOWON_BACKPRESSURE_THRESHOLD_ENV: &str =
+    "ANYSCAN_FOLLOWON_BACKPRESSURE_PENDING_THRESHOLD";
+const FOLLOWON_POLL_INTERVAL_SECONDS_ENV: &str = "ANYSCAN_FOLLOWON_POLL_INTERVAL_SECONDS";
+
+const DEFAULT_FOLLOWON_FLUSH_MIN_RESULTS: usize = 64;
+const DEFAULT_FOLLOWON_FLUSH_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_FOLLOWON_BACKPRESSURE_THRESHOLD: u64 = 1024;
+const DEFAULT_FOLLOWON_POLL_INTERVAL_SECONDS: u64 = 3;
+
+fn followon_flush_min_results() -> usize {
+    resolve_optional_env(FOLLOWON_FLUSH_MIN_RESULTS_ENV)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FOLLOWON_FLUSH_MIN_RESULTS)
+        .max(1)
+}
+
+fn followon_flush_interval() -> Duration {
+    let secs = resolve_optional_env(FOLLOWON_FLUSH_INTERVAL_SECONDS_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FOLLOWON_FLUSH_INTERVAL_SECONDS)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+fn followon_backpressure_threshold() -> u64 {
+    resolve_optional_env(FOLLOWON_BACKPRESSURE_THRESHOLD_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FOLLOWON_BACKPRESSURE_THRESHOLD)
+}
+
+fn followon_poll_interval() -> Duration {
+    let secs = resolve_optional_env(FOLLOWON_POLL_INTERVAL_SECONDS_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_FOLLOWON_POLL_INTERVAL_SECONDS)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+#[derive(Debug, Default)]
+struct StreamingFollowOnSummary {
+    flushed_endpoint_keys: HashSet<String>,
+    queued_run_ids: Vec<i64>,
+    notes: Vec<String>,
+    backpressure_events: u64,
+    imported_targets_total: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamingFollowOnTunables {
+    flush_min_results: usize,
+    flush_interval: Duration,
+    poll_interval: Duration,
+    backpressure_threshold: u64,
+}
+
+impl StreamingFollowOnTunables {
+    fn from_env() -> Self {
+        Self {
+            flush_min_results: followon_flush_min_results(),
+            flush_interval: followon_flush_interval(),
+            poll_interval: followon_poll_interval(),
+            backpressure_threshold: followon_backpressure_threshold(),
+        }
+    }
+}
+
+fn streaming_followon_should_flush(
+    pending_count: usize,
+    flush_min_results: usize,
+    elapsed_since_flush: Duration,
+    flush_interval: Duration,
+    final_drain: bool,
+) -> bool {
+    if pending_count == 0 {
+        return false;
+    }
+    if final_drain {
+        return true;
+    }
+    if pending_count >= flush_min_results {
+        return true;
+    }
+    elapsed_since_flush >= flush_interval
+}
+
+struct StreamingFollowOnContext {
+    config: AppConfig,
+    store: AnyScanStore,
+    worker_runtime: WorkerRuntime,
+    port_scan: PortScanRecord,
+    output_path: PathBuf,
+    output_format: String,
+    cancelled: Arc<AtomicBool>,
+    /// True when `restore_port_scan_resume_state` repopulated the scanner
+    /// output file from a checkpoint. The flusher must skip-ahead through
+    /// the pre-existing content so it does not re-emit endpoints that were
+    /// already streamed (and possibly already host-scanned) in the prior
+    /// life of this port scan.
+    should_resume: bool,
+}
+
+async fn streaming_followon_flusher(
+    ctx: StreamingFollowOnContext,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<StreamingFollowOnSummary> {
+    let mut summary = StreamingFollowOnSummary::default();
+    if !ctx.port_scan.follow_on_run_policy.is_enabled() {
+        return Ok(summary);
+    }
+    let tunables = StreamingFollowOnTunables::from_env();
+    let mut counter = ScannerOutputCounter::new(&ctx.port_scan.ports);
+
+    if ctx.should_resume {
+        // Prime the counter from the restored output so prior endpoints
+        // populate `seen` (preventing re-emission) and add them to the
+        // flushed set so the end-of-scan filter does not re-queue host-scan
+        // jobs for them either.
+        if let Err(error) = counter.refresh(&ctx.output_path, &ctx.output_format) {
+            warn!(
+                port_scan_id = ctx.port_scan.id,
+                %error,
+                "streaming follow-on resume seed read failed"
+            );
+        }
+        let resumed_keys = counter.drain_new_keys();
+        if !resumed_keys.is_empty() {
+            summary.notes.push(format!(
+                "streaming follow-on skipped re-emitting {} pre-resume endpoint(s)",
+                resumed_keys.len()
+            ));
+            summary.flushed_endpoint_keys.extend(resumed_keys);
+        }
+    }
+
+    let mut last_flush_at = Instant::now();
+    let requested_by = ctx
+        .port_scan
+        .requested_by
+        .clone()
+        .unwrap_or_else(|| "port-scan-worker".to_string());
+
+    loop {
+        let final_drain = tokio::select! {
+            _ = &mut shutdown => true,
+            _ = tokio::time::sleep(tunables.poll_interval) => false,
+        };
+
+        if ctx.cancelled.load(Ordering::SeqCst) {
+            return Ok(summary);
+        }
+
+        if let Err(error) = counter.refresh(&ctx.output_path, &ctx.output_format) {
+            warn!(
+                port_scan_id = ctx.port_scan.id,
+                %error,
+                "streaming follow-on counter refresh failed"
+            );
+            if final_drain {
+                return Ok(summary);
+            }
+            continue;
+        }
+
+        let pending_count = counter.pending.len();
+        let elapsed = last_flush_at.elapsed();
+        if !streaming_followon_should_flush(
+            pending_count,
+            tunables.flush_min_results,
+            elapsed,
+            tunables.flush_interval,
+            final_drain,
+        ) {
+            if final_drain {
+                return Ok(summary);
+            }
+            continue;
+        }
+
+        let active_jobs = match ctx.store.count_active_jobs_for_runs(&summary.queued_run_ids) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    port_scan_id = ctx.port_scan.id,
+                    %error,
+                    "streaming follow-on backpressure probe failed"
+                );
+                0
+            }
+        };
+        if !final_drain && active_jobs > tunables.backpressure_threshold {
+            summary.backpressure_events = summary.backpressure_events.saturating_add(1);
+            info!(
+                port_scan_id = ctx.port_scan.id,
+                active_jobs,
+                threshold = tunables.backpressure_threshold,
+                pending = pending_count,
+                "streaming follow-on backpressure: deferring flush"
+            );
+            // Leave keys in counter.pending so they roll forward into the
+            // next iteration once workers drain the queue.
+            continue;
+        }
+
+        let keys = counter.drain_new_keys();
+        if keys.is_empty() {
+            continue;
+        }
+
+        match flush_streaming_followon_batch(
+            &ctx.config,
+            &ctx.store,
+            &ctx.worker_runtime,
+            &ctx.port_scan,
+            &requested_by,
+            &keys,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                summary.imported_targets_total = summary
+                    .imported_targets_total
+                    .saturating_add(outcome.imported_targets);
+                summary.flushed_endpoint_keys.extend(keys.into_iter());
+                last_flush_at = Instant::now();
+                if let Some(queued_run_id) = outcome.queued_run_id {
+                    summary.queued_run_ids.push(queued_run_id);
+                    if let Err(error) = ctx
+                        .store
+                        .append_port_scan_follow_on_run_id_if_owned(
+                            ctx.port_scan.id,
+                            queued_run_id,
+                        )
+                    {
+                        warn!(
+                            port_scan_id = ctx.port_scan.id,
+                            run_id = queued_run_id,
+                            %error,
+                            "failed to persist streamed follow-on run id"
+                        );
+                    }
+                    info!(
+                        port_scan_id = ctx.port_scan.id,
+                        run_id = queued_run_id,
+                        batch_size = pending_count,
+                        imported_targets = outcome.imported_targets,
+                        "streaming follow-on flushed batch"
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    port_scan_id = ctx.port_scan.id,
+                    batch_size = keys.len(),
+                    %error,
+                    "streaming follow-on batch flush failed"
+                );
+                summary
+                    .notes
+                    .push(format!("streaming follow-on batch flush failed: {error}"));
+                // Do NOT mark these keys as flushed. The counter has them in
+                // `seen` (so they will not re-emit in subsequent streaming
+                // batches this life), but leaving them out of
+                // `flushed_endpoint_keys` lets the end-of-scan
+                // `filter_endpoints_excluding_streamed` keep them in the
+                // final import pass — that is the recovery path for any
+                // transient importer/queue/store failure here.
+                last_flush_at = Instant::now();
+            }
+        }
+
+        if final_drain {
+            return Ok(summary);
+        }
+    }
+}
+
+struct StreamingBatchOutcome {
+    queued_run_id: Option<i64>,
+    imported_targets: u64,
+}
+
+async fn flush_streaming_followon_batch(
+    config: &AppConfig,
+    store: &AnyScanStore,
+    worker_runtime: &WorkerRuntime,
+    port_scan: &PortScanRecord,
+    requested_by: &str,
+    keys: &[String],
+) -> Result<StreamingBatchOutcome> {
+    let endpoints = parse_endpoint_keys_for_streaming(keys, port_scan);
+    if endpoints.is_empty() {
+        return Ok(StreamingBatchOutcome {
+            queued_run_id: None,
+            imported_targets: 0,
+        });
+    }
+    let imported = import_port_scan_targets(
+        config,
+        store,
+        port_scan,
+        &endpoints,
+        &worker_runtime.importers,
+    )
+    .await?;
+    let imported_count = imported.target_ids.len() as u64;
+    if imported.target_ids.is_empty() {
+        return Ok(StreamingBatchOutcome {
+            queued_run_id: None,
+            imported_targets: imported_count,
+        });
+    }
+    let queued = queue_follow_on_run_for_targets(
+        store,
+        port_scan,
+        requested_by,
+        &imported.target_ids,
+    )?;
+    Ok(StreamingBatchOutcome {
+        queued_run_id: queued.map(|item| item.run.id),
+        imported_targets: imported_count,
+    })
+}
+
+fn parse_endpoint_keys_for_streaming(
+    keys: &[String],
+    port_scan: &PortScanRecord,
+) -> Vec<DiscoveredEndpoint> {
+    let fallback_port = single_requested_port(&port_scan.ports).ok().flatten();
+    let mut endpoints = Vec::with_capacity(keys.len());
+    for key in keys {
+        if let Ok(Some(endpoint)) = parse_endpoint_token(key, fallback_port) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
+}
+
+/// Drop endpoints whose host:port was already imported during streaming so
+/// the final import pass does not double-queue host-scan jobs for them.
+fn filter_endpoints_excluding_streamed(
+    endpoints: &[DiscoveredEndpoint],
+    flushed_keys: &HashSet<String>,
+) -> Vec<DiscoveredEndpoint> {
+    if flushed_keys.is_empty() {
+        return endpoints.to_vec();
+    }
+    endpoints
+        .iter()
+        .filter(|endpoint| {
+            !flushed_keys.contains(&endpoint_cache_key(&endpoint.host, endpoint.port))
+        })
+        .cloned()
+        .collect()
+}
+
 #[derive(Debug, Clone, Default)]
 struct ScannerProgressCounts {
     discovered_endpoints_total: u64,
@@ -4079,6 +4504,10 @@ struct NetworkPacketCounters {
 struct ScannerOutputCounter {
     offset: u64,
     seen: HashSet<String>,
+    // Endpoint keys observed since the last drain_new_keys() call. Streaming
+    // follow-on uses this to flush incremental batches into host-scan tasks
+    // without re-parsing the whole output file.
+    pending: Vec<String>,
     fallback_port: Option<u16>,
     leftover: String,
     // (device, inode) of the file we last consumed. A change here means the
@@ -4093,6 +4522,7 @@ impl ScannerOutputCounter {
         Self {
             offset: 0,
             seen: HashSet::new(),
+            pending: Vec::new(),
             fallback_port,
             leftover: String::new(),
             file_id: None,
@@ -4106,7 +4536,20 @@ impl ScannerOutputCounter {
     fn rewind(&mut self) {
         self.offset = 0;
         self.seen.clear();
+        self.pending.clear();
         self.leftover.clear();
+    }
+
+    /// Take and clear keys observed since the last drain. Already-flushed keys
+    /// remain in `seen` so duplicates are not re-emitted.
+    fn drain_new_keys(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending)
+    }
+
+    fn record_key(&mut self, key: String) {
+        if self.seen.insert(key.clone()) {
+            self.pending.push(key);
+        }
     }
 
     fn refresh(&mut self, output_path: &Path, output_format: &str) -> Result<()> {
@@ -4180,17 +4623,16 @@ impl ScannerOutputCounter {
             match output_format {
                 "endpoint_lines" => {
                     if let Ok(Some(endpoint)) = parse_endpoint_token(token, self.fallback_port) {
-                        let key = format!("{}:{}", endpoint.host, endpoint.port);
-                        self.seen.insert(key);
+                        self.record_key(endpoint_cache_key(&endpoint.host, endpoint.port));
                     }
                 }
                 "json_lines" => {
                     if let Some(key) = parse_json_endpoint_key(token, self.fallback_port) {
-                        self.seen.insert(key);
+                        self.record_key(key);
                     }
                 }
                 _ => {
-                    self.seen.insert(token.to_string());
+                    self.record_key(token.to_string());
                 }
             }
         }
@@ -4224,7 +4666,21 @@ fn parse_json_endpoint_key(line: &str, fallback_port: Option<u16>) -> Option<Str
         .and_then(|value| value.as_u64())
         .map(|value| value as u16)
         .or(fallback_port)?;
-    Some(format!("{host}:{port}"))
+    Some(endpoint_cache_key(host, port))
+}
+
+/// Canonical "host:port" cache key shared between the streaming counter,
+/// `parse_endpoint_token`, and the final-import filter. IPv6 hosts contain
+/// ':' literally, so a naïve `{host}:{port}` would collide and round-trip
+/// incorrectly (e.g. "2001:db8::1:80" cannot be re-parsed unambiguously).
+/// The bracketed form `[host]:port` parses through `SocketAddr::from_str`
+/// and is unique across all endpoints.
+fn endpoint_cache_key(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn read_scanner_progress_snapshot(
@@ -5047,9 +5503,11 @@ mod tests {
     use super::{
         DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
         ScannerOutputCounter, apply_follow_on_selection_mode_to_targets,
-        derive_protocol_plugin_findings_with_active_mode, normalize_platform_architecture,
-        normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
-        scanner_target_range_for_adapter, should_push_resume_state, validated_target_tag,
+        derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
+        filter_endpoints_excluding_streamed, normalize_platform_architecture,
+        normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
+        parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
+        streaming_followon_should_flush, validated_target_tag,
     };
     use anyscan::core::TargetDefinition;
     use std::collections::HashSet;
@@ -5694,6 +6152,327 @@ mod tests {
                 "10.0.0.8:443".to_string(),
             ]
         );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scanner_output_counter_drains_only_new_keys_each_call() {
+        let path = unique_scratch_path("counter-drain");
+        // Append the file in three separate writes; each refresh+drain
+        // should return only the keys added since the previous drain.
+        fs::write(&path, "1.1.1.1:80\n2.2.2.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let mut first = counter.drain_new_keys();
+        first.sort();
+        assert_eq!(
+            first,
+            vec!["1.1.1.1:80".to_string(), "2.2.2.2:80".to_string()]
+        );
+
+        // Second drain immediately after — no new lines, no keys.
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert!(counter.drain_new_keys().is_empty());
+
+        // Append, including a duplicate; only the new key should drain.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"1.1.1.1:80\n3.3.3.3:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let second = counter.drain_new_keys();
+        assert_eq!(second, vec!["3.3.3.3:80".to_string()]);
+        assert_eq!(counter.count(), 3);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn streaming_followon_should_flush_respects_thresholds_and_intervals() {
+        let interval = std::time::Duration::from_secs(30);
+        // No pending → never flush.
+        assert!(!streaming_followon_should_flush(
+            0,
+            10,
+            std::time::Duration::from_secs(60),
+            interval,
+            false
+        ));
+        // Final drain with any pending → flush.
+        assert!(streaming_followon_should_flush(
+            1,
+            64,
+            std::time::Duration::ZERO,
+            interval,
+            true
+        ));
+        // Hit min results threshold → flush.
+        assert!(streaming_followon_should_flush(
+            64,
+            64,
+            std::time::Duration::ZERO,
+            interval,
+            false
+        ));
+        // Below threshold but interval elapsed → flush.
+        assert!(streaming_followon_should_flush(
+            5,
+            64,
+            std::time::Duration::from_secs(45),
+            interval,
+            false
+        ));
+        // Below threshold and within interval → wait.
+        assert!(!streaming_followon_should_flush(
+            5,
+            64,
+            std::time::Duration::from_secs(5),
+            interval,
+            false
+        ));
+    }
+
+    #[test]
+    fn filter_endpoints_excluding_streamed_drops_overlap() {
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "10.0.0.1".to_string(),
+                port: 80,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+            DiscoveredEndpoint {
+                host: "10.0.0.2".to_string(),
+                port: 443,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+            DiscoveredEndpoint {
+                host: "10.0.0.3".to_string(),
+                port: 22,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+        ];
+        let mut flushed = HashSet::new();
+        flushed.insert("10.0.0.1:80".to_string());
+        flushed.insert("10.0.0.3:22".to_string());
+
+        let remaining = filter_endpoints_excluding_streamed(&endpoints, &flushed);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].host, "10.0.0.2");
+        assert_eq!(remaining[0].port, 443);
+
+        // Empty flushed set → return all.
+        let all = filter_endpoints_excluding_streamed(&endpoints, &HashSet::new());
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn streaming_drives_host_scan_jobs_before_scan_finishes() {
+        // End-to-end test of the streaming pipeline driven by synthetic
+        // PortScanResults written to the scanner output file. We exercise
+        // the same primitives the live worker uses (ScannerOutputCounter
+        // drain + flush decision), simulating a port scan that yields
+        // batches of endpoints in three writes. The assertion is that
+        // host-scan task batches become available before the synthetic
+        // scan finishes — i.e. multiple flushes happen, each producing a
+        // distinct batch of keys, while the file is still being written.
+        let path = unique_scratch_path("streaming-drives");
+        let mut counter = ScannerOutputCounter::new("80");
+        let interval = std::time::Duration::from_secs(60);
+        let min_results: usize = 3;
+        let mut all_batches: Vec<Vec<String>> = Vec::new();
+
+        // Phase 1 of the synthetic scan: 3 endpoints arrive — should
+        // trigger a flush (>= min_results).
+        fs::write(&path, "1.1.1.1:80\n2.2.2.2:80\n3.3.3.3:80\n").unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let pending = counter.pending.len();
+        assert!(streaming_followon_should_flush(
+            pending,
+            min_results,
+            std::time::Duration::ZERO,
+            interval,
+            false
+        ));
+        let batch = counter.drain_new_keys();
+        assert_eq!(batch.len(), 3);
+        all_batches.push(batch);
+
+        // Phase 2: only 1 new endpoint, within interval — should NOT flush
+        // until either threshold or interval is met.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"4.4.4.4:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let pending = counter.pending.len();
+        assert!(!streaming_followon_should_flush(
+            pending,
+            min_results,
+            std::time::Duration::from_secs(1),
+            interval,
+            false
+        ));
+
+        // Phase 3: 2 more endpoints arrive — total pending hits the
+        // threshold, flush again.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"5.5.5.5:80\n6.6.6.6:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let pending = counter.pending.len();
+        assert!(streaming_followon_should_flush(
+            pending,
+            min_results,
+            std::time::Duration::from_secs(1),
+            interval,
+            false
+        ));
+        let batch = counter.drain_new_keys();
+        assert_eq!(batch.len(), 3);
+        all_batches.push(batch);
+
+        // Phase 4: scan ends — final-drain semantics flush whatever's
+        // left, even if below threshold or within interval.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"7.7.7.7:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let pending = counter.pending.len();
+        assert!(streaming_followon_should_flush(
+            pending,
+            min_results,
+            std::time::Duration::ZERO,
+            interval,
+            true
+        ));
+        let batch = counter.drain_new_keys();
+        assert_eq!(batch.len(), 1);
+        all_batches.push(batch);
+
+        // Three distinct batches were produced before the scan output
+        // file was finalized — host-scan tasks would have been queued
+        // incrementally rather than in a single end-of-scan burst.
+        assert_eq!(all_batches.len(), 3);
+        let total: usize = all_batches.iter().map(|b| b.len()).sum();
+        assert_eq!(total, 7);
+        // No key was emitted in more than one batch — the streaming
+        // pipeline does not double-queue endpoints.
+        let mut all_keys: Vec<String> =
+            all_batches.iter().flatten().cloned().collect();
+        all_keys.sort();
+        let unique: std::collections::HashSet<_> = all_keys.iter().cloned().collect();
+        assert_eq!(unique.len(), all_keys.len());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn endpoint_cache_key_round_trips_for_ipv4_and_ipv6() {
+        // IPv4 keys keep the bare host:port form so the existing zmap output
+        // continues to work unchanged.
+        assert_eq!(endpoint_cache_key("10.0.0.1", 80), "10.0.0.1:80");
+
+        // IPv6 hosts contain ':' literally; without bracketing the key would
+        // collide with another endpoint and could not be unambiguously
+        // re-parsed. The bracketed form is canonical and round-trips through
+        // `parse_endpoint_token` (which delegates to `SocketAddr::parse`).
+        let v6_key = endpoint_cache_key("2001:db8::1", 443);
+        assert_eq!(v6_key, "[2001:db8::1]:443");
+        let parsed = parse_endpoint_token(&v6_key, None)
+            .expect("parse")
+            .expect("non-empty");
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 443);
+        // Round-tripping the parsed endpoint must produce the same key.
+        assert_eq!(endpoint_cache_key(&parsed.host, parsed.port), v6_key);
+
+        // Already-bracketed inputs are not re-bracketed.
+        assert_eq!(endpoint_cache_key("[fe80::1]", 22), "[fe80::1]:22");
+    }
+
+    #[test]
+    fn filter_endpoints_excluding_streamed_handles_ipv6_keys() {
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "2001:db8::1".to_string(),
+                port: 443,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+            DiscoveredEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+        ];
+        let mut flushed = HashSet::new();
+        flushed.insert(endpoint_cache_key("2001:db8::1", 443));
+
+        let remaining = filter_endpoints_excluding_streamed(&endpoints, &flushed);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].host, "10.0.0.5");
+    }
+
+    #[test]
+    fn scanner_output_counter_seen_set_dedupes_resumed_content() {
+        // Simulates the resume seed path: the scanner output file already
+        // contains pre-resume endpoints, the flusher refresh+drain prologue
+        // moves them into `seen` (without re-emission), and a subsequent
+        // refresh after the scanner appends new lines drains only the new
+        // post-resume endpoints.
+        let path = unique_scratch_path("counter-resume-seed");
+        fs::write(&path, "1.1.1.1:80\n2.2.2.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+
+        // Resume prologue: refresh, drain, discard (or stash as flushed).
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let resumed = counter.drain_new_keys();
+        assert_eq!(resumed.len(), 2);
+        // After draining, `seen` still contains them — a re-refresh of the
+        // same file does NOT re-emit.
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert!(counter.drain_new_keys().is_empty());
+
+        // Scanner appends a new line; only the new key drains.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"3.3.3.3:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let post = counter.drain_new_keys();
+        assert_eq!(post, vec!["3.3.3.3:80".to_string()]);
+
         let _ = fs::remove_file(&path);
     }
 }
