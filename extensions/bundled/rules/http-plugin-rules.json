@@ -41,7 +41,7 @@
     "detector": "craftcms_exposed_panel",
     "severity": "medium",
     "confidence": "high",
-    "body_contains": [
+    "any_of_body_contains": [
       "craft cms",
       "craft\\\\web\\\\application"
     ],
@@ -293,7 +293,7 @@
     "detector": "mirth_connect_exposed_panel",
     "severity": "medium",
     "confidence": "high",
-    "body_contains": [
+    "any_of_body_contains": [
       "mirth connect",
       "nextgen health care"
     ],
@@ -308,7 +308,7 @@
     "detector": "moodle_exposed_panel",
     "severity": "medium",
     "confidence": "high",
-    "body_contains": [
+    "any_of_body_contains": [
       "moodle",
       "moodleform"
     ],
@@ -476,7 +476,11 @@
     "detector": "sap_netweaver_exposed_panel",
     "severity": "medium",
     "confidence": "high",
-    "body_contains": [
+    "aliases": [
+      "sap netweaver",
+      "sap enterprise portal"
+    ],
+    "any_of_body_contains": [
       "sap netweaver",
       "sap enterprise portal"
     ],
