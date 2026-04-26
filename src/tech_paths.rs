@@ -10,7 +10,7 @@
 //! as an additional source of discovery hints. See PR description for the
 //! integration patch.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Single candidate path produced by tech-stack fingerprinting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,7 +493,12 @@ pub fn candidates_for_fingerprints(
     fingerprints: &[TechFingerprint],
 ) -> Vec<TechPathCandidate> {
     let mut results: Vec<TechPathCandidate> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    // Map normalized path -> index in `results`. When two fingerprints
+    // contribute the same path (e.g. `/version` is in both KUBERNETES_PATHS
+    // at 850 and DOCKER_PATHS at 880), keep the higher score and the
+    // source that produced it so queue priority reflects the strongest
+    // signal rather than insertion order.
+    let mut seen: HashMap<String, usize> = HashMap::new();
 
     for fingerprint in fingerprints {
         for entry in paths_for_fingerprint(*fingerprint) {
@@ -506,19 +511,26 @@ pub fn candidates_for_fingerprints(
 
 fn push_path_candidate(
     results: &mut Vec<TechPathCandidate>,
-    seen: &mut HashSet<String>,
+    seen: &mut HashMap<String, usize>,
     entry: TechPathEntry,
     source: &'static str,
 ) {
     let normalized = normalize_path(entry.path);
-    if !seen.insert(normalized.clone()) {
+    if let Some(&index) = seen.get(&normalized) {
+        let existing = &mut results[index];
+        if entry.score > existing.score {
+            existing.score = entry.score;
+            existing.source = source;
+        }
         return;
     }
+    let index = results.len();
     results.push(TechPathCandidate {
-        path: normalized,
+        path: normalized.clone(),
         source,
         score: entry.score,
     });
+    seen.insert(normalized, index);
 }
 
 fn normalize_path(raw: &str) -> String {
@@ -1536,6 +1548,37 @@ mod tests {
         ]);
         let single = candidates_for_fingerprints(&[TechFingerprint::WordPress]);
         assert_eq!(with_duplicates.len(), single.len());
+    }
+
+    #[test]
+    fn duplicate_paths_across_fingerprints_keep_highest_score() {
+        // `/version` appears in both Kubernetes (score 850) and Docker
+        // (score 880). When both fire we must keep the higher score and
+        // the corresponding source tag so queue priority reflects the
+        // strongest signal — regardless of fingerprint ordering.
+        let kubernetes_first = candidates_for_fingerprints(&[
+            TechFingerprint::Kubernetes,
+            TechFingerprint::Docker,
+        ]);
+        let docker_first = candidates_for_fingerprints(&[
+            TechFingerprint::Docker,
+            TechFingerprint::Kubernetes,
+        ]);
+
+        for ordering in [&kubernetes_first, &docker_first] {
+            let version = ordering
+                .iter()
+                .find(|c| c.path == "/version")
+                .expect("/version should be present when both fingerprints fire");
+            assert_eq!(
+                version.score, 880,
+                "score should be the higher of 850 (k8s) and 880 (docker)"
+            );
+            assert_eq!(
+                version.source, "tech-docker",
+                "source should be the tag of the higher-scoring fingerprint"
+            );
+        }
     }
 
     #[test]
