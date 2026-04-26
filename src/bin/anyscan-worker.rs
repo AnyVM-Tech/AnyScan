@@ -4081,6 +4081,10 @@ struct ScannerOutputCounter {
     seen: HashSet<String>,
     fallback_port: Option<u16>,
     leftover: String,
+    // (device, inode) of the file we last consumed. A change here means the
+    // file was unlinked-and-recreated; the saved offset is meaningless against
+    // the new inode even if the new size happens to be >= the old offset.
+    file_id: Option<(u64, u64)>,
 }
 
 impl ScannerOutputCounter {
@@ -4091,11 +4095,18 @@ impl ScannerOutputCounter {
             seen: HashSet::new(),
             fallback_port,
             leftover: String::new(),
+            file_id: None,
         }
     }
 
     fn count(&self) -> u64 {
         self.seen.len() as u64
+    }
+
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.seen.clear();
+        self.leftover.clear();
     }
 
     fn refresh(&mut self, output_path: &Path, output_format: &str) -> Result<()> {
@@ -4114,12 +4125,17 @@ impl ScannerOutputCounter {
             }
         };
         let size = metadata.len();
-        if size < self.offset {
-            // Output truncated or rotated; rewind and reparse.
-            self.offset = 0;
-            self.seen.clear();
-            self.leftover.clear();
+        let current_id = file_identity(&metadata);
+        let inode_changed = matches!(
+            (self.file_id, current_id),
+            (Some(prev), Some(now)) if prev != now
+        );
+        if size < self.offset || inode_changed {
+            // Output truncated or rotated (size shrank, or unlink+recreate
+            // produced a new inode even at >= the old size); rewind and reparse.
+            self.rewind();
         }
+        self.file_id = current_id.or(self.file_id);
         if size == self.offset {
             return Ok(());
         }
@@ -4183,6 +4199,17 @@ impl ScannerOutputCounter {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn parse_json_endpoint_key(line: &str, fallback_port: Option<u16>) -> Option<String> {
@@ -5602,6 +5629,41 @@ mod tests {
             Some(1_000_000),
             delta,
         ));
+    }
+
+    #[test]
+    fn scanner_output_counter_rewinds_when_inode_changes_at_same_or_larger_size() {
+        let path = unique_scratch_path("counter-inode");
+        // First file: two endpoints.
+        fs::write(&path, "10.0.0.1:80\n10.0.0.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert_eq!(counter.count(), 2);
+        let original_offset = counter.offset;
+
+        // Replace the file with a brand-new inode whose size is >= the old
+        // offset and whose content is entirely different. Without inode
+        // tracking, the old offset would skip the new prefix and the old
+        // dedup set would keep the stale endpoints in the count.
+        let _ = fs::remove_file(&path);
+        let new_contents = "10.0.0.9:80\n10.0.0.10:80\n10.0.0.11:80\n";
+        fs::write(&path, new_contents).unwrap();
+        // Sanity: new file is >= old offset.
+        let new_size = fs::metadata(&path).unwrap().len();
+        assert!(new_size >= original_offset);
+
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let mut endpoints: Vec<_> = counter.seen.iter().cloned().collect();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.10:80".to_string(),
+                "10.0.0.11:80".to_string(),
+                "10.0.0.9:80".to_string(),
+            ]
+        );
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
