@@ -219,11 +219,12 @@ write_bundled_runtime_env() {
     local include_scanner="$4"
     local api_base_url="$5"
     local api_proxy_url="$6"
-    local worker_id="$7"
-    local worker_name="$8"
-    local worker_pool="$9"
-    local worker_tags="${10}"
-    local management_url="${11}"
+    local bundle_name="$7"
+    local worker_id="$8"
+    local worker_name="$9"
+    local worker_pool="${10}"
+    local worker_tags="${11}"
+    local management_url="${12}"
 
     cat >"$dest_env" <<'EOF'
 # Remote agent runtime bundle
@@ -240,6 +241,7 @@ POLL_INTERVAL_SECONDS=15
 CONTROL_URL=${api_base_url}
 AGENT_MANAGEMENT_URL=${management_url}
 CONTROL_PROXY_URL=${api_proxy_url}
+AGENT_BUNDLE_NAME=${bundle_name}
 AGENT_ID=${worker_id}
 AGENT_NAME=${worker_name}
 AGENT_POOL=${worker_pool}
@@ -515,10 +517,10 @@ main() {
     strip_binary "$bundle_root/bin/agentd"
 
     if [ -z "$SCANNER_SOURCE_BIN" ]; then
-        if [ -x /opt/anyscan/bin/scanner ]; then
-            SCANNER_SOURCE_BIN="/opt/anyscan/bin/scanner"
-        elif [ -x "$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner" ]; then
+        if [ -x "$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner" ]; then
             SCANNER_SOURCE_BIN="$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner"
+        elif [ -x /opt/anyscan/bin/scanner ]; then
+            SCANNER_SOURCE_BIN="/opt/anyscan/bin/scanner"
         fi
     fi
     include_scanner="false"
@@ -595,6 +597,7 @@ main() {
         "$include_scanner" \
         "$runtime_api_base_url" \
         "$runtime_api_proxy_url" \
+        "$bundle_name" \
         "$worker_id" \
         "$worker_name" \
         "$worker_pool" \

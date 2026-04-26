@@ -16,7 +16,8 @@ use crate::{
     config::AppConfig,
     core::{
         ApiEvent, ArchiveJobRecord, FetchTelemetry, FindingRecord, NewFinding,
-        PortScanProtocolFindingRecord, PortScanRecord, RecurringScheduleRecord,
+        PortScanProtocolFindingRecord, PortScanRecord, PortScanResumeStateRecord,
+        RecurringScheduleRecord,
         RepositoryDefinition, RepositoryRecord, RunScope, RunSummary, ScanDefaultsSummary,
         ScanJobRecord, ScanRunRecord, TargetDefinition, TargetRecord,
         WorkerBootstrapCodeExchange, WorkerBootstrapCodeExchangeRequest,
@@ -136,8 +137,15 @@ pub enum WorkerControlRequest {
         run_id: i64,
         notes: Option<String>,
     },
+    AcknowledgeStoppingRun {
+        run_id: i64,
+        notes: Option<String>,
+    },
     GetRun {
         run_id: i64,
+    },
+    GetPortScan {
+        port_scan_id: i64,
     },
     ClaimNextPendingJob {
         run_id: i64,
@@ -159,6 +167,25 @@ pub enum WorkerControlRequest {
     MarkPortScanStartedIfQueued {
         port_scan_id: i64,
     },
+    UpdatePortScanProgressIfOwned {
+        port_scan_id: i64,
+        discovered_endpoints_total: u64,
+        probe_rate_millis: u64,
+        receive_rate_millis: u64,
+        progress_percent: Option<u64>,
+    },
+    LoadPortScanResumeState {
+        port_scan_id: i64,
+    },
+    UpdatePortScanResumeStateIfOwned {
+        port_scan_id: i64,
+        checkpoint_data: Option<String>,
+        output_snapshot: Option<String>,
+    },
+    AnnotatePortScanIfOwned {
+        port_scan_id: i64,
+        note: String,
+    },
     CompletePortScanIfOwned {
         port_scan_id: i64,
         discovered_endpoints_total: u64,
@@ -168,6 +195,10 @@ pub enum WorkerControlRequest {
         notes: Option<String>,
     },
     FailPortScanIfOwned {
+        port_scan_id: i64,
+        notes: Option<String>,
+    },
+    AcknowledgeStoppingPortScan {
         port_scan_id: i64,
         notes: Option<String>,
     },
@@ -238,6 +269,9 @@ pub enum WorkerControlResponse {
     },
     OptionalPortScan {
         port_scan: Option<PortScanRecord>,
+    },
+    OptionalPortScanResumeState {
+        resume_state: Option<PortScanResumeStateRecord>,
     },
     RunSummary {
         summary: RunSummary,
@@ -468,10 +502,41 @@ impl AnyScanWorkerApiClient {
         }
     }
 
+    pub fn acknowledge_stopping_run(
+        &self,
+        run_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<ScanRunRecord>> {
+        match self.request(WorkerControlRequest::AcknowledgeStoppingRun {
+            run_id,
+            notes: notes.map(|value| value.to_string()),
+        })? {
+            WorkerControlResponse::OptionalFinishedRun { run } => Ok(run),
+            other => Err(unexpected_worker_response("optional finished run", &other)),
+        }
+    }
+
     pub fn get_run(&self, run_id: i64) -> Result<Option<ScanRunRecord>> {
         match self.request(WorkerControlRequest::GetRun { run_id })? {
             WorkerControlResponse::OptionalRun { run } => Ok(run),
             other => Err(unexpected_worker_response("optional run", &other)),
+        }
+    }
+
+    pub fn get_port_scan(&self, port_scan_id: i64) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::GetPortScan { port_scan_id })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn load_port_scan_resume_state(
+        &self,
+        port_scan_id: i64,
+    ) -> Result<Option<PortScanResumeStateRecord>> {
+        match self.request(WorkerControlRequest::LoadPortScanResumeState { port_scan_id })? {
+            WorkerControlResponse::OptionalPortScanResumeState { resume_state } => Ok(resume_state),
+            other => Err(unexpected_worker_response("optional port scan resume state", &other)),
         }
     }
 
@@ -540,6 +605,56 @@ impl AnyScanWorkerApiClient {
         }
     }
 
+    pub fn update_port_scan_progress_if_owned(
+        &self,
+        port_scan_id: i64,
+        discovered_endpoints_total: u64,
+        probe_rate_millis: u64,
+        receive_rate_millis: u64,
+        progress_percent: Option<u64>,
+    ) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::UpdatePortScanProgressIfOwned {
+            port_scan_id,
+            discovered_endpoints_total,
+            probe_rate_millis,
+            receive_rate_millis,
+            progress_percent,
+        })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn update_port_scan_resume_state_if_owned(
+        &self,
+        port_scan_id: i64,
+        checkpoint_data: Option<&str>,
+        output_snapshot: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::UpdatePortScanResumeStateIfOwned {
+            port_scan_id,
+            checkpoint_data: checkpoint_data.map(|value| value.to_string()),
+            output_snapshot: output_snapshot.map(|value| value.to_string()),
+        })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn annotate_port_scan_if_owned(
+        &self,
+        port_scan_id: i64,
+        note: &str,
+    ) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::AnnotatePortScanIfOwned {
+            port_scan_id,
+            note: note.to_string(),
+        })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
     pub fn complete_port_scan_if_owned(
         &self,
         port_scan_id: i64,
@@ -568,6 +683,20 @@ impl AnyScanWorkerApiClient {
         notes: Option<&str>,
     ) -> Result<Option<PortScanRecord>> {
         match self.request(WorkerControlRequest::FailPortScanIfOwned {
+            port_scan_id,
+            notes: notes.map(|value| value.to_string()),
+        })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn acknowledge_stopping_port_scan(
+        &self,
+        port_scan_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::AcknowledgeStoppingPortScan {
             port_scan_id,
             notes: notes.map(|value| value.to_string()),
         })? {

@@ -8,14 +8,15 @@ use crate::{
         DiscoveryProvenanceRecord, FetchTelemetry, FindingRecord, FindingsQuery, NewFinding,
         OptOutRecord, OptOutRequest, OwnershipClaimRecord, OwnershipClaimRequest,
         PortScanProtocolFindingRecord, PortScanRecord, PortScanRequest,
+        PortScanResumeStateRecord,
         PublicFindingModerationRecord, PublicFindingModerationRequest, PublicFindingRecord,
         PublicFindingSearchQuery, PublicWorkflowStatus, PublicWorkflowStatusUpdate,
         RecurringScheduleRecord, RepositoryDefinition, RepositoryRecord, RunScope, RunSummary,
         ScanDefaultsSummary, ScanJobRecord, ScanRunRecord, StoredEvent, TargetDefinition,
         TargetRecord, WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
-        WorkerBootstrapCodeExchange, WorkerBootstrapCodeIssueRequest, WorkerBootstrapCodeIssued,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord,
-        WorkerBootstrapCandidateRejectionRequest, WorkerBootstrapJobClaim,
+        WorkerBootstrapCandidateRejectionRequest, WorkerBootstrapCodeExchange,
+        WorkerBootstrapCodeIssueRequest, WorkerBootstrapCodeIssued, WorkerBootstrapJobClaim,
         WorkerBootstrapJobRecord, WorkerEnrollmentTokenIssueRequest, WorkerEnrollmentTokenIssued,
         WorkerEnrollmentTokenRecord, WorkerLifecycleState, WorkerPoolRecord, WorkerRecord,
         WorkerRegistration, WorkerRemoteCommandRecord, WorkerRemoteCommandRequest,
@@ -122,11 +123,7 @@ impl AnyScanStore {
             .authenticate_worker_registration_token(worker_id, token)
     }
 
-    pub fn authenticate_registered_worker_token(
-        &self,
-        worker_id: &str,
-        token: &str,
-    ) -> Result<()> {
+    pub fn authenticate_registered_worker_token(&self, worker_id: &str, token: &str) -> Result<()> {
         self.inner
             .authenticate_registered_worker_token(worker_id, token)
     }
@@ -191,7 +188,8 @@ impl AnyScanStore {
         &self,
         worker_id: &str,
     ) -> Result<Option<WorkerRemoteCommandRecord>> {
-        self.inner.claim_next_pending_worker_remote_command(worker_id)
+        self.inner
+            .claim_next_pending_worker_remote_command(worker_id)
     }
 
     pub fn complete_worker_remote_command_if_owned(
@@ -205,13 +203,7 @@ impl AnyScanStore {
         error: Option<&str>,
     ) -> Result<Option<WorkerRemoteCommandRecord>> {
         self.inner.complete_worker_remote_command_if_owned(
-            command_id,
-            worker_id,
-            exit_code,
-            timed_out,
-            stdout,
-            stderr,
-            error,
+            command_id, worker_id, exit_code, timed_out, stdout, stderr, error,
         )
     }
 
@@ -360,6 +352,57 @@ impl AnyScanStore {
         self.inner.mark_port_scan_started_if_queued(port_scan_id)
     }
 
+    pub fn update_port_scan_progress_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        discovered_endpoints_total: u64,
+        probe_rate_millis: u64,
+        receive_rate_millis: u64,
+        progress_percent: Option<u64>,
+    ) -> Result<Option<PortScanRecord>> {
+        self.inner.update_port_scan_progress_if_owned(
+            port_scan_id,
+            worker_id,
+            discovered_endpoints_total,
+            probe_rate_millis,
+            receive_rate_millis,
+            progress_percent,
+        )
+    }
+
+    pub fn load_port_scan_resume_state(
+        &self,
+        port_scan_id: i64,
+    ) -> Result<Option<PortScanResumeStateRecord>> {
+        self.inner.load_port_scan_resume_state(port_scan_id)
+    }
+
+    pub fn update_port_scan_resume_state_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        checkpoint_data: Option<&str>,
+        output_snapshot: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        self.inner.update_port_scan_resume_state_if_owned(
+            port_scan_id,
+            worker_id,
+            checkpoint_data,
+            output_snapshot,
+        )
+    }
+
+    pub fn annotate_port_scan_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        note: &str,
+    ) -> Result<Option<PortScanRecord>> {
+        self.inner
+            .annotate_port_scan_if_owned(port_scan_id, worker_id, note)
+    }
+
     pub fn complete_port_scan_if_owned(
         &self,
         port_scan_id: i64,
@@ -389,6 +432,19 @@ impl AnyScanStore {
     ) -> Result<Option<PortScanRecord>> {
         self.inner
             .fail_port_scan_if_owned(port_scan_id, worker_id, notes)
+    }
+
+    pub fn stop_port_scan(&self, port_scan_id: i64, notes: Option<&str>) -> Result<PortScanRecord> {
+        self.inner.stop_port_scan(port_scan_id, notes)
+    }
+
+    pub fn acknowledge_stopping_port_scan(
+        &self,
+        port_scan_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        self.inner
+            .acknowledge_stopping_port_scan(port_scan_id, notes)
     }
 
     pub fn upsert_schedule(
@@ -595,6 +651,10 @@ impl AnyScanStore {
         self.inner.get_run(run_id)
     }
 
+    pub fn get_port_scan(&self, port_scan_id: i64) -> Result<Option<PortScanRecord>> {
+        self.inner.get_port_scan(port_scan_id)
+    }
+
     pub fn summary(&self, run_id: i64) -> Result<RunSummary> {
         self.inner.summary(run_id)
     }
@@ -611,6 +671,18 @@ impl AnyScanStore {
     ) -> Result<Option<ScanRunRecord>> {
         self.inner
             .mark_run_finished_if_owned(run_id, worker_id, notes)
+    }
+
+    pub fn stop_run(&self, run_id: i64, notes: Option<&str>) -> Result<ScanRunRecord> {
+        self.inner.stop_run(run_id, notes)
+    }
+
+    pub fn acknowledge_stopping_run(
+        &self,
+        run_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<ScanRunRecord>> {
+        self.inner.acknowledge_stopping_run(run_id, notes)
     }
 
     pub fn append_event(&self, run_id: Option<i64>, event: &ApiEvent) -> Result<i64> {

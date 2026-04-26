@@ -1,0 +1,15 @@
+[Unit]
+Description=AnyScan EC2 Worker Manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/AnyGPT/apps/anyscan
+EnvironmentFile=/root/AnyGPT/apps/anyscan/.external-runtime.env
+ExecStart=/root/.venvs/anyscan-aws/bin/python /root/AnyGPT/apps/anyscan/tools/ec2_worker_manager.py daemon
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

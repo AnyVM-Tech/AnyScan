@@ -7,7 +7,7 @@ use aes_gcm::{
 use anyhow::{anyhow, Context, Result};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::{
-    config::{Builder as S3ConfigBuilder, Region},
+    config::{BehaviorVersion, Builder as S3ConfigBuilder, Region},
     primitives::ByteStream,
     Client,
 };
@@ -125,6 +125,7 @@ impl BackblazeArchiveBackend {
         let credentials = Credentials::new(key_id, application_key, None, None, "anyscan-archive");
         let region = Region::new(archive.region.clone());
         let conf = S3ConfigBuilder::new()
+            .behavior_version(BehaviorVersion::latest())
             .region(region)
             .endpoint_url(archive.endpoint.clone())
             .credentials_provider(credentials)

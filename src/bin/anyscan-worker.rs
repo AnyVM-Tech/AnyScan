@@ -2,36 +2,42 @@ use std::{
     collections::HashSet,
     env, fs,
     io::Write,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
 use anyscan::{
-    config::{AppConfig, parse_port_scan_ports},
+    config::{AppConfig, ProxyMode, parse_port_scan_ports, resolve_scan_proxy_url},
     core::{
         ApiEvent, DiscoveryProvenanceRecord, ExtensionManifest, FetchTelemetry, NewFinding,
-        PortScanProtocolFindingRecord, PortScanRecord, PortScanSchemePolicy, RunScope, RunStatus,
-        RunSummary, ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
+        PortScanFollowOnSelectionMode, PortScanProtocolFindingRecord, PortScanRecord,
+        PortScanResumeStateRecord, PortScanSchemePolicy, RunScope, RunStatus, RunSummary,
+        ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord, WorkerBootstrapJobClaim,
         WorkerBootstrapJobRecord, WorkerRegistration, WorkerRemoteCommandRecord,
         WorkerRemoteUpdateStatus, merge_coverage_source_stat, normalize_run_scope,
     },
     detectors::DetectorEngine,
-    fetcher::{Fetcher, TargetFetchReport},
+    fetcher::{Fetcher, TargetFetchReport, build_http_client},
     ops::init_tracing,
     plugins::{PluginExecutionMode, build_plugin_metadata, lookup_plugin},
     worker_api::AnyScanWorkerApiClient as AnyScanStore,
 };
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use futures::stream::{self, StreamExt};
 use reqwest::blocking::Client as BlockingHttpClient;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 #[cfg(feature = "worker-bundle-stealth")]
@@ -111,6 +117,36 @@ const REMOTE_UPDATE_STATUS_FILE_ENV_NAMES: &[&str] = &[
     "AGENT_REMOTE_UPDATE_STATUS_FILE",
     "ANYSCAN_WORKER_REMOTE_UPDATE_STATUS_FILE",
 ];
+#[cfg(feature = "worker-bundle-stealth")]
+const MAX_ACTIVE_TASKS_ENV_NAMES: &[&str] = &["AGENT_MAX_ACTIVE_TASKS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const MAX_ACTIVE_TASKS_ENV_NAMES: &[&str] =
+    &["AGENT_MAX_ACTIVE_TASKS", "ANYSCAN_WORKER_MAX_ACTIVE_TASKS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const INSTALLED_BUNDLE_NAME_ENV_NAMES: &[&str] = &["AGENT_BUNDLE_NAME"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const INSTALLED_BUNDLE_NAME_ENV_NAMES: &[&str] =
+    &["AGENT_BUNDLE_NAME", "ANYSCAN_WORKER_BUNDLE_NAME"];
+#[cfg(feature = "worker-bundle-stealth")]
+const AGENT_CONCURRENCY_ENV_NAMES: &[&str] = &["AGENT_CONCURRENCY"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const AGENT_CONCURRENCY_ENV_NAMES: &[&str] = &["AGENT_CONCURRENCY", "ANYSCAN_SCAN_CONCURRENCY"];
+#[cfg(feature = "worker-bundle-stealth")]
+const SCANNER_DEFAULT_RATE_ENV_NAMES: &[&str] = &["SCANNER_DEFAULT_RATE"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const SCANNER_DEFAULT_RATE_ENV_NAMES: &[&str] = &["SCANNER_DEFAULT_RATE"];
+#[cfg(feature = "worker-bundle-stealth")]
+const SCANNER_SENDER_THREADS_ENV_NAMES: &[&str] = &["SCANNER_SENDER_THREADS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const SCANNER_SENDER_THREADS_ENV_NAMES: &[&str] = &["SCANNER_SENDER_THREADS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const SCANNER_RECEIVER_THREADS_ENV_NAMES: &[&str] = &["SCANNER_RECEIVER_THREADS"];
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const SCANNER_RECEIVER_THREADS_ENV_NAMES: &[&str] = &["SCANNER_RECEIVER_THREADS"];
+#[cfg(feature = "worker-bundle-stealth")]
+const DEFAULT_RUNTIME_ENV_FILE_PATH: &str = "/etc/agentd/runtime.env";
+#[cfg(not(feature = "worker-bundle-stealth"))]
+const DEFAULT_RUNTIME_ENV_FILE_PATH: &str = "/etc/anyscan/runtime.env";
 
 #[derive(Debug, Parser)]
 struct Cli {
@@ -148,6 +184,21 @@ struct WorkerRuntime {
     importers: Vec<ExtensionManifest>,
     provisioners: Vec<ExtensionManifest>,
     remote_update_plan: Option<RemoteUpdatePlan>,
+    max_active_tasks: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TopLevelTaskKind {
+    BootstrapJob,
+    PortScan,
+    Run,
+}
+
+#[derive(Debug)]
+struct ActiveTaskCompletion {
+    kind: TopLevelTaskKind,
+    label: String,
+    result: Result<()>,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +265,18 @@ struct ImportedTargetsResult {
 }
 
 #[derive(Debug)]
+struct SelectedFollowOnTargets {
+    targets: Vec<TargetDefinition>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ValidationTransport {
+    Direct,
+    Proxy,
+}
+
+#[derive(Debug)]
 struct QueuedFollowOnRun {
     run: ScanRunRecord,
     summary: RunSummary,
@@ -226,9 +289,25 @@ struct ScannerAdapterInvocation<'a> {
     ports: &'a str,
     schemes: &'a str,
     rate_limit: u64,
+    sender_threads: Option<u64>,
+    receiver_threads: Option<u64>,
+    output_path: &'a str,
+    checkpoint_path: Option<&'a str>,
+    resume: bool,
     requested_by: Option<&'a str>,
     tags: &'a [String],
     adapter_name: &'a str,
+}
+
+fn scanner_target_range_for_adapter(target_range: &str) -> String {
+    let trimmed = target_range.trim();
+    if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains('-') {
+        return trimmed.to_string();
+    }
+    if trimmed.parse::<std::net::Ipv4Addr>().is_ok() {
+        return format!("{trimmed}/32");
+    }
+    trimmed.to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -261,6 +340,16 @@ struct WorkerPlatformIdentity {
     platform: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ScannerProgressSnapshot {
+    #[serde(default)]
+    progress_percent: Option<u64>,
+    #[serde(default)]
+    probe_rate_millis: u64,
+    #[serde(default)]
+    receive_rate_millis: u64,
+}
+
 const PUBLIC_IP_CHECK_URLS: &[&str] = &[
     "https://api.ipify.org",
     "https://ifconfig.me/ip",
@@ -268,6 +357,7 @@ const PUBLIC_IP_CHECK_URLS: &[&str] = &[
 ];
 const PUBLIC_IP_CHECK_TIMEOUT_SECONDS: u64 = 5;
 const REMOTE_COMMAND_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const CLAIM_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -345,18 +435,22 @@ async fn run_daemon_with_retry(
             {
                 Ok(()) => return Ok(()),
                 Err(error) => {
+                    let error_chain = format!("{error:#}");
                     error!(
                         worker_id = %worker_id,
                         %error,
+                        error_chain = %error_chain,
                         retry_seconds = DAEMON_STARTUP_RETRY_SECONDS,
                         "agent daemon exited; retrying"
                     );
                 }
             },
             Err(error) => {
+                let error_chain = format!("{error:#}");
                 error!(
                     worker_id = %worker_id,
                     %error,
+                    error_chain = %error_chain,
                     retry_seconds = DAEMON_STARTUP_RETRY_SECONDS,
                     "agent startup failed; retrying"
                 );
@@ -394,11 +488,53 @@ async fn run_daemon(
         registration_shutdown_rx,
     ));
     let mut last_handled_remote_update_at = None;
+    let mut active_tasks = JoinSet::<ActiveTaskCompletion>::new();
+    let max_active_tasks = worker_runtime.max_active_tasks.max(1);
 
     let daemon_result = async {
         loop {
+            while let Some(joined) = active_tasks.try_join_next() {
+                match joined {
+                    Ok(completion) => match completion.result {
+                        Ok(()) => {
+                            info!(
+                                task_kind = %top_level_task_kind_label(completion.kind),
+                                task = %completion.label,
+                                worker_id = %worker_id,
+                                "completed worker task"
+                            );
+                        }
+                        Err(error) => {
+                            error!(
+                                task_kind = %top_level_task_kind_label(completion.kind),
+                                task = %completion.label,
+                                worker_id = %worker_id,
+                                %error,
+                                "worker task failed"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        error!(worker_id = %worker_id, %error, "worker task join failed");
+                    }
+                }
+            }
+
+            if worker_runtime.registration.supports_remote_debug_commands {
+                if let Some(command) = store.claim_next_pending_remote_command()? {
+                    info!(
+                        remote_command_id = command.id,
+                        worker_id = %worker_id,
+                        "claimed remote debug command"
+                    );
+                    process_remote_command(&store, &worker_id, command).await?;
+                    continue;
+                }
+            }
+
             if let Some(requested_at) = remote_update_rx.borrow().clone() {
                 if last_handled_remote_update_at != Some(requested_at)
+                    && active_tasks.is_empty()
                     && maybe_schedule_remote_update(&store, &worker_runtime, requested_at)?
                 {
                     last_handled_remote_update_at = Some(requested_at);
@@ -414,19 +550,9 @@ async fn run_daemon(
                 error!(%error, "failed to queue due schedules");
             }
 
-            if worker_runtime.registration.supports_remote_debug_commands {
-                if let Some(command) = store.claim_next_pending_remote_command()? {
-                    info!(
-                        remote_command_id = command.id,
-                        worker_id = %worker_id,
-                        "claimed remote debug command"
-                    );
-                    process_remote_command(&store, &worker_id, command).await?;
-                    continue;
-                }
-            }
-
-            if worker_runtime.registration.supports_bootstrap {
+            if active_tasks.len() < max_active_tasks
+                && worker_runtime.registration.supports_bootstrap
+            {
                 if let Some(bootstrap_job) = store
                     .claim_next_pending_bootstrap_job(config.storage.redis_run_lease_seconds)?
                 {
@@ -437,19 +563,32 @@ async fn run_daemon(
                         provisioner_count = worker_runtime.provisioners.len(),
                         "claimed bootstrap job"
                     );
-                    process_bootstrap_job(
-                        &config,
-                        &worker_runtime,
-                        &worker_id,
-                        &store,
-                        bootstrap_job,
-                    )
-                    .await?;
+                    let config = config.clone();
+                    let worker_runtime = worker_runtime.clone();
+                    let worker_id = worker_id.clone();
+                    let store = store.clone();
+                    let job_id = bootstrap_job.job.id;
+                    active_tasks.spawn(async move {
+                        ActiveTaskCompletion {
+                            kind: TopLevelTaskKind::BootstrapJob,
+                            label: format!("#{}", job_id),
+                            result: process_bootstrap_job(
+                                &config,
+                                &worker_runtime,
+                                &worker_id,
+                                &store,
+                                bootstrap_job,
+                            )
+                            .await,
+                        }
+                    });
                     continue;
                 }
             }
 
-            if worker_runtime.registration.supports_port_scans {
+            if active_tasks.len() < max_active_tasks
+                && worker_runtime.registration.supports_port_scans
+            {
                 if let Some(port_scan) =
                     store.claim_next_pending_port_scan(config.storage.redis_run_lease_seconds)?
                 {
@@ -459,49 +598,98 @@ async fn run_daemon(
                         adapter_count = worker_runtime.scanner_adapters.len(),
                         "claimed port scan"
                     );
-                    process_port_scan(&config, &worker_runtime, &worker_id, &store, port_scan)
-                        .await?;
+                    let config = config.clone();
+                    let worker_runtime = worker_runtime.clone();
+                    let worker_id = worker_id.clone();
+                    let store = store.clone();
+                    let port_scan_id = port_scan.id;
+                    active_tasks.spawn(async move {
+                        ActiveTaskCompletion {
+                            kind: TopLevelTaskKind::PortScan,
+                            label: format!("#{}", port_scan_id),
+                            result: process_port_scan(
+                                &config,
+                                &worker_runtime,
+                                &worker_id,
+                                &store,
+                                port_scan,
+                            )
+                            .await,
+                        }
+                    });
                     continue;
                 }
             }
 
-            if let Some(run) = store.next_assistable_run()? {
-                info!(run_id = run.id, worker_id = %worker_id, "assisting active run");
-                assist_run(&config, &worker_id, &store, detectors.clone(), run.id).await?;
-                continue;
-            }
-
-            if let Some(run) =
-                store.claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
-            {
-                info!(run_id = run.id, worker_id = %worker_id, "claimed runnable run");
-                process_run(&config, &worker_id, &store, detectors.clone(), run.id).await?;
-                continue;
-            }
-
-            match store.maybe_run_archive_pass() {
-                Ok(Some(job)) => {
-                    info!(
-                        archive_job_id = job.id,
-                        pressure_mode = ?job.pressure_mode,
-                        hot_retention_days = job.hot_retention_days,
-                        archived_record_count = job.archived_record_count,
-                        archived_object_count = job.archived_object_count,
-                        "completed archive pass"
-                    );
+            if active_tasks.len() < max_active_tasks {
+                if let Some(run) = store.next_assistable_run()? {
+                    info!(run_id = run.id, worker_id = %worker_id, "assisting active run");
+                    let config = config.clone();
+                    let worker_id = worker_id.clone();
+                    let store = store.clone();
+                    let detectors = detectors.clone();
+                    let run_id = run.id;
+                    active_tasks.spawn(async move {
+                        ActiveTaskCompletion {
+                            kind: TopLevelTaskKind::Run,
+                            label: format!("assist #{}", run_id),
+                            result: assist_run(&config, &worker_id, &store, detectors, run_id)
+                                .await,
+                        }
+                    });
                     continue;
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    error!(%error, "failed to run archive pass");
+            }
+
+            if active_tasks.len() < max_active_tasks {
+                if let Some(run) =
+                    store.claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
+                {
+                    info!(run_id = run.id, worker_id = %worker_id, "claimed runnable run");
+                    let config = config.clone();
+                    let worker_id = worker_id.clone();
+                    let store = store.clone();
+                    let detectors = detectors.clone();
+                    let run_id = run.id;
+                    active_tasks.spawn(async move {
+                        ActiveTaskCompletion {
+                            kind: TopLevelTaskKind::Run,
+                            label: format!("#{}", run_id),
+                            result: process_run(&config, &worker_id, &store, detectors, run_id)
+                                .await,
+                        }
+                    });
+                    continue;
+                }
+            }
+
+            if active_tasks.is_empty() {
+                match store.maybe_run_archive_pass() {
+                    Ok(Some(job)) => {
+                        info!(
+                            archive_job_id = job.id,
+                            pressure_mode = ?job.pressure_mode,
+                            hot_retention_days = job.hot_retention_days,
+                            archived_record_count = job.archived_record_count,
+                            archived_object_count = job.archived_object_count,
+                            "completed archive pass"
+                        );
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        error!(%error, "failed to run archive pass");
+                    }
                 }
             }
 
             let effective_config = load_effective_runtime_config(&config, &store)?;
-            tokio::time::sleep(Duration::from_secs(
-                effective_config.scan.poll_interval_seconds,
-            ))
-            .await;
+            let idle_sleep_seconds = if active_tasks.is_empty() {
+                effective_config.scan.poll_interval_seconds
+            } else {
+                1
+            };
+            tokio::time::sleep(Duration::from_secs(idle_sleep_seconds.max(1))).await;
         }
     }
     .await;
@@ -539,15 +727,15 @@ async fn run_once(
     ));
 
     let once_result = async {
-        if let Some(requested_at) = remote_update_rx.borrow().clone() {
-            if maybe_schedule_remote_update(&store, worker_runtime, requested_at)? {
+        if worker_runtime.registration.supports_remote_debug_commands {
+            if let Some(command) = store.claim_next_pending_remote_command()? {
+                process_remote_command(&store, worker_id, command).await?;
                 return Ok(());
             }
         }
 
-        if worker_runtime.registration.supports_remote_debug_commands {
-            if let Some(command) = store.claim_next_pending_remote_command()? {
-                process_remote_command(&store, worker_id, command).await?;
+        if let Some(requested_at) = remote_update_rx.borrow().clone() {
+            if maybe_schedule_remote_update(&store, worker_runtime, requested_at)? {
                 return Ok(());
             }
         }
@@ -616,15 +804,18 @@ async fn process_run(
     run_id: i64,
 ) -> Result<()> {
     let (claim_shutdown_tx, claim_shutdown_rx) = oneshot::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let heartbeat_store = store.clone();
     let heartbeat_worker_id = worker_id.to_string();
     let lease_seconds = config.storage.redis_run_lease_seconds;
+    let heartbeat_cancelled = cancelled.clone();
     let heartbeat_handle = tokio::spawn(async move {
         run_claim_heartbeat(
             heartbeat_store,
             heartbeat_worker_id,
             run_id,
             lease_seconds,
+            heartbeat_cancelled,
             claim_shutdown_rx,
         )
         .await
@@ -645,16 +836,40 @@ async fn process_run(
 
         let mut notes =
             process_claimed_jobs(config, worker_id, store, detectors.clone(), run_id).await?;
-        while store.has_incomplete_jobs(run_id)? {
+        while !cancelled.load(Ordering::SeqCst) && store.has_incomplete_jobs(run_id)? {
             let mut recovery_notes =
                 process_claimed_jobs(config, worker_id, store, detectors.clone(), run_id).await?;
             notes.append(&mut recovery_notes);
-            if store.has_incomplete_jobs(run_id)? {
-                tokio::time::sleep(run_completion_poll_interval(
-                    config.storage.redis_run_lease_seconds,
-                ))
-                .await;
+            if cancelled.load(Ordering::SeqCst) {
+                break;
             }
+            if store.has_incomplete_jobs(run_id)? {
+                tokio::select! {
+                    _ = tokio::time::sleep(run_completion_poll_interval(
+                        config.storage.redis_run_lease_seconds,
+                    )) => {}
+                    _ = wait_for_cancellation(cancelled.clone()) => {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if cancelled.load(Ordering::SeqCst) {
+            if let Some(stopped_run) = store
+                .acknowledge_stopping_run(run_id, Some("stop request acknowledged by worker"))?
+            {
+                let stopped_summary = store.summary(run_id)?;
+                store.append_event(
+                    Some(run_id),
+                    &ApiEvent::RunFailed {
+                        run: stopped_run,
+                        summary: stopped_summary,
+                        error: "stop request acknowledged by worker".to_string(),
+                    },
+                )?;
+            }
+            return Ok(());
         }
 
         let notes_text = if notes.is_empty() {
@@ -699,7 +914,7 @@ async fn process_run(
                     },
                 )?;
             }
-            RunStatus::Queued | RunStatus::InProgress => {}
+            RunStatus::Queued | RunStatus::InProgress | RunStatus::Stopping => {}
         }
 
         Ok(())
@@ -829,26 +1044,31 @@ async fn process_job(
     allow_active_authorized: bool,
 ) -> Result<()> {
     let (claim_shutdown_tx, claim_shutdown_rx) = oneshot::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let heartbeat_store = store.as_ref().clone();
     let heartbeat_worker_id = worker_id.clone();
     let job_id = job.id;
+    let heartbeat_cancelled = cancelled.clone();
     let heartbeat_handle = tokio::spawn(async move {
         job_claim_heartbeat(
             heartbeat_store,
             heartbeat_worker_id,
             job_id,
+            job.run_id,
             lease_seconds,
+            heartbeat_cancelled,
             claim_shutdown_rx,
         )
         .await
     });
 
     let outcome = async {
-        let (findings_count, telemetry, terminal_error, fetch_error) = match fetcher
-            .fetch_target(&job.target)
-            .await
-        {
-            Ok(report) => {
+        let fetch_result = tokio::select! {
+            result = fetcher.fetch_target(&job.target) => Some(result),
+            _ = wait_for_cancellation(cancelled.clone()) => None,
+        };
+        let (findings_count, telemetry, terminal_error, fetch_error) = match fetch_result {
+            Some(Ok(report)) => {
                 let TargetFetchReport {
                     documents,
                     discovered_paths,
@@ -928,7 +1148,7 @@ async fn process_job(
                 };
                 (findings_count, telemetry, terminal_error, None)
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 let error_message = error.to_string();
                 (
                     0,
@@ -936,6 +1156,15 @@ async fn process_job(
                     Some(error_message.clone()),
                     Some(error_message),
                 )
+            }
+            None => {
+                if store
+                    .get_run(job.run_id)?
+                    .is_some_and(|run| matches!(run.status, RunStatus::Stopping | RunStatus::Failed))
+                {
+                    return Ok(());
+                }
+                return Err(anyhow!("job {} claim was lost before fetch completed", job.id));
             }
         };
 
@@ -993,17 +1222,54 @@ async fn process_port_scan(
     port_scan: PortScanRecord,
 ) -> Result<()> {
     let (claim_shutdown_tx, claim_shutdown_rx) = oneshot::channel();
+    let (progress_shutdown_tx, progress_shutdown_rx) = oneshot::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
     let heartbeat_store = store.clone();
     let heartbeat_worker_id = worker_id.to_string();
     let lease_seconds = config.storage.redis_run_lease_seconds;
     let port_scan_id = port_scan.id;
+    let heartbeat_cancelled = cancelled.clone();
     let heartbeat_handle = tokio::spawn(async move {
         port_scan_claim_heartbeat(
             heartbeat_store,
             heartbeat_worker_id,
             port_scan_id,
             lease_seconds,
+            heartbeat_cancelled,
             claim_shutdown_rx,
+        )
+        .await
+    });
+    let adapter = select_scanner_adapter(&worker_runtime.scanner_adapters, &port_scan)?;
+    let output_path = build_scanner_output_path(&adapter.name, port_scan.id);
+    let checkpoint_path = build_scanner_checkpoint_path(&output_path);
+    let resume_state = store.load_port_scan_resume_state(port_scan.id)?;
+    let should_resume =
+        restore_port_scan_resume_state(&output_path, &checkpoint_path, resume_state.as_ref())?;
+    if should_resume {
+        let _ = store.annotate_port_scan_if_owned(
+            port_scan.id,
+            "resumed port scan from persisted checkpoint",
+        )?;
+    }
+    let progress_store = store.clone();
+    let progress_target_range = port_scan.target_range.clone();
+    let progress_ports = port_scan.ports.clone();
+    let progress_output_format = adapter.output_format().to_string();
+    let progress_output_path = output_path.clone();
+    let progress_checkpoint_path = checkpoint_path.clone();
+    let progress_cancelled = cancelled.clone();
+    let progress_handle = tokio::spawn(async move {
+        port_scan_progress_reporter(
+            progress_store,
+            port_scan_id,
+            progress_target_range,
+            progress_ports,
+            progress_output_format,
+            progress_output_path,
+            progress_checkpoint_path,
+            progress_cancelled,
+            progress_shutdown_rx,
         )
         .await
     });
@@ -1013,8 +1279,15 @@ async fn process_port_scan(
             store.append_event(None, &ApiEvent::PortScanStarted { port_scan: started })?;
         }
 
-        let execution =
-            execute_scanner_adapter(&port_scan, &worker_runtime.scanner_adapters).await?;
+        let execution = execute_scanner_adapter(
+            &port_scan,
+            adapter,
+            &output_path,
+            &checkpoint_path,
+            should_resume,
+            cancelled.clone(),
+        )
+        .await?;
         let protocol_findings = derive_protocol_plugin_findings_with_active_mode(
             &execution.discovered_endpoints,
             port_scan.active_authorized_plugins.is_enabled()
@@ -1032,7 +1305,8 @@ async fn process_port_scan(
             &port_scan,
             &execution.discovered_endpoints,
             &worker_runtime.importers,
-        )?;
+        )
+        .await?;
         let follow_on = queue_follow_on_run_for_targets(
             store,
             &port_scan,
@@ -1044,6 +1318,9 @@ async fn process_port_scan(
         )?;
 
         let mut notes = execution.notes;
+        if should_resume {
+            notes.push("resumed port scan from persisted checkpoint".to_string());
+        }
         if !protocol_findings.is_empty() {
             notes.push(format!(
                 "identified {} authless protocol plugin match(es)",
@@ -1108,18 +1385,37 @@ async fn process_port_scan(
 
     if let Err(error) = &outcome {
         let error_message = error.to_string();
-        if let Some(failed) = store.fail_port_scan_if_owned(port_scan.id, Some(&error_message))? {
+        if !cancelled.load(Ordering::SeqCst) {
+            if let Some(failed) =
+                store.fail_port_scan_if_owned(port_scan.id, Some(&error_message))?
+            {
+                store.append_event(
+                    None,
+                    &ApiEvent::PortScanFailed {
+                        port_scan: failed,
+                        error: error_message,
+                    },
+                )?;
+            }
+        } else if let Some(failed) = store.acknowledge_stopping_port_scan(
+            port_scan.id,
+            Some("stop request acknowledged by worker"),
+        )? {
             store.append_event(
                 None,
                 &ApiEvent::PortScanFailed {
                     port_scan: failed,
-                    error: error_message,
+                    error: "stop request acknowledged by worker".to_string(),
                 },
             )?;
         }
     }
 
+    let _ = progress_shutdown_tx.send(());
     let _ = claim_shutdown_tx.send(());
+    if let Err(error) = progress_handle.await {
+        warn!(port_scan_id = port_scan.id, %error, "port scan progress reporter task failed");
+    }
     let heartbeat_result = match heartbeat_handle.await {
         Ok(result) => result,
         Err(error) => Err(anyhow!("port scan claim heartbeat task failed: {error}")),
@@ -1469,26 +1765,36 @@ fn select_bootstrap_provisioner<'a>(
 
 async fn execute_scanner_adapter(
     port_scan: &PortScanRecord,
-    scanner_adapters: &[ExtensionManifest],
+    adapter: &ExtensionManifest,
+    output_path: &Path,
+    checkpoint_path: &Path,
+    should_resume: bool,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<ScannerExecutionResult> {
-    let adapter = select_scanner_adapter(scanner_adapters, port_scan)?;
     let command = adapter
         .resolved_command()
         .ok_or_else(|| anyhow!("scanner adapter {} is missing a command", adapter.name))?;
-    let output_path = build_scanner_output_path(&adapter.name, port_scan.id);
     let rendered_command =
-        render_scanner_template(&command, port_scan, Some(&output_path), adapter);
+        render_scanner_template(&command, port_scan, Some(output_path), adapter);
     let rendered_args = adapter
         .args
         .iter()
-        .map(|value| render_scanner_template(value, port_scan, Some(&output_path), adapter))
+        .map(|value| render_scanner_template(value, port_scan, Some(output_path), adapter))
         .collect::<Vec<_>>();
+    let output_path_value = output_path.to_string_lossy().into_owned();
+    let checkpoint_path_value = checkpoint_path.to_string_lossy().into_owned();
+    let scanner_target_range = scanner_target_range_for_adapter(&port_scan.target_range);
     let invocation = serde_json::to_vec(&ScannerAdapterInvocation {
         port_scan_id: port_scan.id,
-        target_range: &port_scan.target_range,
+        target_range: &scanner_target_range,
         ports: &port_scan.ports,
         schemes: port_scan.schemes.as_str(),
         rate_limit: port_scan.rate_limit,
+        sender_threads: port_scan.scanner_sender_threads,
+        receiver_threads: port_scan.scanner_receiver_threads,
+        output_path: &output_path_value,
+        checkpoint_path: Some(&checkpoint_path_value),
+        resume: should_resume,
         requested_by: port_scan.requested_by.as_deref(),
         tags: &port_scan.tags,
         adapter_name: &adapter.name,
@@ -1496,7 +1802,7 @@ async fn execute_scanner_adapter(
     .context("failed to serialize scanner adapter invocation")?;
     let adapter_name = adapter.name.clone();
     let output_format = adapter.output_format().to_string();
-    let output_path_for_process = output_path.clone();
+    let output_path_for_process = output_path.to_path_buf();
 
     let output = tokio::task::spawn_blocking(move || {
         run_scanner_process(
@@ -1504,6 +1810,7 @@ async fn execute_scanner_adapter(
             rendered_args,
             invocation,
             output_path_for_process,
+            cancelled,
         )
     })
     .await
@@ -1536,13 +1843,13 @@ async fn execute_scanner_adapter(
     }
 
     let raw_output = if output_path.exists() {
-        let contents = fs::read_to_string(&output_path).with_context(|| {
+        let contents = fs::read_to_string(output_path).with_context(|| {
             format!(
                 "failed to read scanner adapter output file {}",
                 output_path.display()
             )
         })?;
-        let _ = fs::remove_file(&output_path);
+        let _ = fs::remove_file(output_path);
         if contents.trim().is_empty() {
             stdout
         } else {
@@ -1575,6 +1882,7 @@ fn run_scanner_process(
     args: Vec<String>,
     invocation: Vec<u8>,
     output_path: PathBuf,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<std::process::Output> {
     let mut child = ProcessCommand::new(&command)
         .args(&args)
@@ -1590,15 +1898,66 @@ fn run_scanner_process(
             .context("failed to write scanner adapter invocation")?;
     }
 
+    let was_cancelled = loop {
+        if child
+            .try_wait()
+            .context("failed while waiting for scanner adapter command")?
+            .is_some()
+        {
+            break false;
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            terminate_child_process_tree(child.id());
+            let _ = child.kill();
+            break true;
+        }
+        thread::sleep(Duration::from_millis(200));
+    };
+
     let output = child
         .wait_with_output()
         .context("failed to wait for scanner adapter command")?;
+
+    if was_cancelled {
+        return Err(anyhow!("scanner adapter command {command} cancelled"));
+    }
 
     if output_path.exists() && output.stdout.is_empty() {
         return Ok(output);
     }
 
     Ok(output)
+}
+
+fn terminate_child_process_tree(parent_pid: u32) {
+    let child_pids = read_child_process_ids(parent_pid);
+    if child_pids.is_empty() {
+        return;
+    }
+    for pid in &child_pids {
+        let _ = ProcessCommand::new("/bin/kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status();
+    }
+    thread::sleep(Duration::from_millis(250));
+    for pid in &child_pids {
+        let _ = ProcessCommand::new("/bin/kill")
+            .arg("-KILL")
+            .arg(pid.to_string())
+            .status();
+    }
+}
+
+fn read_child_process_ids(parent_pid: u32) -> Vec<u32> {
+    let path = format!("/proc/{}/task/{}/children", parent_pid, parent_pid);
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    contents
+        .split_whitespace()
+        .filter_map(|value| value.parse::<u32>().ok())
+        .collect()
 }
 
 fn select_scanner_adapter<'a>(
@@ -1759,6 +2118,54 @@ fn build_scanner_output_path(adapter_name: &str, port_scan_id: i64) -> PathBuf {
         "agent-{}-{}-{}.out",
         safe_name, port_scan_id, timestamp
     ))
+}
+
+fn build_scanner_checkpoint_path(output_path: &Path) -> PathBuf {
+    output_path.with_file_name(
+        output_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}.checkpoint"))
+            .unwrap_or_else(|| "scanner.checkpoint".to_string()),
+    )
+}
+
+fn restore_port_scan_resume_state(
+    output_path: &Path,
+    checkpoint_path: &Path,
+    resume_state: Option<&PortScanResumeStateRecord>,
+) -> Result<bool> {
+    let Some(resume_state) = resume_state else {
+        return Ok(false);
+    };
+    let mut restored = false;
+    if let Some(output_snapshot) = resume_state
+        .output_snapshot
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        fs::write(output_path, output_snapshot).with_context(|| {
+            format!(
+                "failed to restore port scan output snapshot {}",
+                output_path.display()
+            )
+        })?;
+        restored = true;
+    }
+    if let Some(checkpoint_data) = resume_state
+        .checkpoint_data
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        fs::write(checkpoint_path, checkpoint_data).with_context(|| {
+            format!(
+                "failed to restore port scan checkpoint {}",
+                checkpoint_path.display()
+            )
+        })?;
+        restored = true;
+    }
+    Ok(restored)
 }
 
 fn parse_scanner_output(
@@ -2870,7 +3277,7 @@ fn single_requested_port(requested_ports: &str) -> Result<Option<u16>> {
     Ok((ports.len() == 1).then_some(ports[0]))
 }
 
-fn import_port_scan_targets(
+async fn import_port_scan_targets(
     config: &AppConfig,
     store: &AnyScanStore,
     port_scan: &PortScanRecord,
@@ -2882,13 +3289,15 @@ fn import_port_scan_targets(
     } else {
         run_importers(port_scan, discovered_endpoints, importers)?
     };
+    let selected_targets =
+        select_follow_on_targets_for_port_scan(config, port_scan, generated_targets).await?;
 
     let mut target_ids = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes = selected_targets.notes;
     let mut normalized_targets = HashSet::new();
     let target_tags = normalized_port_scan_tags(&port_scan.tags);
 
-    for generated_target in generated_targets {
+    for generated_target in selected_targets.targets {
         let generated_target = merge_imported_target_definition(generated_target, &target_tags);
         let target = config.normalize_target_definition(generated_target)?;
         if !normalized_targets.insert(target.base_url.clone()) {
@@ -2934,6 +3343,201 @@ fn build_builtin_import_targets(
     }
 
     targets
+}
+
+async fn select_follow_on_targets_for_port_scan(
+    config: &AppConfig,
+    port_scan: &PortScanRecord,
+    generated_targets: Vec<TargetDefinition>,
+) -> Result<SelectedFollowOnTargets> {
+    let selection_mode = port_scan.follow_on_run_policy.selection_mode;
+
+    if matches!(selection_mode, PortScanFollowOnSelectionMode::Raw) {
+        return Ok(apply_follow_on_selection_mode_to_targets(
+            generated_targets,
+            selection_mode,
+            &HashSet::new(),
+        ));
+    }
+
+    let validated_urls = validate_follow_on_target_urls(config, &generated_targets).await?;
+    Ok(apply_follow_on_selection_mode_to_targets(
+        generated_targets,
+        selection_mode,
+        &validated_urls,
+    ))
+}
+
+fn follow_on_selection_mode_label(mode: PortScanFollowOnSelectionMode) -> &'static str {
+    match mode {
+        PortScanFollowOnSelectionMode::Raw => "raw",
+        PortScanFollowOnSelectionMode::Validated => "validated",
+        PortScanFollowOnSelectionMode::Both => "both",
+    }
+}
+
+fn validated_target_tag(base_url: &str) -> Option<&'static str> {
+    if base_url.starts_with("https://") {
+        Some("validated-https")
+    } else if base_url.starts_with("http://") {
+        Some("validated-http")
+    } else {
+        None
+    }
+}
+
+fn apply_follow_on_selection_mode_to_targets(
+    generated_targets: Vec<TargetDefinition>,
+    selection_mode: PortScanFollowOnSelectionMode,
+    validated_urls: &HashSet<String>,
+) -> SelectedFollowOnTargets {
+    let raw_candidate_total = generated_targets.len();
+    if matches!(selection_mode, PortScanFollowOnSelectionMode::Raw) {
+        return SelectedFollowOnTargets {
+            targets: generated_targets,
+            notes: vec![format!(
+                "follow-on target mode raw kept {} candidate target(s)",
+                raw_candidate_total
+            )],
+        };
+    }
+
+    let mut validated_count = 0usize;
+    let mut selected = Vec::new();
+    for mut target in generated_targets {
+        if !validated_urls.contains(&target.base_url) {
+            continue;
+        }
+        validated_count += 1;
+        if let Some(tag) = validated_target_tag(&target.base_url) {
+            if !target
+                .tags
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(tag))
+            {
+                target.tags.push(tag.to_string());
+            }
+        }
+        selected.push(target);
+    }
+
+    let mut notes = vec![format!(
+        "follow-on target mode {} validated {} of {} candidate target(s)",
+        follow_on_selection_mode_label(selection_mode),
+        validated_count,
+        raw_candidate_total
+    )];
+    if matches!(selection_mode, PortScanFollowOnSelectionMode::Both) {
+        notes.push("raw discovered endpoint metadata remains available for benchmarking".to_string());
+    }
+
+    SelectedFollowOnTargets {
+        targets: selected,
+        notes,
+    }
+}
+
+fn validation_transport_attempts(
+    proxy_mode: ProxyMode,
+    has_proxy: bool,
+) -> Vec<ValidationTransport> {
+    match proxy_mode {
+        ProxyMode::DirectOnly => vec![ValidationTransport::Direct],
+        ProxyMode::PreferProxy => {
+            if has_proxy {
+                vec![ValidationTransport::Proxy]
+            } else {
+                vec![ValidationTransport::Direct]
+            }
+        }
+        ProxyMode::ProxyOnly => {
+            if has_proxy {
+                vec![ValidationTransport::Proxy]
+            } else {
+                Vec::new()
+            }
+        }
+        ProxyMode::ProxyThenDirect => {
+            if has_proxy {
+                vec![ValidationTransport::Proxy, ValidationTransport::Direct]
+            } else {
+                vec![ValidationTransport::Direct]
+            }
+        }
+        ProxyMode::DirectThenProxy => {
+            if has_proxy {
+                vec![ValidationTransport::Direct, ValidationTransport::Proxy]
+            } else {
+                vec![ValidationTransport::Direct]
+            }
+        }
+    }
+}
+
+async fn validate_follow_on_target_urls(
+    config: &AppConfig,
+    generated_targets: &[TargetDefinition],
+) -> Result<HashSet<String>> {
+    let mut unique_urls = Vec::new();
+    let mut seen_urls = HashSet::new();
+    for target in generated_targets {
+        if seen_urls.insert(target.base_url.clone()) {
+            unique_urls.push(target.base_url.clone());
+        }
+    }
+    if unique_urls.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let direct_client = build_http_client(&config.scan, None)?;
+    let proxy_url = resolve_scan_proxy_url(&config.scan);
+    let proxy_client = match proxy_url.as_deref() {
+        Some(url) => Some(build_http_client(&config.scan, Some(url))?),
+        None => None,
+    };
+    let transports = validation_transport_attempts(config.scan.proxy_mode, proxy_client.is_some());
+    let validation_concurrency = config.scan.probe_concurrency.max(1);
+
+    let validated_urls = stream::iter(unique_urls.into_iter().map(|base_url| {
+        let direct_client = direct_client.clone();
+        let proxy_client = proxy_client.clone();
+        let transports = transports.clone();
+        async move {
+            let is_valid =
+                validate_follow_on_target_url(&base_url, &direct_client, proxy_client.as_ref(), &transports).await;
+            (base_url, is_valid)
+        }
+    }))
+    .buffer_unordered(validation_concurrency)
+    .collect::<Vec<_>>()
+    .await;
+
+    Ok(validated_urls
+        .into_iter()
+        .filter_map(|(base_url, is_valid)| is_valid.then_some(base_url))
+        .collect())
+}
+
+async fn validate_follow_on_target_url(
+    base_url: &str,
+    direct_client: &reqwest::Client,
+    proxy_client: Option<&reqwest::Client>,
+    transports: &[ValidationTransport],
+) -> bool {
+    for transport in transports {
+        let client = match transport {
+            ValidationTransport::Direct => direct_client,
+            ValidationTransport::Proxy => match proxy_client {
+                Some(client) => client,
+                None => continue,
+            },
+        };
+        match client.get(base_url).send().await {
+            Ok(_response) => return true,
+            Err(_error) => continue,
+        }
+    }
+    false
 }
 
 fn run_importers(
@@ -3149,14 +3753,33 @@ async fn port_scan_claim_heartbeat(
     _worker_id: String,
     port_scan_id: i64,
     lease_seconds: u64,
+    cancelled: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let interval = run_claim_heartbeat_interval(lease_seconds);
+    let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let mut next_renewal = tokio::time::Instant::now() + renew_interval;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(interval) => {
-                store.renew_port_scan_claim(port_scan_id, lease_seconds)?;
+            _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
+                match store.get_port_scan(port_scan_id)? {
+                    Some(port_scan) if matches!(port_scan.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    None => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= next_renewal {
+                    if let Err(error) = store.renew_port_scan_claim(port_scan_id, lease_seconds) {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                }
             }
         }
     }
@@ -3169,12 +3792,16 @@ async fn bootstrap_job_claim_heartbeat(
     lease_seconds: u64,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let interval = run_claim_heartbeat_interval(lease_seconds);
+    let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let mut next_renewal = tokio::time::Instant::now() + renew_interval;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(interval) => {
-                store.renew_bootstrap_job_claim(bootstrap_job_id, lease_seconds)?;
+            _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
+                if tokio::time::Instant::now() >= next_renewal {
+                    store.renew_bootstrap_job_claim(bootstrap_job_id, lease_seconds)?;
+                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                }
             }
         }
     }
@@ -3184,15 +3811,35 @@ async fn job_claim_heartbeat(
     store: AnyScanStore,
     _worker_id: String,
     job_id: i64,
+    run_id: i64,
     lease_seconds: u64,
+    cancelled: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let interval = run_claim_heartbeat_interval(lease_seconds);
+    let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let mut next_renewal = tokio::time::Instant::now() + renew_interval;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(interval) => {
-                store.renew_job_claim(job_id, lease_seconds)?;
+            _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
+                match store.get_run(run_id)? {
+                    Some(run) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    None => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= next_renewal {
+                    if let Err(error) = store.renew_job_claim(job_id, lease_seconds) {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Err(error);
+                    }
+                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                }
             }
         }
     }
@@ -3203,14 +3850,30 @@ async fn run_claim_heartbeat(
     _worker_id: String,
     run_id: i64,
     lease_seconds: u64,
+    cancelled: Arc<AtomicBool>,
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
-    let interval = run_claim_heartbeat_interval(lease_seconds);
+    let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let mut next_renewal = tokio::time::Instant::now() + renew_interval;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = tokio::time::sleep(interval) => {
-                store.renew_run_claim(run_id, lease_seconds)?;
+            _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
+                match store.get_run(run_id)? {
+                    Some(run) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    None => {
+                        cancelled.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= next_renewal {
+                    store.renew_run_claim(run_id, lease_seconds)?;
+                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                }
             }
         }
     }
@@ -3222,6 +3885,257 @@ fn run_claim_heartbeat_interval(lease_seconds: u64) -> Duration {
 
 fn run_completion_poll_interval(lease_seconds: u64) -> Duration {
     Duration::from_secs(lease_seconds.saturating_div(6).max(1))
+}
+
+async fn wait_for_cancellation(cancelled: Arc<AtomicBool>) {
+    while !cancelled.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn port_scan_progress_reporter(
+    store: AnyScanStore,
+    port_scan_id: i64,
+    target_range: String,
+    requested_ports: String,
+    output_format: String,
+    output_path: PathBuf,
+    checkpoint_path: PathBuf,
+    cancelled: Arc<AtomicBool>,
+    mut shutdown: oneshot::Receiver<()>,
+) -> Result<()> {
+    let mut last_count = 0u64;
+    let mut last_probe_rate = 0u64;
+    let mut last_receive_rate = 0u64;
+    let mut last_progress_percent = None;
+    let mut last_checkpoint_data = None::<String>;
+    let mut last_output_snapshot = None::<String>;
+    let scanner_interface = resolve_scanner_interface_name();
+    let mut last_interface_counters = scanner_interface
+        .as_deref()
+        .and_then(read_interface_packet_counters);
+    let mut last_interface_sample_at = Instant::now();
+    let mut estimated_sent_total = 0u64;
+    let total_targets_estimate = estimate_target_packet_total(&target_range, &requested_ports);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                if cancelled.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let mut progress = read_scanner_progress_count(&output_path, &requested_ports, &output_format)?;
+                if progress.probe_rate_millis == 0
+                    && progress.receive_rate_millis == 0
+                    && progress.progress_percent.is_none()
+                {
+                    if let Some(interface_name) = scanner_interface.as_deref() {
+                        if let Some(current_counters) = read_interface_packet_counters(interface_name) {
+                            let now = Instant::now();
+                            let elapsed = now.saturating_duration_since(last_interface_sample_at);
+                            if let Some(previous) = last_interface_counters {
+                                let tx_delta = current_counters.tx_packets.saturating_sub(previous.tx_packets);
+                                let rx_delta = current_counters.rx_packets.saturating_sub(previous.rx_packets);
+                                if elapsed.as_secs_f64() > 0.0 {
+                                    progress.probe_rate_millis =
+                                        ((tx_delta as f64 / elapsed.as_secs_f64()) * 1000.0) as u64;
+                                    progress.receive_rate_millis =
+                                        ((rx_delta as f64 / elapsed.as_secs_f64()) * 1000.0) as u64;
+                                }
+                                estimated_sent_total = estimated_sent_total.saturating_add(tx_delta);
+                                if let Some(total_targets) = total_targets_estimate.filter(|value| *value > 0) {
+                                    let percent = ((estimated_sent_total as f64 / total_targets as f64) * 100.0)
+                                        .clamp(0.0, 100.0);
+                                    progress.progress_percent = Some(percent as u64);
+                                }
+                            }
+                            last_interface_counters = Some(current_counters);
+                            last_interface_sample_at = now;
+                        }
+                    }
+                }
+                if progress.discovered_endpoints_total > last_count
+                    || progress.probe_rate_millis != last_probe_rate
+                    || progress.receive_rate_millis != last_receive_rate
+                    || progress.progress_percent != last_progress_percent
+                {
+                    last_count = progress.discovered_endpoints_total;
+                    last_probe_rate = progress.probe_rate_millis;
+                    last_receive_rate = progress.receive_rate_millis;
+                    last_progress_percent = progress.progress_percent;
+                    let _ = store.update_port_scan_progress_if_owned(
+                        port_scan_id,
+                        progress.discovered_endpoints_total,
+                        progress.probe_rate_millis,
+                        progress.receive_rate_millis,
+                        progress.progress_percent,
+                    )?;
+                }
+                let checkpoint_data = fs::read_to_string(&checkpoint_path)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+                let output_snapshot = fs::read_to_string(&output_path)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty());
+                if checkpoint_data != last_checkpoint_data || output_snapshot != last_output_snapshot
+                {
+                    last_checkpoint_data = checkpoint_data.clone();
+                    last_output_snapshot = output_snapshot.clone();
+                    let _ = store.update_port_scan_resume_state_if_owned(
+                        port_scan_id,
+                        checkpoint_data.as_deref(),
+                        output_snapshot.as_deref(),
+                    )?;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ScannerProgressCounts {
+    discovered_endpoints_total: u64,
+    probe_rate_millis: u64,
+    receive_rate_millis: u64,
+    progress_percent: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NetworkPacketCounters {
+    tx_packets: u64,
+    rx_packets: u64,
+}
+
+fn read_scanner_progress_count(
+    output_path: &Path,
+    requested_ports: &str,
+    output_format: &str,
+) -> Result<ScannerProgressCounts> {
+    let mut progress = ScannerProgressCounts::default();
+    if output_path.exists() {
+        let contents = fs::read_to_string(output_path)
+            .with_context(|| format!("failed to read scanner progress file {}", output_path.display()))?;
+        progress.discovered_endpoints_total = match output_format {
+            "endpoint_lines" => contents
+                .lines()
+                .filter_map(|line| {
+                    let token = line.trim();
+                    if token.is_empty() || token.starts_with('#') {
+                        return None;
+                    }
+                    parse_endpoint_token(token, single_requested_port(requested_ports).ok().flatten())
+                        .ok()
+                        .flatten()
+                        .map(|endpoint| format!("{}:{}", endpoint.host, endpoint.port))
+                })
+                .collect::<HashSet<_>>()
+                .len() as u64,
+            _ => contents
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count() as u64,
+        };
+    }
+    let progress_path = output_path.with_file_name(
+        output_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}.progress"))
+            .unwrap_or_else(|| "scanner.progress".to_string()),
+    );
+    if progress_path.exists() {
+        if let Ok(contents) = fs::read_to_string(&progress_path) {
+            if let Ok(snapshot) = serde_json::from_str::<ScannerProgressSnapshot>(&contents) {
+                progress.probe_rate_millis = snapshot.probe_rate_millis;
+                progress.receive_rate_millis = snapshot.receive_rate_millis;
+                progress.progress_percent = snapshot.progress_percent;
+            }
+        }
+    }
+    Ok(progress)
+}
+
+fn resolve_scanner_interface_name() -> Option<String> {
+    if let Some(value) = resolve_optional_env("SCANNER_INTERFACE") {
+        return Some(value);
+    }
+    let contents = fs::read_to_string("/proc/net/route").ok()?;
+    for line in contents.lines().skip(1) {
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        if columns.len() > 2 && columns[1] == "00000000" {
+            let iface = columns[0].trim();
+            if !iface.is_empty() {
+                return Some(iface.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn read_interface_packet_counters(interface_name: &str) -> Option<NetworkPacketCounters> {
+    let base = PathBuf::from("/sys/class/net")
+        .join(interface_name)
+        .join("statistics");
+    let tx_packets = fs::read_to_string(base.join("tx_packets"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    let rx_packets = fs::read_to_string(base.join("rx_packets"))
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(NetworkPacketCounters {
+        tx_packets,
+        rx_packets,
+    })
+}
+
+fn estimate_target_packet_total(target_range: &str, requested_ports: &str) -> Option<u64> {
+    let (start, end) = parse_ipv4_target_range_bounds(target_range)?;
+    let host_count = end.saturating_sub(start).saturating_add(1);
+    let port_count = parse_port_scan_ports(requested_ports).ok()?.len() as u64;
+    if port_count == 0 {
+        return None;
+    }
+    Some(host_count.saturating_mul(port_count))
+}
+
+fn parse_ipv4_target_range_bounds(target_range: &str) -> Option<(u64, u64)> {
+    let trimmed = target_range.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((ip_text, prefix_text)) = trimmed.split_once('/') {
+        let ip = ip_text.trim().parse::<Ipv4Addr>().ok()?;
+        let prefix = prefix_text.trim().parse::<u8>().ok()?;
+        if prefix > 32 {
+            return None;
+        }
+        let ip_u32 = u32::from(ip);
+        let mask = if prefix == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix)
+        };
+        let network = ip_u32 & mask;
+        let broadcast = network | !mask;
+        return Some((network as u64, broadcast as u64));
+    }
+    if let Some((start_text, end_text)) = trimmed.split_once('-') {
+        let start = start_text.trim().parse::<Ipv4Addr>().ok()?;
+        let end = end_text.trim().parse::<Ipv4Addr>().ok()?;
+        let start = u32::from(start) as u64;
+        let end = u32::from(end) as u64;
+        if start > end {
+            return None;
+        }
+        return Some((start, end));
+    }
+    let ip = trimmed.parse::<Ipv4Addr>().ok()?;
+    let value = u32::from(ip) as u64;
+    Some((value, value))
 }
 
 fn create_bootstrap_candidates_for_port_scan(
@@ -3312,9 +4226,21 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
     let supports_remote_debug_commands =
         resolve_bool_env_aliases(REMOTE_DEBUG_ENABLED_ENV_NAMES).unwrap_or(false);
     let remote_update_plan = resolve_remote_update_plan();
+    let max_active_tasks = resolve_usize_env_aliases_or_runtime_file(MAX_ACTIVE_TASKS_ENV_NAMES)
+        .filter(|value| *value > 0)
+        .unwrap_or(2);
     let network_identity = detect_worker_network_identity();
     let platform_identity = detect_worker_platform_identity();
     let remote_update_state = read_remote_update_state();
+    let installed_bundle_name =
+        resolve_optional_env_aliases_or_runtime_file(INSTALLED_BUNDLE_NAME_ENV_NAMES);
+    let agent_concurrency = resolve_u64_env_aliases_or_runtime_file(AGENT_CONCURRENCY_ENV_NAMES);
+    let scanner_default_rate =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_DEFAULT_RATE_ENV_NAMES);
+    let scanner_sender_threads =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_SENDER_THREADS_ENV_NAMES);
+    let scanner_receiver_threads =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_RECEIVER_THREADS_ENV_NAMES);
     let registration = WorkerRegistration {
         worker_id: worker_id.to_string(),
         display_name,
@@ -3342,6 +4268,12 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
         remote_update_status: remote_update_state.status,
         remote_update_status_message: remote_update_state.message,
         remote_update_status_updated_at: remote_update_state.updated_at,
+        installed_bundle_name,
+        max_active_tasks: Some(max_active_tasks as u64),
+        agent_concurrency,
+        scanner_default_rate,
+        scanner_sender_threads,
+        scanner_receiver_threads,
         enrollment_token,
     };
 
@@ -3351,6 +4283,7 @@ fn build_worker_runtime(config: &AppConfig, worker_id: &str) -> Result<WorkerRun
         importers,
         provisioners,
         remote_update_plan,
+        max_active_tasks,
     })
 }
 
@@ -3564,6 +4497,7 @@ fn read_remote_update_state() -> WorkerRemoteUpdateState {
     for line in contents.lines() {
         if let Some(value) = line.strip_prefix("STATUS=") {
             status = match value.trim() {
+                "queued" => Some(WorkerRemoteUpdateStatus::Queued),
                 "running" => Some(WorkerRemoteUpdateStatus::Running),
                 "success" => Some(WorkerRemoteUpdateStatus::Success),
                 "failed" => Some(WorkerRemoteUpdateStatus::Failed),
@@ -3590,6 +4524,35 @@ fn read_remote_update_state() -> WorkerRemoteUpdateState {
     }
 }
 
+fn write_remote_update_state(status: WorkerRemoteUpdateStatus, message: &str) -> Result<()> {
+    let status_file = resolve_optional_env_aliases(REMOTE_UPDATE_STATUS_FILE_ENV_NAMES)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/agentd/remote-update.status"));
+    let parent = status_file
+        .parent()
+        .ok_or_else(|| anyhow!("remote update status file has no parent directory"))?;
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create remote update status directory {}",
+            parent.display()
+        )
+    })?;
+    let temp_path = status_file.with_extension("status.tmp");
+    fs::write(
+        &temp_path,
+        format!(
+            "STATUS={}\nUPDATED_AT={}\nMESSAGE={}\n",
+            status.as_str(),
+            Utc::now().to_rfc3339(),
+            message.trim()
+        ),
+    )
+    .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, &status_file)
+        .with_context(|| format!("failed to move status into {}", status_file.display()))?;
+    Ok(())
+}
+
 fn resolve_optional_env(name: &str) -> Option<String> {
     env::var(name)
         .ok()
@@ -3599,6 +4562,35 @@ fn resolve_optional_env(name: &str) -> Option<String> {
 
 fn resolve_optional_env_aliases(names: &[&str]) -> Option<String> {
     names.iter().find_map(|name| resolve_optional_env(name))
+}
+
+fn resolve_optional_env_aliases_or_runtime_file(names: &[&str]) -> Option<String> {
+    resolve_optional_env_aliases(names).or_else(|| {
+        names
+            .iter()
+            .find_map(|name| load_env_value_from_runtime_file(DEFAULT_RUNTIME_ENV_FILE_PATH, name))
+    })
+}
+
+fn resolve_u64_env_aliases_or_runtime_file(names: &[&str]) -> Option<u64> {
+    resolve_optional_env_aliases_or_runtime_file(names)
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn resolve_usize_env_aliases_or_runtime_file(names: &[&str]) -> Option<usize> {
+    resolve_optional_env_aliases_or_runtime_file(names)
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn load_env_value_from_runtime_file(path: &str, key: &str) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let needle = format!("{key}=");
+    content.lines().find_map(|line| {
+        line.strip_prefix(&needle)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
 }
 
 fn resolve_worker_bootstrap_support() -> bool {
@@ -3616,6 +4608,19 @@ fn resolve_bool_env(name: &str) -> Option<bool> {
 
 fn resolve_bool_env_aliases(names: &[&str]) -> Option<bool> {
     names.iter().find_map(|name| resolve_bool_env(name))
+}
+
+fn resolve_usize_env_aliases(names: &[&str]) -> Option<usize> {
+    names.iter()
+        .find_map(|name| resolve_optional_env(name).and_then(|value| value.parse::<usize>().ok()))
+}
+
+fn top_level_task_kind_label(kind: TopLevelTaskKind) -> &'static str {
+    match kind {
+        TopLevelTaskKind::BootstrapJob => "bootstrap_job",
+        TopLevelTaskKind::PortScan => "port_scan",
+        TopLevelTaskKind::Run => "run",
+    }
 }
 
 fn worker_registration_ttl_seconds(config: &AppConfig) -> u64 {
@@ -3665,6 +4670,19 @@ fn refresh_dynamic_worker_registration(registration: &WorkerRegistration) -> Wor
     refreshed.remote_update_status = remote_update_state.status;
     refreshed.remote_update_status_message = remote_update_state.message;
     refreshed.remote_update_status_updated_at = remote_update_state.updated_at;
+    refreshed.installed_bundle_name =
+        resolve_optional_env_aliases_or_runtime_file(INSTALLED_BUNDLE_NAME_ENV_NAMES);
+    refreshed.max_active_tasks = Some(resolve_usize_env_aliases(MAX_ACTIVE_TASKS_ENV_NAMES)
+        .filter(|value| *value > 0)
+        .unwrap_or(2) as u64);
+    refreshed.agent_concurrency =
+        resolve_u64_env_aliases_or_runtime_file(AGENT_CONCURRENCY_ENV_NAMES);
+    refreshed.scanner_default_rate =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_DEFAULT_RATE_ENV_NAMES);
+    refreshed.scanner_sender_threads =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_SENDER_THREADS_ENV_NAMES);
+    refreshed.scanner_receiver_threads =
+        resolve_u64_env_aliases_or_runtime_file(SCANNER_RECEIVER_THREADS_ENV_NAMES);
     refreshed
 }
 
@@ -3674,23 +4692,60 @@ fn maybe_schedule_remote_update(
     requested_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<bool> {
     let Some(plan) = worker_runtime.remote_update_plan.as_ref() else {
+        let message = format!(
+            "remote update requested at {} but this worker has no local update plan",
+            requested_at
+        );
         warn!(
             worker_id = %worker_runtime.registration.worker_id,
             requested_at = %requested_at,
             "remote update was requested but this worker has no local update plan"
         );
-        return Ok(false);
+        let _ = write_remote_update_state(WorkerRemoteUpdateStatus::Failed, &message);
+        if let Err(error) = store.acknowledge_remote_update(requested_at) {
+            warn!(
+                worker_id = %worker_runtime.registration.worker_id,
+                requested_at = %requested_at,
+                %error,
+                "failed to acknowledge remote update request without local plan"
+            );
+            return Ok(false);
+        }
+        return Ok(true);
     };
 
-    write_remote_update_request(plan, &worker_runtime.registration.worker_id, requested_at)?;
-    store
-        .acknowledge_remote_update(requested_at)
-        .with_context(|| {
-            format!(
-                "failed to acknowledge remote update request for worker {}",
-                worker_runtime.registration.worker_id
-            )
-        })?;
+    if let Err(error) =
+        write_remote_update_request(plan, &worker_runtime.registration.worker_id, requested_at)
+    {
+        let message = format!("remote update scheduling failed: {error}");
+        warn!(
+            worker_id = %worker_runtime.registration.worker_id,
+            requested_at = %requested_at,
+            %error,
+            "failed to write remote update request file"
+        );
+        let _ = write_remote_update_state(WorkerRemoteUpdateStatus::Failed, &message);
+        if let Err(ack_error) = store.acknowledge_remote_update(requested_at) {
+            warn!(
+                worker_id = %worker_runtime.registration.worker_id,
+                requested_at = %requested_at,
+                %ack_error,
+                "failed to acknowledge remote update request after scheduling failure"
+            );
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+
+    if let Err(error) = store.acknowledge_remote_update(requested_at) {
+        warn!(
+            worker_id = %worker_runtime.registration.worker_id,
+            requested_at = %requested_at,
+            %error,
+            "failed to acknowledge remote update request after scheduling"
+        );
+        return Ok(true);
+    }
     info!(
         worker_id = %worker_runtime.registration.worker_id,
         requested_at = %requested_at,
@@ -3791,10 +4846,14 @@ fn load_effective_runtime_config(
 #[cfg(test)]
 mod tests {
     use super::{
-        DiscoveredEndpoint, ReportedProtocolPluginFinding,
+        DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
+        apply_follow_on_selection_mode_to_targets,
         derive_protocol_plugin_findings_with_active_mode, normalize_platform_architecture,
         normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
+        scanner_target_range_for_adapter, validated_target_tag,
     };
+    use anyscan::core::TargetDefinition;
+    use std::collections::HashSet;
 
     fn endpoint(
         host: &str,
@@ -3864,6 +4923,67 @@ mod tests {
             addresses,
             vec!["10.10.0.5".to_string(), "2001:db8::10".to_string()]
         );
+    }
+
+    #[test]
+    fn scanner_target_range_for_adapter_normalizes_single_ipv4_hosts_to_cidr32() {
+        assert_eq!(scanner_target_range_for_adapter("0.0.0.0"), "0.0.0.0/32");
+        assert_eq!(scanner_target_range_for_adapter("8.8.8.8"), "8.8.8.8/32");
+        assert_eq!(
+            scanner_target_range_for_adapter("10.0.0.0-10.0.0.255"),
+            "10.0.0.0-10.0.0.255"
+        );
+        assert_eq!(
+            scanner_target_range_for_adapter("10.0.0.0/24"),
+            "10.0.0.0/24"
+        );
+    }
+
+    #[test]
+    fn apply_follow_on_selection_mode_to_targets_respects_validated_and_both_modes() {
+        let targets = vec![
+            TargetDefinition {
+                label: "one".to_string(),
+                base_url: "http://example.com:80".to_string(),
+                ..TargetDefinition::default()
+            },
+            TargetDefinition {
+                label: "two".to_string(),
+                base_url: "https://example.com:443".to_string(),
+                ..TargetDefinition::default()
+            },
+        ];
+        let validated = HashSet::from(["https://example.com:443".to_string()]);
+
+        let selected = apply_follow_on_selection_mode_to_targets(
+            targets.clone(),
+            PortScanFollowOnSelectionMode::Validated,
+            &validated,
+        );
+        assert_eq!(selected.targets.len(), 1);
+        assert_eq!(selected.targets[0].base_url, "https://example.com:443");
+        assert!(selected.targets[0].tags.contains(&"validated-https".to_string()));
+
+        let both = apply_follow_on_selection_mode_to_targets(
+            targets,
+            PortScanFollowOnSelectionMode::Both,
+            &validated,
+        );
+        assert_eq!(both.targets.len(), 1);
+        assert!(both
+            .notes
+            .iter()
+            .any(|note| note.contains("raw discovered endpoint metadata remains available")));
+    }
+
+    #[test]
+    fn validated_target_tag_matches_http_and_https() {
+        assert_eq!(validated_target_tag("http://example.com:80"), Some("validated-http"));
+        assert_eq!(
+            validated_target_tag("https://example.com:443"),
+            Some("validated-https")
+        );
+        assert_eq!(validated_target_tag("ftp://example.com"), None);
     }
 
     #[test]

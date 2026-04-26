@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Read,
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -29,12 +29,14 @@ use crate::{
         FetchTelemetry, FindingRecord, FindingsQuery, HybridFindingsRanker, JobStatus, NewFinding,
         OptOutRecord, OptOutRequest, OwnershipClaimRecord, OwnershipClaimRequest,
         PortScanProtocolFindingRecord, PortScanRecord, PortScanRequest,
+        PortScanResumeStateRecord,
         PublicFindingModerationRecord, PublicFindingModerationRequest, PublicFindingRecord,
         PublicFindingSearchQuery, PublicFindingStatus, PublicResourceKind, PublicWorkflowStatus,
         PublicWorkflowStatusUpdate, RecurringScheduleRecord, RepositoryDefinition,
         RepositoryRecord, RunProgressSnapshot, RunScope, RunStatus, RunSummary,
         ScanDefaultsSummary, ScanJobRecord, ScanRunRecord, Severity, StoredEvent, TargetDefinition,
-        TargetRecord, WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
+        TargetRecord, WorkerActivityKind, WorkerActivitySnapshot,
+        WorkerBootstrapCandidateApproval, WorkerBootstrapCandidateApprovalRequest,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord,
         WorkerBootstrapCandidateRejectionRequest, WorkerBootstrapCandidateStatus,
         WorkerBootstrapCodeExchange, WorkerBootstrapCodeIssueRequest, WorkerBootstrapCodeIssued,
@@ -42,9 +44,10 @@ use crate::{
         WorkerBootstrapJobRecord, WorkerBootstrapJobStatus, WorkerEnrollmentTokenIssueRequest,
         WorkerEnrollmentTokenIssued, WorkerEnrollmentTokenRecord, WorkerLifecycleState,
         WorkerPoolRecord, WorkerRecord, WorkerRegistration, WorkerRemoteCommandRecord,
-        WorkerRemoteCommandRequest, WorkerRemoteCommandStatus, merge_coverage_source_stats,
-        normalize_public_finding_search_query, normalize_run_scope, run_findings_query,
-        sort_coverage_source_stats, utc_now,
+        WorkerRemoteCommandRequest, WorkerRemoteCommandStatus, WorkerRemoteUpdateStatus,
+        WorkerThroughputSummary,
+        merge_coverage_source_stats, normalize_public_finding_search_query, normalize_run_scope,
+        run_findings_query, sort_coverage_source_stats, utc_now,
     },
 };
 
@@ -171,6 +174,8 @@ struct StoredPortScan {
     claimed_by: Option<String>,
     #[serde(default)]
     claim_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    resume_state: PortScanResumeStateRecord,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,45 +660,79 @@ impl DragonflyAnyScanStore {
     ) -> Result<PortScanRecord> {
         self.with_state_mut(|state| {
             let now = utc_now();
-            let record = PortScanRecord {
-                id: state.next_port_scan_id(),
-                requested_by: requested_by.map(|value| value.to_string()),
-                target_range: request.target_range.trim().to_string(),
-                ports: request.ports.trim().to_string(),
-                schemes: request.schemes,
-                tags: request.tags.clone(),
-                rate_limit: request.rate_limit,
-                worker_pool: request.worker_pool.clone(),
-                bootstrap_policy: request.bootstrap_policy.clone(),
-                follow_on_run_policy: request.follow_on_run_policy.clone(),
-                active_authorized_plugins: active_authorized_plugins.clone(),
-                status: RunStatus::Queued,
-                started_at: now,
-                completed_at: None,
-                discovered_endpoints_total: 0,
-                imported_targets_total: 0,
-                bootstrap_candidates_total: 0,
-                queued_run_id: None,
-                protocol_findings: Vec::new(),
-                notes: None,
-            };
-            state.port_scans.push(StoredPortScan {
-                port_scan: record.clone(),
-                claimed_by: None,
-                claim_expires_at: None,
-            });
-            Ok(record)
+            let shard_ranges = split_port_scan_target_range(
+                request.target_range.trim(),
+                desired_port_scan_shard_count(state, request.worker_pool.as_deref(), now).max(1),
+            );
+            let group_id = state.next_port_scan_id();
+            let shard_total = shard_ranges.len() as u32;
+            let aggregate_target_range = request.target_range.trim().to_string();
+            let mut created = Vec::new();
+
+            for (index, shard_range) in shard_ranges.into_iter().enumerate() {
+                let shard_id = if index == 0 {
+                    group_id
+                } else {
+                    state.next_port_scan_id()
+                };
+                let record = PortScanRecord {
+                    id: shard_id,
+                    shard_group_id: (shard_total > 1).then_some(group_id),
+                    aggregate_target_range: (shard_total > 1)
+                        .then_some(aggregate_target_range.clone()),
+                    shard_index: (shard_total > 1).then_some(index as u32 + 1),
+                    shard_total: (shard_total > 1).then_some(shard_total),
+                    requested_by: requested_by.map(|value| value.to_string()),
+                    target_range: shard_range,
+                    ports: request.ports.trim().to_string(),
+                    schemes: request.schemes,
+                    tags: request.tags.clone(),
+                    rate_limit: request.rate_limit,
+                    scanner_sender_threads: request.scanner_sender_threads,
+                    scanner_receiver_threads: request.scanner_receiver_threads,
+                    worker_pool: request.worker_pool.clone(),
+                    bootstrap_policy: request.bootstrap_policy.clone(),
+                    follow_on_run_policy: request.follow_on_run_policy.clone(),
+                    active_authorized_plugins: active_authorized_plugins.clone(),
+                    status: RunStatus::Queued,
+                    started_at: now,
+                    completed_at: None,
+                    discovered_endpoints_total: 0,
+                    imported_targets_total: 0,
+                    bootstrap_candidates_total: 0,
+                    queued_run_id: None,
+                    follow_on_run_ids: Vec::new(),
+                    protocol_findings: Vec::new(),
+                    current_probe_rate_millis: 0,
+                    current_receive_rate_millis: 0,
+                    current_progress_percent: None,
+                    notes: None,
+                };
+                state.port_scans.push(StoredPortScan {
+                    port_scan: record.clone(),
+                    claimed_by: None,
+                    claim_expires_at: None,
+                    resume_state: PortScanResumeStateRecord::default(),
+                });
+                created.push(record);
+            }
+
+            Ok(aggregate_port_scan_records(created)
+                .into_iter()
+                .next()
+                .expect("created at least one port scan record"))
         })
     }
 
     pub fn list_port_scans(&self, limit: usize) -> Result<Vec<PortScanRecord>> {
-        self.with_state(|state| {
-            let mut port_scans = state
+        self.with_state_mut(|state| {
+            reconcile_orphaned_stopping_work_in_state(state, utc_now());
+            let port_scans = state
                 .port_scans
                 .iter()
                 .map(|record| record.port_scan.clone())
                 .collect::<Vec<_>>();
-            port_scans.sort_by(|left, right| right.id.cmp(&left.id));
+            let mut port_scans = aggregate_port_scan_records(port_scans);
             if limit > 0 {
                 port_scans.truncate(limit);
             }
@@ -800,7 +839,13 @@ impl DragonflyAnyScanStore {
     }
 
     pub fn list_workers(&self) -> Result<Vec<WorkerRecord>> {
-        self.with_state(|state| Ok(sorted_workers(state.workers.clone())))
+        self.with_state_mut(|state| {
+            let now = utc_now();
+            reconcile_orphaned_stopping_work_in_state(state, now);
+            reconcile_stale_worker_remote_updates_in_state(state, now);
+            reconcile_stale_worker_remote_commands_in_state(state, now);
+            Ok(sorted_workers(visible_worker_records(state, now)))
+        })
     }
 
     pub fn get_worker(&self, worker_id: &str) -> Result<Option<WorkerRecord>> {
@@ -808,7 +853,10 @@ impl DragonflyAnyScanStore {
         if worker_id.is_empty() {
             return Err(anyhow!("worker_id is required"));
         }
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            let now = utc_now();
+            reconcile_stale_worker_remote_updates_in_state(state, now);
+            reconcile_stale_worker_remote_commands_in_state(state, now);
             Ok(state
                 .workers
                 .iter()
@@ -879,7 +927,8 @@ impl DragonflyAnyScanStore {
             .filter(|value| !value.is_empty())
             .map(|value| value.to_string());
         let limit = limit.max(1);
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            reconcile_stale_worker_remote_commands_in_state(state, utc_now());
             Ok(sorted_worker_remote_commands(
                 state.worker_remote_commands.clone(),
                 worker_id.as_deref(),
@@ -1178,15 +1227,14 @@ impl DragonflyAnyScanStore {
         })
     }
 
-    pub fn complete_port_scan_if_owned(
+    pub fn update_port_scan_progress_if_owned(
         &self,
         port_scan_id: i64,
         worker_id: &str,
         discovered_endpoints_total: u64,
-        imported_targets_total: u64,
-        protocol_findings: &[PortScanProtocolFindingRecord],
-        queued_run_id: Option<i64>,
-        notes: Option<&str>,
+        probe_rate_millis: u64,
+        receive_rate_millis: u64,
+        progress_percent: Option<u64>,
     ) -> Result<Option<PortScanRecord>> {
         let now = utc_now();
         self.with_state_mut(|state| {
@@ -1202,17 +1250,132 @@ impl DragonflyAnyScanStore {
             {
                 return Ok(None);
             }
-            record.port_scan.status = RunStatus::Completed;
-            record.port_scan.completed_at = Some(now);
-            record.port_scan.discovered_endpoints_total = discovered_endpoints_total;
-            record.port_scan.imported_targets_total = imported_targets_total;
-            record.port_scan.protocol_findings = protocol_findings.to_vec();
-            record.port_scan.queued_run_id = queued_run_id;
-            if let Some(notes) = notes {
-                record.port_scan.notes = Some(notes.to_string());
+            if matches!(
+                record.port_scan.status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Stopping
+            ) {
+                return Ok(None);
             }
-            clear_port_scan_claim(record);
+            if discovered_endpoints_total > record.port_scan.discovered_endpoints_total {
+                record.port_scan.discovered_endpoints_total = discovered_endpoints_total;
+            }
+            record.port_scan.current_probe_rate_millis = probe_rate_millis;
+            record.port_scan.current_receive_rate_millis = receive_rate_millis;
+            record.port_scan.current_progress_percent = match (
+                record.port_scan.current_progress_percent,
+                progress_percent,
+            ) {
+                (Some(existing), Some(incoming)) => Some(existing.max(incoming)),
+                (Some(existing), None) => Some(existing),
+                (None, Some(incoming)) => Some(incoming),
+                (None, None) => None,
+            };
             Ok(Some(record.port_scan.clone()))
+        })
+    }
+
+    pub fn load_port_scan_resume_state(
+        &self,
+        port_scan_id: i64,
+    ) -> Result<Option<PortScanResumeStateRecord>> {
+        self.with_state(|state| {
+            Ok(state
+                .port_scans
+                .iter()
+                .find(|record| record.port_scan.id == port_scan_id)
+                .and_then(|record| {
+                    let has_state = record.resume_state.checkpoint_data.is_some()
+                        || record.resume_state.output_snapshot.is_some()
+                        || record.resume_state.updated_at.is_some();
+                    has_state.then(|| record.resume_state.clone())
+                }))
+        })
+    }
+
+    pub fn update_port_scan_resume_state_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        checkpoint_data: Option<&str>,
+        output_snapshot: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            update_port_scan_resume_state_if_owned_in_state(
+                state,
+                port_scan_id,
+                worker_id,
+                checkpoint_data,
+                output_snapshot,
+                now,
+            )
+        })
+    }
+
+    pub fn annotate_port_scan_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        note: &str,
+    ) -> Result<Option<PortScanRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            let record = state
+                .port_scans
+                .iter_mut()
+                .find(|record| record.port_scan.id == port_scan_id)
+                .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
+            if record.claimed_by.as_deref() != Some(worker_id)
+                || !record
+                    .claim_expires_at
+                    .is_some_and(|expires_at| expires_at > now)
+            {
+                return Ok(None);
+            }
+            if matches!(
+                record.port_scan.status,
+                RunStatus::Completed | RunStatus::Failed | RunStatus::Stopping
+            ) {
+                return Ok(None);
+            }
+            let trimmed = note.trim();
+            if trimmed.is_empty() {
+                return Ok(Some(record.port_scan.clone()));
+            }
+            record.port_scan.notes = Some(match record.port_scan.notes.as_deref() {
+                Some(existing) if existing.contains(trimmed) => existing.to_string(),
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing} | {trimmed}")
+                }
+                _ => trimmed.to_string(),
+            });
+            Ok(Some(record.port_scan.clone()))
+        })
+    }
+
+    pub fn complete_port_scan_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        discovered_endpoints_total: u64,
+        imported_targets_total: u64,
+        protocol_findings: &[PortScanProtocolFindingRecord],
+        queued_run_id: Option<i64>,
+        notes: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            complete_port_scan_if_owned_in_state(
+                state,
+                port_scan_id,
+                worker_id,
+                discovered_endpoints_total,
+                imported_targets_total,
+                protocol_findings,
+                queued_run_id,
+                notes,
+                now,
+            )
         })
     }
 
@@ -1229,11 +1392,7 @@ impl DragonflyAnyScanStore {
                 .iter_mut()
                 .find(|record| record.port_scan.id == port_scan_id)
                 .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
-            if record.claimed_by.as_deref() != Some(worker_id)
-                || !record
-                    .claim_expires_at
-                    .is_some_and(|expires_at| expires_at > now)
-            {
+            if record.claimed_by.as_deref() != Some(worker_id) {
                 return Ok(None);
             }
             record.port_scan.status = RunStatus::Failed;
@@ -1241,7 +1400,38 @@ impl DragonflyAnyScanStore {
             if let Some(notes) = notes {
                 record.port_scan.notes = Some(notes.to_string());
             }
+            clear_port_scan_resume_state(record);
             clear_port_scan_claim(record);
+            Ok(Some(record.port_scan.clone()))
+        })
+    }
+
+    pub fn stop_port_scan(&self, port_scan_id: i64, notes: Option<&str>) -> Result<PortScanRecord> {
+        let now = utc_now();
+        self.with_state_mut(|state| stop_port_scan_in_state(state, port_scan_id, notes, now))
+    }
+
+    pub fn acknowledge_stopping_port_scan(
+        &self,
+        port_scan_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<PortScanRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            let record = state
+                .port_scans
+                .iter_mut()
+                .find(|record| record.port_scan.id == port_scan_id)
+                .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
+            if !matches!(record.port_scan.status, RunStatus::Stopping) {
+                return Ok(None);
+            }
+            record.port_scan.status = RunStatus::Failed;
+            record.port_scan.completed_at = Some(now);
+            if let Some(notes) = notes {
+                record.port_scan.notes = Some(notes.to_string());
+            }
+            clear_port_scan_resume_state(record);
             Ok(Some(record.port_scan.clone()))
         })
     }
@@ -2071,7 +2261,8 @@ impl DragonflyAnyScanStore {
     }
 
     pub fn list_runs(&self, limit: usize) -> Result<Vec<ScanRunRecord>> {
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            reconcile_orphaned_stopping_work_in_state(state, utc_now());
             let mut runs = state
                 .runs
                 .iter()
@@ -2084,7 +2275,8 @@ impl DragonflyAnyScanStore {
     }
 
     pub fn latest_run(&self) -> Result<Option<ScanRunRecord>> {
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            reconcile_orphaned_stopping_work_in_state(state, utc_now());
             Ok(state
                 .runs
                 .iter()
@@ -2094,12 +2286,24 @@ impl DragonflyAnyScanStore {
     }
 
     pub fn get_run(&self, run_id: i64) -> Result<Option<ScanRunRecord>> {
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            reconcile_orphaned_stopping_work_in_state(state, utc_now());
             Ok(state
                 .runs
                 .iter()
                 .find(|run| run.run.id == run_id)
                 .map(|run| run.run.clone()))
+        })
+    }
+
+    pub fn get_port_scan(&self, port_scan_id: i64) -> Result<Option<PortScanRecord>> {
+        self.with_state_mut(|state| {
+            reconcile_orphaned_stopping_work_in_state(state, utc_now());
+            Ok(state
+                .port_scans
+                .iter()
+                .find(|record| record.port_scan.id == port_scan_id)
+                .map(|record| record.port_scan.clone()))
         })
     }
 
@@ -2199,6 +2403,88 @@ impl DragonflyAnyScanStore {
         })
     }
 
+    pub fn stop_run(&self, run_id: i64, notes: Option<&str>) -> Result<ScanRunRecord> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            let run_job_ids = state
+                .jobs
+                .iter()
+                .filter(|job| job.run_id == run_id)
+                .map(|job| job.id)
+                .collect::<Vec<_>>();
+
+            let run = state
+                .runs
+                .iter_mut()
+                .find(|run| run.run.id == run_id)
+                .ok_or_else(|| anyhow!("run {run_id} not found"))?;
+            if !matches!(run.run.status, RunStatus::Completed | RunStatus::Failed) {
+                run.run.status = if matches!(run.run.status, RunStatus::Queued) {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::Stopping
+                };
+                run.run.completed_at = if matches!(run.run.status, RunStatus::Failed) {
+                    Some(now)
+                } else {
+                    None
+                };
+                if let Some(notes) = notes {
+                    run.run.notes = Some(notes.to_string());
+                }
+                clear_run_claim(run);
+            }
+
+            for job in state.jobs.iter_mut().filter(|job| job.run_id == run_id) {
+                if matches!(job.status, JobStatus::Completed | JobStatus::Failed) {
+                    continue;
+                }
+                job.status = JobStatus::Failed;
+                if job.started_at.is_none() {
+                    job.started_at = Some(now);
+                }
+                job.completed_at = Some(now);
+                if job.error.is_none() {
+                    job.error = notes.map(|value| value.to_string());
+                }
+            }
+            for job_id in run_job_ids {
+                state.job_claims.remove(&job_id);
+            }
+            refresh_run_totals(state, run_id)?;
+            let run = state
+                .runs
+                .iter()
+                .find(|run| run.run.id == run_id)
+                .ok_or_else(|| anyhow!("run {run_id} not found after stop"))?;
+            Ok(run.run.clone())
+        })
+    }
+
+    pub fn acknowledge_stopping_run(
+        &self,
+        run_id: i64,
+        notes: Option<&str>,
+    ) -> Result<Option<ScanRunRecord>> {
+        let now = utc_now();
+        self.with_state_mut(|state| {
+            let run = state
+                .runs
+                .iter_mut()
+                .find(|run| run.run.id == run_id)
+                .ok_or_else(|| anyhow!("run {run_id} not found"))?;
+            if !matches!(run.run.status, RunStatus::Stopping) {
+                return Ok(None);
+            }
+            run.run.status = RunStatus::Failed;
+            run.run.completed_at = Some(now);
+            if let Some(notes) = notes {
+                run.run.notes = Some(notes.to_string());
+            }
+            Ok(Some(run.run.clone()))
+        })
+    }
+
     pub fn append_event(&self, run_id: Option<i64>, event: &ApiEvent) -> Result<i64> {
         let mut connection = self.open_connection_for_write("appending run event")?;
         self.append_event_to_stream(&mut connection, run_id, event, utc_now())
@@ -2222,7 +2508,10 @@ impl DragonflyAnyScanStore {
     }
 
     pub fn dashboard_snapshot(&self) -> Result<DashboardSnapshot> {
-        self.with_state(|state| {
+        self.with_state_mut(|state| {
+            let now = utc_now();
+            reconcile_stale_worker_remote_updates_in_state(state, now);
+            reconcile_stale_worker_remote_commands_in_state(state, now);
             let latest_run = state
                 .runs
                 .iter()
@@ -2270,25 +2559,34 @@ impl DragonflyAnyScanStore {
                     .then(left.next_run_at.cmp(&right.next_run_at))
                     .then(left.id.cmp(&right.id))
             });
+            let workers = visible_worker_records(state, now);
+            let worker_activity = compute_worker_activity_snapshots(state, &workers, now)?;
+            let worker_throughput_summary =
+                Some(compute_worker_throughput_summary(&workers, &worker_activity, now));
 
-            let now = utc_now();
             Ok(DashboardSnapshot {
                 latest_run,
                 latest_summary,
-                recent_port_scans: state
-                    .port_scans
-                    .iter()
-                    .map(|record| record.port_scan.clone())
-                    .rev()
-                    .take(10)
-                    .collect(),
+                recent_port_scans: {
+                    let mut port_scans = aggregate_port_scan_records(
+                        state
+                            .port_scans
+                            .iter()
+                            .map(|record| record.port_scan.clone())
+                            .collect(),
+                    );
+                    port_scans.truncate(10);
+                    port_scans
+                },
                 targets: sorted_targets(state.targets.clone()),
                 scan_defaults: Default::default(),
                 active_authorized_execution_policy: Default::default(),
                 archive_status: None,
                 repositories: sorted_repositories(state.repositories.clone()),
                 operators: Vec::new(),
-                workers: active_worker_records(&state.workers, now),
+                workers,
+                worker_activity,
+                worker_throughput_summary,
                 worker_pools: compute_worker_pool_records(state, now),
                 recent_worker_remote_commands: sorted_worker_remote_commands(
                     state.worker_remote_commands.clone(),
@@ -3531,6 +3829,21 @@ fn register_worker_in_state(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_string());
     let remote_update_status_updated_at = registration.remote_update_status_updated_at;
+    let installed_bundle_name = registration
+        .installed_bundle_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+    let max_active_tasks = registration.max_active_tasks.filter(|value| *value > 0);
+    let agent_concurrency = registration.agent_concurrency.filter(|value| *value > 0);
+    let scanner_default_rate = registration.scanner_default_rate;
+    let scanner_sender_threads = registration
+        .scanner_sender_threads
+        .filter(|value| *value > 0);
+    let scanner_receiver_threads = registration
+        .scanner_receiver_threads
+        .filter(|value| *value > 0);
     let presented_token_index = registration
         .enrollment_token
         .as_deref()
@@ -3565,36 +3878,60 @@ fn register_worker_in_state(
             .and_then(|token_index| state.worker_enrollment_tokens.get(token_index))
             .map(|token| token.record.id)
             .filter(|token_id| state.workers[index].enrollment_token_id != Some(*token_id));
+        let preserve_controller_queued_remote_update = state.workers[index]
+            .remote_update_requested_at
+            .is_some_and(|requested_at| {
+                matches!(
+                    state.workers[index].remote_update_status,
+                    Some(WorkerRemoteUpdateStatus::Queued)
+                ) && remote_update_status_updated_at.is_none_or(|updated_at| updated_at <= requested_at)
+            });
         if let Some(token_id) = rebind_token_id {
             mark_worker_enrollment_token_used_in_state(state, token_id, worker_id, now)?;
         }
 
-        let existing = &mut state.workers[index];
-        existing.display_name = display_name;
-        existing.worker_pool = resolved_pool;
-        existing.tags = resolved_tags;
-        existing.operating_system = operating_system;
-        existing.architecture = architecture;
-        existing.platform = platform;
-        if let Some(token_id) = rebind_token_id {
-            existing.enrollment_token_id = Some(token_id);
+        let existing_worker_id = state.workers[index].worker_id.clone();
+        {
+            let existing = &mut state.workers[index];
+            existing.display_name = display_name;
+            existing.worker_pool = resolved_pool;
+            existing.tags = resolved_tags;
+            existing.operating_system = operating_system;
+            existing.architecture = architecture;
+            existing.platform = platform;
+            if let Some(token_id) = rebind_token_id {
+                existing.enrollment_token_id = Some(token_id);
+            }
+            existing.supports_runs = registration.supports_runs;
+            existing.supports_port_scans = registration.supports_port_scans;
+            existing.supports_bootstrap = registration.supports_bootstrap;
+            existing.supports_remote_updates = registration.supports_remote_updates;
+            existing.supports_remote_debug_commands = registration.supports_remote_debug_commands;
+            existing.scanner_adapters = scanner_adapters;
+            existing.provisioners = provisioners;
+            existing.local_ip_addresses = local_ip_addresses;
+            existing.public_ip_address = public_ip_address;
+            existing.public_ip_checked_at = public_ip_checked_at;
+            if !preserve_controller_queued_remote_update {
+                existing.remote_update_status = remote_update_status;
+                existing.remote_update_status_message = remote_update_status_message;
+                existing.remote_update_status_updated_at = remote_update_status_updated_at;
+            }
+            existing.installed_bundle_name = installed_bundle_name;
+            existing.max_active_tasks = max_active_tasks;
+            existing.agent_concurrency = agent_concurrency;
+            existing.scanner_default_rate = scanner_default_rate;
+            existing.scanner_sender_threads = scanner_sender_threads;
+            existing.scanner_receiver_threads = scanner_receiver_threads;
+            existing.latest_available_bundle_name = None;
+            existing.latest_bundle_matches_installed = None;
+            existing.last_seen_at = now;
+            existing.expires_at = expires_at;
         }
-        existing.supports_runs = registration.supports_runs;
-        existing.supports_port_scans = registration.supports_port_scans;
-        existing.supports_bootstrap = registration.supports_bootstrap;
-        existing.supports_remote_updates = registration.supports_remote_updates;
-        existing.supports_remote_debug_commands = registration.supports_remote_debug_commands;
-        existing.scanner_adapters = scanner_adapters;
-        existing.provisioners = provisioners;
-        existing.local_ip_addresses = local_ip_addresses;
-        existing.public_ip_address = public_ip_address;
-        existing.public_ip_checked_at = public_ip_checked_at;
-        existing.remote_update_status = remote_update_status;
-        existing.remote_update_status_message = remote_update_status_message;
-        existing.remote_update_status_updated_at = remote_update_status_updated_at;
-        existing.last_seen_at = now;
-        existing.expires_at = expires_at;
-        return Ok(existing.clone());
+        let control_plane_health_message =
+            compute_worker_control_plane_health_message(state, &existing_worker_id, now);
+        state.workers[index].control_plane_health_message = control_plane_health_message;
+        return Ok(state.workers[index].clone());
     }
 
     let enrollment_token = registration
@@ -3631,6 +3968,15 @@ fn register_worker_in_state(
         remote_update_status,
         remote_update_status_message,
         remote_update_status_updated_at,
+        installed_bundle_name,
+        max_active_tasks,
+        agent_concurrency,
+        scanner_default_rate,
+        scanner_sender_threads,
+        scanner_receiver_threads,
+        latest_available_bundle_name: None,
+        latest_bundle_matches_installed: None,
+        control_plane_health_message: None,
         lifecycle_state: WorkerLifecycleState::Active,
         remote_update_requested_at: None,
         enrollment_token_id: Some(token_record.id),
@@ -3638,6 +3984,9 @@ fn register_worker_in_state(
         last_seen_at: now,
         expires_at,
     };
+    let mut record = record;
+    record.control_plane_health_message =
+        compute_worker_control_plane_health_message(state, &record.worker_id, now);
     state.workers.push(record.clone());
     state
         .workers
@@ -3680,7 +4029,13 @@ fn request_worker_remote_update_in_state(
     if !worker.lifecycle_state.accepts_heartbeats() {
         return Err(anyhow!("worker {worker_id} has been revoked"));
     }
+    if !worker_is_online(worker, now) {
+        return Err(anyhow!("worker {worker_id} is offline"));
+    }
     worker.remote_update_requested_at = Some(now);
+    worker.remote_update_status = Some(WorkerRemoteUpdateStatus::Queued);
+    worker.remote_update_status_message = Some("remote update queued by controller".to_string());
+    worker.remote_update_status_updated_at = Some(now);
     Ok(worker.clone())
 }
 
@@ -3696,10 +4051,16 @@ fn request_all_worker_remote_updates_in_state(
         if !worker.lifecycle_state.accepts_heartbeats() {
             continue;
         }
+        if !worker_is_online(worker, now) {
+            continue;
+        }
         if worker.remote_update_requested_at.is_some() {
             continue;
         }
         worker.remote_update_requested_at = Some(now);
+        worker.remote_update_status = Some(WorkerRemoteUpdateStatus::Queued);
+        worker.remote_update_status_message = Some("remote update queued by controller".to_string());
+        worker.remote_update_status_updated_at = Some(now);
         updated_workers.push(worker.clone());
     }
     Ok(updated_workers)
@@ -3725,6 +4086,125 @@ fn acknowledge_worker_remote_update_in_state(
     }
     worker.remote_update_requested_at = None;
     Ok(worker.clone())
+}
+
+fn reconcile_stale_worker_remote_updates_in_state(
+    state: &mut DragonflyRuntimeState,
+    now: DateTime<Utc>,
+) {
+    for worker in &mut state.workers {
+        if worker.remote_update_requested_at.is_none() {
+            continue;
+        }
+        if worker.expires_at > now {
+            continue;
+        }
+        worker.remote_update_requested_at = None;
+        worker.remote_update_status = Some(WorkerRemoteUpdateStatus::Failed);
+        worker.remote_update_status_message =
+            Some("worker went offline before acknowledging remote update request".to_string());
+        worker.remote_update_status_updated_at = Some(now);
+    }
+}
+
+fn reconcile_stale_worker_remote_commands_in_state(
+    state: &mut DragonflyRuntimeState,
+    now: DateTime<Utc>,
+) {
+    for command in &mut state.worker_remote_commands {
+        if command.status != WorkerRemoteCommandStatus::Queued {
+            continue;
+        }
+        let worker = state
+            .workers
+            .iter()
+            .find(|worker| worker.worker_id == command.worker_id);
+        let Some(worker) = worker else {
+            command.status = WorkerRemoteCommandStatus::Failed;
+            command.error = Some("worker record no longer exists".to_string());
+            command.completed_at = Some(now);
+            command.updated_at = now;
+            continue;
+        };
+        if worker_is_online(worker, now) {
+            continue;
+        }
+        command.status = WorkerRemoteCommandStatus::Failed;
+        command.error = Some("worker went offline before claiming remote command".to_string());
+        command.completed_at = Some(now);
+        command.updated_at = now;
+    }
+}
+
+fn reconcile_orphaned_stopping_work_in_state(state: &mut DragonflyRuntimeState, now: DateTime<Utc>) {
+    for run in &mut state.runs {
+        if !matches!(run.run.status, RunStatus::Stopping) {
+            continue;
+        }
+        let claim_active = run
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at > now)
+            && run.claimed_by.is_some();
+        if claim_active {
+            continue;
+        }
+        run.run.status = RunStatus::Failed;
+        if run.run.completed_at.is_none() {
+            run.run.completed_at = Some(now);
+        }
+        clear_run_claim(run);
+    }
+
+    for record in &mut state.port_scans {
+        if !matches!(record.port_scan.status, RunStatus::Stopping) {
+            continue;
+        }
+        let claim_active = record
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at > now)
+            && record.claimed_by.is_some();
+        if claim_active {
+            continue;
+        }
+        record.port_scan.status = RunStatus::Failed;
+        if record.port_scan.completed_at.is_none() {
+            record.port_scan.completed_at = Some(now);
+        }
+        clear_port_scan_claim(record);
+    }
+}
+
+fn compute_worker_control_plane_health_message(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let worker = state
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)?;
+    if !worker_is_online(worker, now) {
+        return None;
+    }
+
+    if let Some(requested_at) = worker.remote_update_requested_at {
+        if requested_at + ChronoDuration::minutes(5) < now {
+            return Some(
+                "online worker has not acknowledged queued remote update request".to_string(),
+            );
+        }
+    }
+
+    let has_stale_queued_command = state.worker_remote_commands.iter().any(|command| {
+        command.worker_id == worker_id
+            && command.status == WorkerRemoteCommandStatus::Queued
+            && command.created_at + ChronoDuration::minutes(5) < now
+    });
+    if has_stale_queued_command {
+        return Some("online worker is not consuming queued remote commands".to_string());
+    }
+
+    None
 }
 
 fn sorted_worker_remote_commands(
@@ -4579,6 +5059,10 @@ fn claim_next_pending_port_scan_in_state(
     };
     record.claimed_by = Some(worker_id.to_string());
     record.claim_expires_at = Some(claim_expires_at);
+    if matches!(record.port_scan.status, RunStatus::Queued) {
+        record.port_scan.status = RunStatus::InProgress;
+        record.port_scan.completed_at = None;
+    }
     Ok(Some(record.port_scan.clone()))
 }
 
@@ -7187,6 +7671,476 @@ fn clear_port_scan_claim(port_scan: &mut StoredPortScan) {
     port_scan.claim_expires_at = None;
 }
 
+fn clear_port_scan_resume_state(port_scan: &mut StoredPortScan) {
+    port_scan.resume_state = PortScanResumeStateRecord::default();
+}
+
+fn update_port_scan_resume_state_if_owned_in_state(
+    state: &mut DragonflyRuntimeState,
+    port_scan_id: i64,
+    worker_id: &str,
+    checkpoint_data: Option<&str>,
+    output_snapshot: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<PortScanRecord>> {
+    let record = state
+        .port_scans
+        .iter_mut()
+        .find(|record| record.port_scan.id == port_scan_id)
+        .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
+    if record.claimed_by.as_deref() != Some(worker_id)
+        || !record
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at > now)
+    {
+        return Ok(None);
+    }
+    if matches!(
+        record.port_scan.status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Stopping
+    ) {
+        return Ok(None);
+    }
+    record.resume_state.checkpoint_data = checkpoint_data
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    record.resume_state.output_snapshot = output_snapshot
+        .map(str::trim_end)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    record.resume_state.updated_at = Some(now);
+    Ok(Some(record.port_scan.clone()))
+}
+
+fn complete_port_scan_if_owned_in_state(
+    state: &mut DragonflyRuntimeState,
+    port_scan_id: i64,
+    worker_id: &str,
+    discovered_endpoints_total: u64,
+    imported_targets_total: u64,
+    protocol_findings: &[PortScanProtocolFindingRecord],
+    queued_run_id: Option<i64>,
+    notes: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<PortScanRecord>> {
+    let record = state
+        .port_scans
+        .iter_mut()
+        .find(|record| record.port_scan.id == port_scan_id)
+        .ok_or_else(|| anyhow!("port scan {port_scan_id} not found"))?;
+    if record.claimed_by.as_deref() != Some(worker_id) {
+        return Ok(None);
+    }
+    record.port_scan.status = RunStatus::Completed;
+    record.port_scan.completed_at = Some(now);
+    record.port_scan.discovered_endpoints_total = discovered_endpoints_total;
+    record.port_scan.imported_targets_total = imported_targets_total;
+    record.port_scan.protocol_findings = protocol_findings.to_vec();
+    record.port_scan.queued_run_id = queued_run_id;
+    record.port_scan.follow_on_run_ids = queued_run_id.into_iter().collect();
+    if let Some(notes) = notes {
+        record.port_scan.notes = Some(notes.to_string());
+    }
+    clear_port_scan_resume_state(record);
+    clear_port_scan_claim(record);
+    Ok(Some(record.port_scan.clone()))
+}
+
+fn desired_port_scan_shard_count(
+    state: &DragonflyRuntimeState,
+    worker_pool: Option<&str>,
+    now: DateTime<Utc>,
+) -> usize {
+    let available = available_port_scan_worker_count(state, worker_pool, now);
+    if available > 0 {
+        return available;
+    }
+    eligible_online_port_scan_worker_count(state, worker_pool, now)
+}
+
+fn eligible_online_port_scan_worker_count(
+    state: &DragonflyRuntimeState,
+    worker_pool: Option<&str>,
+    now: DateTime<Utc>,
+) -> usize {
+    state
+        .workers
+        .iter()
+        .filter(|worker| {
+            worker.supports_port_scans
+                && worker.lifecycle_state.allows_new_work()
+                && worker_is_online(worker, now)
+                && match worker_pool {
+                    Some(required_pool) => worker.worker_pool.as_deref() == Some(required_pool),
+                    None => true,
+                }
+        })
+        .count()
+}
+
+fn available_port_scan_worker_count(
+    state: &DragonflyRuntimeState,
+    worker_pool: Option<&str>,
+    now: DateTime<Utc>,
+) -> usize {
+    state
+        .workers
+        .iter()
+        .filter(|worker| {
+            worker.supports_port_scans
+                && worker.lifecycle_state.allows_new_work()
+                && worker_is_online(worker, now)
+                && match worker_pool {
+                    Some(required_pool) => worker.worker_pool.as_deref() == Some(required_pool),
+                    None => true,
+                }
+        })
+        .filter(|worker| worker_active_top_level_task_count(state, &worker.worker_id, now) == 0)
+        .count()
+}
+
+fn worker_active_top_level_task_count(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> usize {
+    let active_runs = state
+        .runs
+        .iter()
+        .filter(|run| {
+            run.claimed_by.as_deref() == Some(worker_id)
+                && run_claim_is_active(run, now)
+                && matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress)
+        })
+        .count();
+    let active_port_scans = state
+        .port_scans
+        .iter()
+        .filter(|port_scan| {
+            port_scan.claimed_by.as_deref() == Some(worker_id)
+                && port_scan_claim_is_active(port_scan, now)
+                && matches!(
+                    port_scan.port_scan.status,
+                    RunStatus::Queued | RunStatus::InProgress
+                )
+        })
+        .count();
+    let active_bootstrap_jobs = state
+        .bootstrap_job_claims
+        .values()
+        .filter(|claim| claim.claimed_by == worker_id && claim.claim_expires_at > now)
+        .count();
+    active_runs + active_port_scans + active_bootstrap_jobs
+}
+
+fn worker_has_active_claimed_run(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    state.runs.iter().any(|run| {
+        run.claimed_by.as_deref() == Some(worker_id)
+            && run_claim_is_active(run, now)
+            && matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress)
+    })
+}
+
+fn worker_has_active_claimed_port_scan(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    state.port_scans.iter().any(|port_scan| {
+        port_scan.claimed_by.as_deref() == Some(worker_id)
+            && port_scan_claim_is_active(port_scan, now)
+            && matches!(
+                port_scan.port_scan.status,
+                RunStatus::Queued | RunStatus::InProgress
+            )
+    })
+}
+
+fn worker_has_active_claimed_bootstrap_job(
+    state: &DragonflyRuntimeState,
+    worker_id: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    state
+        .bootstrap_job_claims
+        .values()
+        .any(|claim| claim.claimed_by == worker_id && claim.claim_expires_at > now)
+}
+
+fn split_port_scan_target_range(target_range: &str, desired_shards: usize) -> Vec<String> {
+    let Some((start, end)) = parse_port_scan_target_range_bounds(target_range) else {
+        return vec![target_range.trim().to_string()];
+    };
+    if desired_shards <= 1 || start >= end {
+        return vec![format_port_scan_range_bounds(start, end)];
+    }
+
+    let total_hosts = u64::from(end) - u64::from(start) + 1;
+    let shard_total = desired_shards.min(total_hosts as usize).max(1);
+    if shard_total <= 1 {
+        return vec![format_port_scan_range_bounds(start, end)];
+    }
+
+    let base_hosts = total_hosts / shard_total as u64;
+    let remainder = total_hosts % shard_total as u64;
+    let mut cursor = u64::from(start);
+    let mut shards = Vec::with_capacity(shard_total);
+    for index in 0..shard_total {
+        let shard_size = base_hosts + u64::from(index < remainder as usize);
+        let shard_start = cursor as u32;
+        let shard_end = (cursor + shard_size - 1) as u32;
+        shards.push(format_port_scan_range_bounds(shard_start, shard_end));
+        cursor = shard_end as u64 + 1;
+    }
+    shards
+}
+
+fn parse_port_scan_target_range_bounds(target_range: &str) -> Option<(u32, u32)> {
+    let trimmed = target_range.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some((host, prefix)) = trimmed.split_once('/') {
+        let address: Ipv4Addr = host.trim().parse().ok()?;
+        let prefix_len: u8 = prefix.trim().parse().ok()?;
+        if prefix_len > 32 {
+            return None;
+        }
+        let mask = if prefix_len == 0 {
+            0
+        } else {
+            u32::MAX << (32 - prefix_len)
+        };
+        let start = u32::from(address) & mask;
+        let host_mask = if prefix_len == 32 {
+            0
+        } else {
+            u32::MAX >> prefix_len
+        };
+        return Some((start, start | host_mask));
+    }
+    if let Some((start, end)) = trimmed.split_once('-') {
+        let start_ip: Ipv4Addr = start.trim().parse().ok()?;
+        let end_ip: Ipv4Addr = end.trim().parse().ok()?;
+        let start_num = u32::from(start_ip);
+        let end_num = u32::from(end_ip);
+        if start_num > end_num {
+            return None;
+        }
+        return Some((start_num, end_num));
+    }
+    let address: Ipv4Addr = trimmed.parse().ok()?;
+    let value = u32::from(address);
+    Some((value, value))
+}
+
+fn format_port_scan_range_bounds(start: u32, end: u32) -> String {
+    let start_ip = Ipv4Addr::from(start);
+    let end_ip = Ipv4Addr::from(end);
+    if start == end {
+        start_ip.to_string()
+    } else {
+        format!("{start_ip}-{end_ip}")
+    }
+}
+
+fn aggregate_port_scan_records(records: Vec<PortScanRecord>) -> Vec<PortScanRecord> {
+    let mut grouped = BTreeMap::<i64, Vec<PortScanRecord>>::new();
+    for record in records {
+        let group_id = record.shard_group_id.unwrap_or(record.id);
+        grouped.entry(group_id).or_default().push(record);
+    }
+
+    let mut aggregates = grouped
+        .into_iter()
+        .map(|(group_id, mut shards)| {
+            shards.sort_by_key(|record| (record.shard_index.unwrap_or(0), record.id));
+            let mut aggregate = shards
+                .first()
+                .cloned()
+                .expect("port scan shard group should not be empty");
+            if aggregate.shard_group_id.is_none() && shards.len() == 1 {
+                return aggregate;
+            }
+
+            aggregate.id = group_id;
+            aggregate.shard_group_id = Some(group_id);
+            aggregate.target_range = aggregate
+                .aggregate_target_range
+                .clone()
+                .unwrap_or_else(|| aggregate.target_range.clone());
+            aggregate.shard_index = None;
+            aggregate.shard_total = Some(
+                shards
+                    .iter()
+                    .filter_map(|record| record.shard_total)
+                    .max()
+                    .unwrap_or(shards.len() as u32),
+            );
+            aggregate.started_at = shards
+                .iter()
+                .map(|record| record.started_at)
+                .min()
+                .unwrap_or(aggregate.started_at);
+            aggregate.completed_at =
+                match aggregate_port_scan_statuses(shards.iter().map(|record| &record.status)) {
+                    RunStatus::Completed | RunStatus::Failed => {
+                        shards.iter().filter_map(|record| record.completed_at).max()
+                    }
+                    _ => None,
+                };
+            aggregate.status =
+                aggregate_port_scan_statuses(shards.iter().map(|record| &record.status));
+            aggregate.discovered_endpoints_total = shards
+                .iter()
+                .map(|record| record.discovered_endpoints_total)
+                .sum();
+            aggregate.imported_targets_total = shards
+                .iter()
+                .map(|record| record.imported_targets_total)
+                .sum();
+            aggregate.bootstrap_candidates_total = shards
+                .iter()
+                .map(|record| record.bootstrap_candidates_total)
+                .sum();
+            aggregate.current_probe_rate_millis = shards
+                .iter()
+                .map(|record| record.current_probe_rate_millis)
+                .sum();
+            aggregate.current_receive_rate_millis = shards
+                .iter()
+                .map(|record| record.current_receive_rate_millis)
+                .sum();
+            let progress_values = shards
+                .iter()
+                .filter_map(|record| record.current_progress_percent)
+                .collect::<Vec<_>>();
+            aggregate.current_progress_percent = (!progress_values.is_empty()).then(|| {
+                progress_values.iter().sum::<u64>() / progress_values.len() as u64
+            });
+            aggregate.protocol_findings = shards
+                .iter()
+                .flat_map(|record| record.protocol_findings.clone())
+                .collect();
+            let mut follow_on_run_ids = shards
+                .iter()
+                .flat_map(|record| {
+                    if record.follow_on_run_ids.is_empty() {
+                        record.queued_run_id.into_iter().collect::<Vec<_>>()
+                    } else {
+                        record.follow_on_run_ids.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            follow_on_run_ids.sort_unstable();
+            follow_on_run_ids.dedup();
+            aggregate.queued_run_id = follow_on_run_ids.first().copied();
+            aggregate.follow_on_run_ids = follow_on_run_ids;
+            let mut notes = shards
+                .iter()
+                .filter_map(|record| record.notes.as_deref())
+                .filter(|note| !note.trim().is_empty())
+                .map(|note| note.trim().to_string())
+                .collect::<Vec<_>>();
+            notes.sort();
+            notes.dedup();
+            aggregate.notes = (!notes.is_empty()).then(|| notes.join(" | "));
+            aggregate
+        })
+        .collect::<Vec<_>>();
+    aggregates.sort_by(|left, right| right.id.cmp(&left.id));
+    aggregates
+}
+
+fn aggregate_port_scan_statuses<'a>(statuses: impl Iterator<Item = &'a RunStatus>) -> RunStatus {
+    let statuses = statuses.collect::<Vec<_>>();
+    if statuses
+        .iter()
+        .any(|status| matches!(status, RunStatus::InProgress))
+    {
+        return RunStatus::InProgress;
+    }
+    if statuses
+        .iter()
+        .any(|status| matches!(status, RunStatus::Stopping))
+    {
+        return RunStatus::Stopping;
+    }
+    if statuses
+        .iter()
+        .any(|status| matches!(status, RunStatus::Queued))
+    {
+        return RunStatus::Queued;
+    }
+    if statuses
+        .iter()
+        .any(|status| matches!(status, RunStatus::Failed))
+    {
+        return RunStatus::Failed;
+    }
+    RunStatus::Completed
+}
+
+fn port_scan_matches_group(port_scan: &PortScanRecord, port_scan_id: i64) -> bool {
+    port_scan.id == port_scan_id || port_scan.shard_group_id == Some(port_scan_id)
+}
+
+fn stop_port_scan_in_state(
+    state: &mut DragonflyRuntimeState,
+    port_scan_id: i64,
+    notes: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<PortScanRecord> {
+    let matching_indexes = state
+        .port_scans
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| {
+            port_scan_matches_group(&record.port_scan, port_scan_id).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if matching_indexes.is_empty() {
+        return Err(anyhow!("port scan {port_scan_id} not found"));
+    }
+
+    let mut updated = Vec::with_capacity(matching_indexes.len());
+    for index in matching_indexes {
+        let record = &mut state.port_scans[index];
+        if !matches!(
+            record.port_scan.status,
+            RunStatus::Completed | RunStatus::Failed
+        ) {
+            record.port_scan.status = if matches!(record.port_scan.status, RunStatus::Queued) {
+                RunStatus::Failed
+            } else {
+                RunStatus::Stopping
+            };
+            record.port_scan.completed_at = if matches!(record.port_scan.status, RunStatus::Failed)
+            {
+                Some(now)
+            } else {
+                None
+            };
+            if let Some(notes) = notes {
+                record.port_scan.notes = Some(notes.to_string());
+            }
+            clear_port_scan_resume_state(record);
+            clear_port_scan_claim(record);
+        }
+        updated.push(record.port_scan.clone());
+    }
+
+    aggregate_port_scan_records(updated)
+        .into_iter()
+        .find(|record| record.id == port_scan_id)
+        .ok_or_else(|| anyhow!("failed to aggregate stopped port scan {port_scan_id}"))
+}
+
 fn normalize_worker_values(values: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
@@ -7201,9 +8155,512 @@ fn normalize_worker_values(values: &[String]) -> Vec<String> {
 fn active_worker_records(workers: &[WorkerRecord], now: DateTime<Utc>) -> Vec<WorkerRecord> {
     workers
         .iter()
-        .filter(|worker| worker.expires_at > now)
+        .filter(|worker| {
+            worker.expires_at > now
+                && !(worker.lifecycle_state == WorkerLifecycleState::Revoked
+                    && !worker_is_online(worker, now))
+        })
         .cloned()
         .collect()
+}
+
+fn visible_worker_records(state: &DragonflyRuntimeState, now: DateTime<Utc>) -> Vec<WorkerRecord> {
+    let filtered = active_worker_records(&state.workers, now);
+    collapse_duplicate_worker_records(state, filtered, now)
+}
+
+fn collapse_duplicate_worker_records(
+    state: &DragonflyRuntimeState,
+    workers: Vec<WorkerRecord>,
+    now: DateTime<Utc>,
+) -> Vec<WorkerRecord> {
+    let mut deduped = Vec::new();
+    let mut grouped: HashMap<String, Vec<WorkerRecord>> = HashMap::new();
+
+    for worker in workers {
+        let Some(display_name) = worker
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            deduped.push(worker);
+            continue;
+        };
+        grouped
+            .entry(display_name.to_ascii_lowercase())
+            .or_default()
+            .push(worker);
+    }
+
+    for mut group in grouped.into_values() {
+        if group.len() == 1 {
+            deduped.extend(group);
+            continue;
+        }
+
+        let mut claimants = group
+            .iter()
+            .filter(|worker| {
+                worker_has_active_claimed_run(state, &worker.worker_id, now)
+                    || worker_has_active_claimed_port_scan(state, &worker.worker_id, now)
+                    || worker_has_active_claimed_bootstrap_job(state, &worker.worker_id, now)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !claimants.is_empty() {
+            claimants.sort_by(|left, right| {
+                right
+                    .last_seen_at
+                    .cmp(&left.last_seen_at)
+                    .then(right.registered_at.cmp(&left.registered_at))
+                    .then(left.worker_id.cmp(&right.worker_id))
+            });
+            deduped.extend(claimants);
+            continue;
+        }
+
+        group.sort_by(|left, right| {
+            worker_is_online(right, now)
+                .cmp(&worker_is_online(left, now))
+                .then(
+                    (right.lifecycle_state != WorkerLifecycleState::Revoked)
+                        .cmp(&(left.lifecycle_state != WorkerLifecycleState::Revoked)),
+                )
+                .then(right.last_seen_at.cmp(&left.last_seen_at))
+                .then(right.registered_at.cmp(&left.registered_at))
+                .then(left.worker_id.cmp(&right.worker_id))
+        });
+        if let Some(selected) = group.into_iter().next() {
+            deduped.push(selected);
+        }
+    }
+
+    deduped
+}
+
+fn compute_worker_activity_snapshots(
+    state: &DragonflyRuntimeState,
+    workers: &[WorkerRecord],
+    now: DateTime<Utc>,
+) -> Result<Vec<WorkerActivitySnapshot>> {
+    let mut active_port_scans_by_worker: HashMap<String, Vec<PortScanRecord>> = HashMap::new();
+    let mut stale_port_scans_by_worker: HashMap<String, Vec<PortScanRecord>> = HashMap::new();
+    for record in &state.port_scans {
+        let Some(worker_id) = record.claimed_by.as_ref() else {
+            continue;
+        };
+        if matches!(record.port_scan.status, RunStatus::Completed | RunStatus::Failed) {
+            continue;
+        }
+        let claims_are_active = record
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at > now);
+        let target_map = if claims_are_active {
+            &mut active_port_scans_by_worker
+        } else {
+            &mut stale_port_scans_by_worker
+        };
+        target_map
+            .entry(worker_id.clone())
+            .or_default()
+            .push(record.port_scan.clone());
+    }
+
+    let mut active_bootstrap_jobs_by_worker: HashMap<String, WorkerBootstrapJobRecord> =
+        HashMap::new();
+    for record in &state.bootstrap_jobs {
+        let Some(worker_id) = record.claimed_by_worker_id.as_ref() else {
+            continue;
+        };
+        let Some(claim) = state.bootstrap_job_claims.get(&record.id) else {
+            continue;
+        };
+        if claim.claim_expires_at <= now || claim.claimed_by != *worker_id {
+            continue;
+        }
+        if matches!(
+            record.status,
+            WorkerBootstrapJobStatus::Completed | WorkerBootstrapJobStatus::Failed
+        ) {
+            continue;
+        }
+        active_bootstrap_jobs_by_worker.insert(worker_id.clone(), record.clone());
+    }
+
+    let mut run_job_claims_by_worker: HashMap<String, HashMap<i64, Vec<i64>>> = HashMap::new();
+    let mut run_worker_ids: HashMap<i64, HashSet<String>> = HashMap::new();
+    for (job_id, claim) in &state.job_claims {
+        if claim.claim_expires_at <= now {
+            continue;
+        }
+        let Some(job) = state.jobs.iter().find(|job| job.id == *job_id) else {
+            continue;
+        };
+        if matches!(job.status, JobStatus::Completed | JobStatus::Failed) {
+            continue;
+        }
+        run_job_claims_by_worker
+            .entry(claim.claimed_by.clone())
+            .or_default()
+            .entry(job.run_id)
+            .or_default()
+            .push(*job_id);
+        run_worker_ids
+            .entry(job.run_id)
+            .or_default()
+            .insert(claim.claimed_by.clone());
+    }
+
+    let mut active_run_coordinators: HashMap<String, i64> = HashMap::new();
+    for record in &state.runs {
+        let Some(worker_id) = record.claimed_by.as_ref() else {
+            continue;
+        };
+        if record
+            .claim_expires_at
+            .is_none_or(|expires_at| expires_at <= now)
+        {
+            continue;
+        }
+        if matches!(record.run.status, RunStatus::Completed | RunStatus::Failed) {
+            continue;
+        }
+        active_run_coordinators.insert(worker_id.clone(), record.run.id);
+        run_worker_ids
+            .entry(record.run.id)
+            .or_default()
+            .insert(worker_id.clone());
+    }
+
+    let mut run_summary_cache: HashMap<i64, RunSummary> = HashMap::new();
+    let mut snapshots = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let worker_id = worker.worker_id.clone();
+        let port_scans = active_port_scans_by_worker.get(&worker_id).or_else(|| {
+            if worker_is_online(worker, now) {
+                stale_port_scans_by_worker.get(&worker_id)
+            } else {
+                None
+            }
+        });
+        if let Some(port_scans) = port_scans {
+            let aggregated_port_scans = aggregate_port_scan_records(port_scans.clone());
+            let active_shard_count = port_scans.len() as u64;
+            let logical_port_scan_count = aggregated_port_scans.len() as u64;
+            let started_at = aggregated_port_scans
+                .iter()
+                .map(|record| record.started_at)
+                .min();
+            let last_activity_at = if aggregated_port_scans
+                .iter()
+                .any(|record| matches!(record.status, RunStatus::InProgress | RunStatus::Stopping))
+            {
+                Some(now)
+            } else {
+                aggregated_port_scans
+                    .iter()
+                    .filter_map(|record| record.completed_at.or(Some(record.started_at)))
+                    .max()
+            };
+            let target_rate_millis = aggregated_port_scans
+                .iter()
+                .map(|record| {
+                    compute_rate_millis(
+                        record.imported_targets_total,
+                        Some(record.started_at),
+                        record.completed_at,
+                        now,
+                    )
+                })
+                .sum();
+            let endpoint_rate_millis = aggregated_port_scans
+                .iter()
+                .map(|record| {
+                    compute_rate_millis(
+                        record.discovered_endpoints_total,
+                        Some(record.started_at),
+                        record.completed_at,
+                        now,
+                    )
+                })
+                .sum();
+            let probe_rate_millis = aggregated_port_scans
+                .iter()
+                .map(|record| record.current_probe_rate_millis)
+                .sum();
+            let receive_rate_millis = aggregated_port_scans
+                .iter()
+                .map(|record| record.current_receive_rate_millis)
+                .sum();
+            let progress_values = aggregated_port_scans
+                .iter()
+                .filter_map(|record| record.current_progress_percent)
+                .collect::<Vec<_>>();
+            let progress_percent = (!progress_values.is_empty())
+                .then(|| progress_values.iter().sum::<u64>() / progress_values.len() as u64);
+            let (label, port_scan_id) = if aggregated_port_scans.len() == 1 {
+                let port_scan = &aggregated_port_scans[0];
+                let display_range = port_scan
+                    .aggregate_target_range
+                    .as_deref()
+                    .unwrap_or(&port_scan.target_range);
+                let label = if port_scan.shard_total.unwrap_or(1) > 1 {
+                    format!(
+                        "Port scan #{} • {} ({} shards)",
+                        port_scan.id,
+                        display_range,
+                        port_scan.shard_total.unwrap_or(active_shard_count as u32)
+                    )
+                } else {
+                    format!("Port scan #{} • {}", port_scan.id, display_range)
+                };
+                (Some(label), Some(port_scan.id))
+            } else {
+                (
+                    Some(format!(
+                        "{} active port scans • {} shards",
+                        logical_port_scan_count, active_shard_count
+                    )),
+                    None,
+                )
+            };
+            snapshots.push(WorkerActivitySnapshot {
+                worker_id,
+                kind: WorkerActivityKind::PortScan,
+                label,
+                run_id: None,
+                port_scan_id,
+                bootstrap_job_id: None,
+                active_job_count: 0,
+                started_at,
+                last_activity_at,
+                request_rate_millis: 0,
+                target_rate_millis,
+                endpoint_rate_millis,
+                probe_rate_millis,
+                receive_rate_millis,
+                progress_percent,
+            });
+            continue;
+        }
+
+        if let Some(run_claims) = run_job_claims_by_worker.get(&worker_id) {
+            if let Some((run_id, job_ids)) = run_claims
+                .iter()
+                .max_by_key(|(_, job_ids)| job_ids.len())
+                .map(|(run_id, job_ids)| (*run_id, job_ids))
+            {
+                let summary = if let Some(summary) = run_summary_cache.get(&run_id) {
+                    summary.clone()
+                } else {
+                    let computed = compute_run_summary(state, run_id)?;
+                    run_summary_cache.insert(run_id, computed.clone());
+                    computed
+                };
+                let worker_count = run_worker_ids
+                    .get(&run_id)
+                    .map(|ids| ids.len() as u64)
+                    .unwrap_or(1)
+                    .max(1);
+                snapshots.push(WorkerActivitySnapshot {
+                    worker_id,
+                    kind: WorkerActivityKind::Run,
+                    label: Some(format!("Run #{}", run_id)),
+                    run_id: Some(run_id),
+                    port_scan_id: None,
+                    bootstrap_job_id: None,
+                    active_job_count: job_ids.len() as u64,
+                    started_at: summary.started_at,
+                    last_activity_at: summary.progress.last_activity_at.or(summary.started_at),
+                    request_rate_millis: compute_rate_millis(
+                        summary.requests_total,
+                        summary.started_at,
+                        summary.completed_at,
+                        now,
+                    ) / worker_count,
+                    target_rate_millis: compute_rate_millis(
+                        summary.completed_targets,
+                        summary.started_at,
+                        summary.completed_at,
+                        now,
+                    ) / worker_count,
+                    endpoint_rate_millis: 0,
+                    probe_rate_millis: 0,
+                    receive_rate_millis: 0,
+                    progress_percent: None,
+                });
+                continue;
+            }
+        }
+
+        if let Some(run_id) = active_run_coordinators.get(&worker_id).copied() {
+            let summary = if let Some(summary) = run_summary_cache.get(&run_id) {
+                summary.clone()
+            } else {
+                let computed = compute_run_summary(state, run_id)?;
+                run_summary_cache.insert(run_id, computed.clone());
+                computed
+            };
+            let worker_count = run_worker_ids
+                .get(&run_id)
+                .map(|ids| ids.len() as u64)
+                .unwrap_or(1)
+                .max(1);
+            snapshots.push(WorkerActivitySnapshot {
+                worker_id,
+                kind: WorkerActivityKind::RunCoordinator,
+                label: Some(format!("Run #{} coordinator", run_id)),
+                run_id: Some(run_id),
+                port_scan_id: None,
+                bootstrap_job_id: None,
+                active_job_count: 0,
+                started_at: summary.started_at,
+                last_activity_at: summary.progress.last_activity_at.or(summary.started_at),
+                request_rate_millis: compute_rate_millis(
+                    summary.requests_total,
+                    summary.started_at,
+                    summary.completed_at,
+                    now,
+                    ) / worker_count,
+                    target_rate_millis: compute_rate_millis(
+                        summary.completed_targets,
+                        summary.started_at,
+                        summary.completed_at,
+                        now,
+                    ) / worker_count,
+                    endpoint_rate_millis: 0,
+                    probe_rate_millis: 0,
+                    receive_rate_millis: 0,
+                    progress_percent: None,
+                });
+            continue;
+        }
+
+        if let Some(job) = active_bootstrap_jobs_by_worker.get(&worker_id) {
+            snapshots.push(WorkerActivitySnapshot {
+                worker_id,
+                kind: WorkerActivityKind::BootstrapJob,
+                label: Some(format!(
+                    "Bootstrap #{} • {}",
+                    job.id, job.discovered_host
+                )),
+                run_id: None,
+                port_scan_id: None,
+                bootstrap_job_id: Some(job.id),
+                active_job_count: 0,
+                started_at: job.started_at,
+                last_activity_at: job.started_at.or(Some(job.created_at)),
+                request_rate_millis: 0,
+                target_rate_millis: 0,
+                endpoint_rate_millis: 0,
+                probe_rate_millis: 0,
+                receive_rate_millis: 0,
+                progress_percent: None,
+            });
+            continue;
+        }
+
+        snapshots.push(WorkerActivitySnapshot {
+            worker_id,
+            kind: WorkerActivityKind::Idle,
+            label: Some("Idle".to_string()),
+            ..WorkerActivitySnapshot::default()
+        });
+    }
+    snapshots.sort_by(|left, right| left.worker_id.cmp(&right.worker_id));
+    Ok(snapshots)
+}
+
+fn compute_worker_throughput_summary(
+    workers: &[WorkerRecord],
+    worker_activity: &[WorkerActivitySnapshot],
+    now: DateTime<Utc>,
+) -> WorkerThroughputSummary {
+    let online_workers = workers
+        .iter()
+        .filter(|worker| worker_is_online(worker, now))
+        .count() as u64;
+    let active = worker_activity
+        .iter()
+        .filter(|activity| activity.kind != WorkerActivityKind::Idle)
+        .collect::<Vec<_>>();
+    let active_workers = active.len() as u64;
+    let total_request_rate_millis = active
+        .iter()
+        .map(|activity| activity.request_rate_millis)
+        .sum::<u64>();
+    let total_target_rate_millis = active
+        .iter()
+        .map(|activity| activity.target_rate_millis)
+        .sum::<u64>();
+    let total_endpoint_rate_millis = active
+        .iter()
+        .map(|activity| activity.endpoint_rate_millis)
+        .sum::<u64>();
+    let total_probe_rate_millis = active
+        .iter()
+        .map(|activity| activity.probe_rate_millis)
+        .sum::<u64>();
+    let total_receive_rate_millis = active
+        .iter()
+        .map(|activity| activity.receive_rate_millis)
+        .sum::<u64>();
+    WorkerThroughputSummary {
+        updated_at: Some(now),
+        online_workers,
+        active_workers,
+        total_request_rate_millis,
+        average_request_rate_millis: if active_workers > 0 {
+            total_request_rate_millis / active_workers
+        } else {
+            0
+        },
+        total_target_rate_millis,
+        average_target_rate_millis: if active_workers > 0 {
+            total_target_rate_millis / active_workers
+        } else {
+            0
+        },
+        total_endpoint_rate_millis,
+        average_endpoint_rate_millis: if active_workers > 0 {
+            total_endpoint_rate_millis / active_workers
+        } else {
+            0
+        },
+        total_probe_rate_millis,
+        average_probe_rate_millis: if active_workers > 0 {
+            total_probe_rate_millis / active_workers
+        } else {
+            0
+        },
+        total_receive_rate_millis,
+        average_receive_rate_millis: if active_workers > 0 {
+            total_receive_rate_millis / active_workers
+        } else {
+            0
+        },
+    }
+}
+
+fn compute_rate_millis(
+    count: u64,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> u64 {
+    if count == 0 {
+        return 0;
+    }
+    let Some(started_at) = started_at else {
+        return 0;
+    };
+    let ended_at = completed_at.unwrap_or(now);
+    let elapsed_ms = (ended_at - started_at).num_milliseconds();
+    if elapsed_ms <= 0 {
+        return 0;
+    }
+    ((count as u128) * 1_000_000u128 / (elapsed_ms as u128)) as u64
 }
 
 fn lease_expires_at(now: DateTime<Utc>, lease_seconds: u64) -> Result<DateTime<Utc>> {
@@ -7486,9 +8943,9 @@ mod tests {
         core::{
             ActiveAuthorizedPluginExecution, CoverageSourceStat, FetchTelemetry, FindingRecord,
             FindingsQuery, JobStatus, PublicFindingModerationRequest, PublicFindingSearchQuery,
-            PublicFindingStatus, RecurringScheduleRecord, RunScope, RunStatus, ScanJobRecord,
-            ScanRunRecord, Severity, TargetDefinition, TargetRecord, TargetStrategy,
-            WorkerBootstrapCandidateRecord, WorkerBootstrapCandidateStatus,
+            PublicFindingStatus, PortScanResumeStateRecord, RecurringScheduleRecord, RunScope,
+            RunStatus, ScanJobRecord, ScanRunRecord, Severity, TargetDefinition, TargetRecord, TargetStrategy,
+            WorkerActivityKind, WorkerBootstrapCandidateRecord, WorkerBootstrapCandidateStatus,
             WorkerEnrollmentTokenRecord, WorkerLifecycleState, WorkerRecord,
         },
     };
@@ -7918,6 +9375,15 @@ mod tests {
             remote_update_status: None,
             remote_update_status_message: None,
             remote_update_status_updated_at: None,
+            installed_bundle_name: None,
+            max_active_tasks: Some(1),
+            agent_concurrency: None,
+            scanner_default_rate: None,
+            scanner_sender_threads: None,
+            scanner_receiver_threads: None,
+            latest_available_bundle_name: None,
+            latest_bundle_matches_installed: None,
+            control_plane_health_message: None,
             lifecycle_state,
             remote_update_requested_at: None,
             enrollment_token_id: None,
@@ -7943,6 +9409,106 @@ mod tests {
         let updated = super::request_worker_remote_update_in_state(&mut state, "edge-1", now)
             .expect("remote update should be requested");
         assert_eq!(updated.remote_update_requested_at, Some(now));
+    }
+
+    #[test]
+    fn active_worker_records_hide_stale_duplicate_display_names() {
+        let now = Utc::now();
+        let mut stale = sample_worker(
+            "edge-old",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        stale.display_name = Some("anyscan-ec2-worker".to_string());
+        stale.last_seen_at = now
+            .checked_sub_signed(ChronoDuration::seconds(180))
+            .expect("timestamp subtraction should remain in range");
+
+        let mut fresh = sample_worker(
+            "edge-new",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        fresh.display_name = Some("anyscan-ec2-worker".to_string());
+        fresh.last_seen_at = now;
+
+        let visible = super::active_worker_records(&[stale, fresh.clone()], now);
+        let state = DragonflyRuntimeState::default();
+        let visible = super::collapse_duplicate_worker_records(&state, visible, now);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].worker_id, fresh.worker_id);
+    }
+
+    #[test]
+    fn visible_worker_records_preserve_duplicate_claimant_worker() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+
+        let mut claimant = sample_worker(
+            "edge-old",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        claimant.display_name = Some("anyscan-ec2-worker".to_string());
+        claimant.last_seen_at = now
+            .checked_sub_signed(ChronoDuration::seconds(180))
+            .expect("timestamp subtraction should remain in range");
+
+        let mut fresh = sample_worker(
+            "edge-new",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        fresh.display_name = Some("anyscan-ec2-worker".to_string());
+        fresh.last_seen_at = now;
+
+        state.workers.push(claimant.clone());
+        state.workers.push(fresh);
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 77,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
+                requested_by: Some("admin".to_string()),
+                target_range: "0.0.0.0-255.255.255.255".to_string(),
+                ports: "80,443".to_string(),
+                schemes: Default::default(),
+                tags: Vec::new(),
+                rate_limit: 0,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
+                notes: None,
+            },
+            claimed_by: Some(claimant.worker_id.clone()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(30)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+
+        let visible = super::visible_worker_records(&state, now);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].worker_id, claimant.worker_id);
     }
 
     #[test]
@@ -8078,12 +9644,18 @@ mod tests {
         state.port_scans.push(super::StoredPortScan {
             port_scan: crate::core::PortScanRecord {
                 id: 1,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
                 requested_by: Some("admin".to_string()),
                 target_range: "10.0.0.0/24".to_string(),
                 ports: "80,443".to_string(),
                 schemes: Default::default(),
                 tags: vec!["edge".to_string()],
                 rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
                 worker_pool: Some("edge".to_string()),
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
@@ -8095,21 +9667,32 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
                 protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
                 notes: None,
             },
             claimed_by: None,
             claim_expires_at: None,
+            resume_state: PortScanResumeStateRecord::default(),
         });
         state.port_scans.push(super::StoredPortScan {
             port_scan: crate::core::PortScanRecord {
                 id: 2,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
                 requested_by: Some("admin".to_string()),
                 target_range: "10.0.1.0/24".to_string(),
                 ports: "8443".to_string(),
                 schemes: Default::default(),
                 tags: vec!["edge".to_string()],
                 rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
                 worker_pool: Some("edge".to_string()),
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
@@ -8121,11 +9704,16 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
                 protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
                 notes: None,
             },
             claimed_by: Some("edge-1".to_string()),
             claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+            resume_state: PortScanResumeStateRecord::default(),
         });
 
         let pools = super::compute_worker_pool_records(&state, now);
@@ -8681,12 +10269,18 @@ mod tests {
         state.port_scans.push(super::StoredPortScan {
             port_scan: crate::core::PortScanRecord {
                 id: 1,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
                 requested_by: Some("admin".to_string()),
                 target_range: "10.0.0.0/24".to_string(),
                 ports: "80".to_string(),
                 schemes: Default::default(),
                 tags: vec![],
                 rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
                 worker_pool: None,
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
@@ -8698,21 +10292,32 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
                 protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
                 notes: None,
             },
             claimed_by: None,
             claim_expires_at: None,
+            resume_state: PortScanResumeStateRecord::default(),
         });
         state.port_scans.push(super::StoredPortScan {
             port_scan: crate::core::PortScanRecord {
                 id: 2,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
                 requested_by: Some("admin".to_string()),
                 target_range: "10.0.1.0/24".to_string(),
                 ports: "443".to_string(),
                 schemes: Default::default(),
                 tags: vec![],
                 rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
                 worker_pool: Some("edge".to_string()),
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
@@ -8724,16 +10329,723 @@ mod tests {
                 imported_targets_total: 0,
                 bootstrap_candidates_total: 0,
                 queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
                 protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
                 notes: None,
             },
             claimed_by: None,
             claim_expires_at: None,
+            resume_state: PortScanResumeStateRecord::default(),
         });
 
         let claimed = claim_next_pending_port_scan_in_state(&mut state, "edge-1", now, 60)?
             .expect("expected a port scan claim");
         assert_eq!(claimed.id, 2);
+        assert!(matches!(claimed.status, RunStatus::InProgress));
+        Ok(())
+    }
+
+    #[test]
+    fn split_port_scan_target_range_evenly_divides_large_ipv4_ranges() {
+        let shards = super::split_port_scan_target_range("0.0.0.0/0", 4);
+        assert_eq!(
+            shards,
+            vec![
+                "0.0.0.0-63.255.255.255",
+                "64.0.0.0-127.255.255.255",
+                "128.0.0.0-191.255.255.255",
+                "192.0.0.0-255.255.255.255",
+            ]
+        );
+    }
+
+    #[test]
+    fn desired_port_scan_shard_count_prefers_available_workers_over_busy_workers() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.workers.push(sample_worker(
+            "edge-2",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.workers.push(sample_worker(
+            "edge-3",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.runs.push(super::StoredRun {
+            schedule_id: None,
+            run: ScanRunRecord {
+                id: 10,
+                requested_by: Some("admin".to_string()),
+                scope: None,
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                total_targets: 0,
+                completed_targets: 0,
+                requests_total: 0,
+                control_requests_total: 0,
+                documents_scanned_total: 0,
+                non_text_responses_total: 0,
+                truncated_responses_total: 0,
+                duplicate_responses_total: 0,
+                control_match_responses_total: 0,
+                request_errors_total: 0,
+                findings_total: 0,
+                errors_total: 0,
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+        });
+
+        assert_eq!(
+            super::eligible_online_port_scan_worker_count(&state, Some("edge"), now),
+            3
+        );
+        assert_eq!(
+            super::available_port_scan_worker_count(&state, Some("edge"), now),
+            2
+        );
+        assert_eq!(
+            super::desired_port_scan_shard_count(&state, Some("edge"), now),
+            2
+        );
+    }
+
+    #[test]
+    fn desired_port_scan_shard_count_falls_back_to_online_workers_when_none_are_free() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.workers.push(sample_worker(
+            "edge-2",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        ));
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 20,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.0.0/24".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 21,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.1.0/24".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
+                notes: None,
+            },
+            claimed_by: Some("edge-2".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+
+        assert_eq!(
+            super::available_port_scan_worker_count(&state, Some("edge"), now),
+            0
+        );
+        assert_eq!(
+            super::desired_port_scan_shard_count(&state, Some("edge"), now),
+            2
+        );
+    }
+
+    #[test]
+    fn desired_port_scan_shard_count_uses_worker_count_even_when_slots_are_higher() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let mut worker = sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(30),
+        );
+        worker.max_active_tasks = Some(4);
+        state.workers.push(worker);
+
+        assert_eq!(
+            super::eligible_online_port_scan_worker_count(&state, Some("edge"), now),
+            1
+        );
+        assert_eq!(
+            super::available_port_scan_worker_count(&state, Some("edge"), now),
+            1
+        );
+        assert_eq!(
+            super::desired_port_scan_shard_count(&state, Some("edge"), now),
+            1
+        );
+    }
+
+    #[test]
+    fn aggregate_port_scan_records_combines_shards_into_one_logical_scan() {
+        let now = Utc::now();
+        let aggregated = super::aggregate_port_scan_records(vec![
+            crate::core::PortScanRecord {
+                id: 100,
+                shard_group_id: Some(100),
+                aggregate_target_range: Some("0.0.0.0/0".to_string()),
+                shard_index: Some(1),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "0.0.0.0-127.255.255.255".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec!["wide".to_string()],
+                rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Completed,
+                started_at: now,
+                completed_at: Some(now),
+                discovered_endpoints_total: 10,
+                imported_targets_total: 8,
+                bootstrap_candidates_total: 1,
+                queued_run_id: Some(55),
+                follow_on_run_ids: vec![55],
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 1_000,
+                current_receive_rate_millis: 2_000,
+                current_progress_percent: Some(50),
+                notes: Some("queued follow-on run 55".to_string()),
+            },
+            crate::core::PortScanRecord {
+                id: 101,
+                shard_group_id: Some(100),
+                aggregate_target_range: Some("0.0.0.0/0".to_string()),
+                shard_index: Some(2),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "128.0.0.0-255.255.255.255".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec!["wide".to_string()],
+                rate_limit: 100,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::Completed,
+                started_at: now,
+                completed_at: Some(now),
+                discovered_endpoints_total: 20,
+                imported_targets_total: 16,
+                bootstrap_candidates_total: 2,
+                queued_run_id: Some(56),
+                follow_on_run_ids: vec![56],
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 2_000,
+                current_receive_rate_millis: 3_000,
+                current_progress_percent: Some(70),
+                notes: Some("queued follow-on run 56".to_string()),
+            },
+        ]);
+
+        assert_eq!(aggregated.len(), 1);
+        let record = &aggregated[0];
+        assert_eq!(record.id, 100);
+        assert_eq!(record.target_range, "0.0.0.0/0");
+        assert_eq!(record.shard_total, Some(2));
+        assert_eq!(record.discovered_endpoints_total, 30);
+        assert_eq!(record.imported_targets_total, 24);
+        assert_eq!(record.bootstrap_candidates_total, 3);
+        assert_eq!(record.current_probe_rate_millis, 3_000);
+        assert_eq!(record.current_receive_rate_millis, 5_000);
+        assert_eq!(record.current_progress_percent, Some(60));
+        assert_eq!(record.follow_on_run_ids, vec![55, 56]);
+        assert_eq!(record.queued_run_id, Some(55));
+        assert!(
+            record
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("queued follow-on run 55"))
+        );
+        assert!(
+            record
+                .notes
+                .as_deref()
+                .is_some_and(|notes| notes.contains("queued follow-on run 56"))
+        );
+    }
+
+    #[test]
+    fn compute_worker_activity_snapshots_aggregates_port_scan_shards_per_worker() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(60),
+        ));
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 200,
+                shard_group_id: Some(200),
+                aggregate_target_range: Some("0.0.0.0/0".to_string()),
+                shard_index: Some(1),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "0.0.0.0-127.255.255.255".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec!["wide".to_string()],
+                rate_limit: 0,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 10,
+                imported_targets_total: 8,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 1_000,
+                current_receive_rate_millis: 2_000,
+                current_progress_percent: Some(40),
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 201,
+                shard_group_id: Some(200),
+                aggregate_target_range: Some("0.0.0.0/0".to_string()),
+                shard_index: Some(2),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "128.0.0.0-255.255.255.255".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec!["wide".to_string()],
+                rate_limit: 0,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 20,
+                imported_targets_total: 16,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 3_000,
+                current_receive_rate_millis: 4_000,
+                current_progress_percent: Some(60),
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::seconds(60)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+
+        let snapshots =
+            super::compute_worker_activity_snapshots(&state, &state.workers, now).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.kind, WorkerActivityKind::PortScan);
+        assert_eq!(snapshot.port_scan_id, Some(200));
+        assert_eq!(snapshot.probe_rate_millis, 4_000);
+        assert_eq!(snapshot.receive_rate_millis, 6_000);
+        assert_eq!(snapshot.progress_percent, Some(50));
+        assert!(
+            snapshot
+                .label
+                .as_deref()
+                .is_some_and(|label| label.contains("2 shards"))
+        );
+    }
+
+    #[test]
+    fn compute_worker_activity_snapshots_keeps_online_worker_port_scan_when_claim_is_stale() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-1",
+            "edge",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(60),
+        ));
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 300,
+                shard_group_id: None,
+                aggregate_target_range: None,
+                shard_index: None,
+                shard_total: None,
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.0.0/24".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: Vec::new(),
+                rate_limit: 0,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: Some("edge".to_string()),
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 100,
+                imported_targets_total: 25,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 9_000,
+                current_receive_rate_millis: 100,
+                current_progress_percent: Some(12),
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now - ChronoDuration::seconds(5)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+
+        let snapshots =
+            super::compute_worker_activity_snapshots(&state, &state.workers, now).unwrap();
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(snapshot.kind, WorkerActivityKind::PortScan);
+        assert_eq!(snapshot.port_scan_id, Some(300));
+        assert_eq!(snapshot.probe_rate_millis, 9_000);
+        assert_eq!(snapshot.receive_rate_millis, 100);
+        assert_eq!(snapshot.progress_percent, Some(12));
+    }
+
+    #[test]
+    fn stop_port_scan_stops_all_shards_in_group() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 100,
+                shard_group_id: Some(100),
+                aggregate_target_range: Some("10.0.0.0/24".to_string()),
+                shard_index: Some(1),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.0.0-10.0.0.127".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 1000,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
+                notes: None,
+            },
+            claimed_by: Some("edge-1".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::minutes(5)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+        state.port_scans.push(super::StoredPortScan {
+            port_scan: crate::core::PortScanRecord {
+                id: 101,
+                shard_group_id: Some(100),
+                aggregate_target_range: Some("10.0.0.0/24".to_string()),
+                shard_index: Some(2),
+                shard_total: Some(2),
+                requested_by: Some("admin".to_string()),
+                target_range: "10.0.0.128-10.0.0.255".to_string(),
+                ports: "80".to_string(),
+                schemes: Default::default(),
+                tags: vec![],
+                rate_limit: 1000,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+                active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                status: RunStatus::InProgress,
+                started_at: now,
+                completed_at: None,
+                discovered_endpoints_total: 0,
+                imported_targets_total: 0,
+                bootstrap_candidates_total: 0,
+                queued_run_id: None,
+                follow_on_run_ids: Vec::new(),
+                protocol_findings: Vec::new(),
+                current_probe_rate_millis: 0,
+                current_receive_rate_millis: 0,
+                current_progress_percent: None,
+                notes: None,
+            },
+            claimed_by: Some("edge-2".to_string()),
+            claim_expires_at: Some(now + ChronoDuration::minutes(5)),
+            resume_state: PortScanResumeStateRecord::default(),
+        });
+
+        let stopped = super::stop_port_scan_in_state(
+            &mut state,
+            100,
+            Some("stopped by operator admin"),
+            now,
+        )
+        .expect("stop should succeed");
+
+        assert_eq!(stopped.id, 100);
+        assert_eq!(stopped.status, RunStatus::Stopping);
+
+        let matching = state
+            .port_scans
+            .iter()
+            .filter(|record| super::port_scan_matches_group(&record.port_scan, 100))
+            .collect::<Vec<_>>();
+        assert!(!matching.is_empty());
+        assert!(matching.iter().all(|record| record.port_scan.status == RunStatus::Stopping));
+        assert!(matching.iter().all(|record| record.claimed_by.is_none()));
+    }
+
+    #[test]
+    fn complete_port_scan_if_owned_allows_stale_same_worker_claim() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState {
+            port_scans: vec![super::StoredPortScan {
+                port_scan: crate::core::PortScanRecord {
+                    id: 400,
+                    shard_group_id: None,
+                    aggregate_target_range: None,
+                    shard_index: None,
+                    shard_total: None,
+                    requested_by: Some("admin".to_string()),
+                    target_range: "10.0.0.1".to_string(),
+                    ports: "80".to_string(),
+                    schemes: Default::default(),
+                    tags: Vec::new(),
+                    rate_limit: 0,
+                    scanner_sender_threads: None,
+                    scanner_receiver_threads: None,
+                    worker_pool: None,
+                    bootstrap_policy: Default::default(),
+                    follow_on_run_policy: Default::default(),
+                    active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                    status: RunStatus::InProgress,
+                    started_at: now,
+                    completed_at: None,
+                    discovered_endpoints_total: 0,
+                    imported_targets_total: 0,
+                    bootstrap_candidates_total: 0,
+                    queued_run_id: None,
+                    follow_on_run_ids: Vec::new(),
+                    protocol_findings: Vec::new(),
+                    current_probe_rate_millis: 10,
+                    current_receive_rate_millis: 20,
+                    current_progress_percent: Some(100),
+                    notes: None,
+                },
+                claimed_by: Some("edge-1".to_string()),
+                claim_expires_at: Some(now - ChronoDuration::seconds(5)),
+                resume_state: PortScanResumeStateRecord::default(),
+            }],
+            ..Default::default()
+        };
+
+        let completed = super::complete_port_scan_if_owned_in_state(
+            &mut state,
+            400,
+            "edge-1",
+            0,
+            0,
+            &[],
+            None,
+            Some("done"),
+            now,
+        )
+        .unwrap()
+        .expect("expected completion");
+        assert!(matches!(completed.status, RunStatus::Completed));
+        assert_eq!(completed.notes.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn port_scan_resume_state_round_trips_and_clears_on_completion() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState {
+            port_scans: vec![super::StoredPortScan {
+                port_scan: crate::core::PortScanRecord {
+                    id: 500,
+                    shard_group_id: None,
+                    aggregate_target_range: None,
+                    shard_index: None,
+                    shard_total: None,
+                    requested_by: Some("admin".to_string()),
+                    target_range: "10.0.0.1".to_string(),
+                    ports: "80".to_string(),
+                    schemes: Default::default(),
+                    tags: Vec::new(),
+                    rate_limit: 0,
+                    scanner_sender_threads: None,
+                    scanner_receiver_threads: None,
+                    worker_pool: None,
+                    bootstrap_policy: Default::default(),
+                    follow_on_run_policy: Default::default(),
+                    active_authorized_plugins: ActiveAuthorizedPluginExecution::default(),
+                    status: RunStatus::InProgress,
+                    started_at: now,
+                    completed_at: None,
+                    discovered_endpoints_total: 0,
+                    imported_targets_total: 0,
+                    bootstrap_candidates_total: 0,
+                    queued_run_id: None,
+                    follow_on_run_ids: Vec::new(),
+                    protocol_findings: Vec::new(),
+                    current_probe_rate_millis: 0,
+                    current_receive_rate_millis: 0,
+                    current_progress_percent: None,
+                    notes: None,
+                },
+                claimed_by: Some("edge-1".to_string()),
+                claim_expires_at: Some(now + ChronoDuration::seconds(30)),
+                resume_state: PortScanResumeStateRecord::default(),
+            }],
+            ..Default::default()
+        };
+
+        let updated = super::update_port_scan_resume_state_if_owned_in_state(
+            &mut state,
+            500,
+            "edge-1",
+            Some("cursor=42"),
+            Some("1.2.3.4:80\n"),
+            now,
+        )?
+        .expect("resume state update should apply");
+        assert_eq!(updated.id, 500);
+
+        let resume_state = state.port_scans[0].resume_state.clone();
+        assert_eq!(resume_state.checkpoint_data.as_deref(), Some("cursor=42"));
+        assert_eq!(resume_state.output_snapshot.as_deref(), Some("1.2.3.4:80"));
+
+        super::complete_port_scan_if_owned_in_state(
+            &mut state,
+            500,
+            "edge-1",
+            1,
+            0,
+            &[],
+            None,
+            Some("done"),
+            now,
+        )?;
+
+        assert!(state.port_scans[0].resume_state.checkpoint_data.is_none());
+        assert!(state.port_scans[0].resume_state.output_snapshot.is_none());
         Ok(())
     }
 
