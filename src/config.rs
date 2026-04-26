@@ -485,6 +485,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "vcs-and-ide-leaks",
     "container-registry",
     "extended-debug-endpoints",
+    "dependency-manifests",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -904,6 +905,44 @@ const EXTENDED_DEBUG_ENDPOINT_PATHS: &[&str] = &[
     "/_metrics",
     "/__profiler__/",
     "/_cat/",
+];
+
+const DEPENDENCY_MANIFEST_PATHS: &[&str] = &[
+    "/package.json",
+    "/package-lock.json",
+    "/yarn.lock",
+    "/pnpm-lock.yaml",
+    "/bun.lock",
+    "/bun.lockb",
+    "/.npmrc",
+    "/.yarnrc",
+    "/requirements.txt",
+    "/requirements-dev.txt",
+    "/Pipfile",
+    "/Pipfile.lock",
+    "/poetry.lock",
+    "/pyproject.toml",
+    "/setup.py",
+    "/setup.cfg",
+    "/Gemfile",
+    "/Gemfile.lock",
+    "/composer.json",
+    "/composer.lock",
+    "/go.mod",
+    "/go.sum",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/Podfile",
+    "/Podfile.lock",
+    "/mix.exs",
+    "/mix.lock",
+    "/build.gradle",
+    "/build.gradle.kts",
+    "/gradle.properties",
+    "/settings.gradle",
+    "/pom.xml",
+    "/Package.swift",
+    "/Package.resolved",
 ];
 
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
@@ -1448,6 +1487,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "vcs-and-ide-leaks" => Some(VCS_AND_IDE_LEAK_PATHS),
         "container-registry" => Some(CONTAINER_REGISTRY_PATHS),
         "extended-debug-endpoints" => Some(EXTENDED_DEBUG_ENDPOINT_PATHS),
+        "dependency-manifests" => Some(DEPENDENCY_MANIFEST_PATHS),
         _ => None,
     }
 }

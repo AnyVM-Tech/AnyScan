@@ -5046,6 +5046,106 @@ paths:
     }
 
     #[tokio::test]
+    async fn dependency_manifests_profile_fetches_lockfiles_through_fetcher() {
+        #[derive(Clone, Default)]
+        struct PathCapture {
+            paths: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn record_lockfile(
+            State(capture): State<PathCapture>,
+            uri: axum::http::Uri,
+        ) -> (StatusCode, [(header::HeaderName, &'static str); 1], &'static str) {
+            let path = uri.path().to_string();
+            let (content_type, body): (&'static str, &'static str) = match path.as_str() {
+                "/package-lock.json" => (
+                    "application/json",
+                    "{\"name\":\"x\",\"lockfileVersion\":3,\"dependencies\":{}}",
+                ),
+                "/requirements.txt" => ("text/plain", "requests==2.28.0\nflask==2.0.0"),
+                "/composer.lock" => ("application/json", "{\"_readme\":[],\"packages\":[]}"),
+                _ => ("text/plain", ""),
+            };
+            capture.paths.lock().await.push(path);
+            (StatusCode::OK, [(CONTENT_TYPE, content_type)], body)
+        }
+
+        let capture = PathCapture::default();
+        let app = Router::new()
+            .route("/package-lock.json", get(record_lockfile))
+            .route("/requirements.txt", get(record_lockfile))
+            .route("/composer.lock", get(record_lockfile))
+            .with_state(capture.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("dependency-manifests listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("dependency-manifests listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("dependency-manifests server should stay available")
+        });
+        let base_url = format!("http://{}", address);
+
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.inventory.default_paths.clear();
+        config.inventory.path_profiles = vec!["dependency-manifests".to_string()];
+        config.scan.max_paths_per_target = 64;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+        config
+            .validate()
+            .expect("dependency-manifests config should validate");
+        let resolved_paths = config
+            .resolved_default_paths()
+            .expect("dependency-manifests profile should resolve");
+        assert!(resolved_paths.contains(&"/package-lock.json".to_string()));
+        assert!(resolved_paths.contains(&"/requirements.txt".to_string()));
+        assert!(resolved_paths.contains(&"/composer.lock".to_string()));
+
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 42,
+            label: "dependency-manifests".to_string(),
+            base_url,
+            paths: resolved_paths,
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        fetcher
+            .fetch_target(&target)
+            .await
+            .expect("dependency-manifests target fetch should succeed");
+
+        let recorded = capture.paths.lock().await.clone();
+        assert!(
+            recorded.iter().any(|path| path == "/package-lock.json"),
+            "package-lock.json should have been fetched, got {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|path| path == "/requirements.txt"),
+            "requirements.txt should have been fetched, got {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|path| path == "/composer.lock"),
+            "composer.lock should have been fetched, got {recorded:?}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn fetch_target_applies_request_profile_credentials() {
         let (server, base_url, capture) = spawn_authenticated_fetch_test_server().await;
         let mut config = AppConfig::default();
