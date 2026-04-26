@@ -1857,7 +1857,16 @@ fn discover_candidate_path_candidates(
     // that discovered anything at all, crowding out legitimate
     // html-link / sitemap discoveries under tight `max_discovered_paths_per_target`
     // budgets.
+    //
+    // Skip static-asset fingerprint probes (e.g.
+    // /phpmyadmin/themes/pmahomme/img/logo_right.png). Their parent
+    // directory is too deep for VCS-leak probes to be plausible, and
+    // emitting the full SENSITIVE_PARENT_PATHS set against a deep nested
+    // image path is pure noise.
     for path in &tech_fingerprint_paths {
+        if looks_like_static_asset_fingerprint_path(path) {
+            continue;
+        }
         for candidate in crate::tech_paths::sensitive_variant_candidates(path) {
             push_tech_fingerprint_discovered_candidate(
                 &mut discovered,
@@ -3697,6 +3706,24 @@ fn push_authoritative_discovered_candidate(
     );
 }
 
+/// True if a tech-fingerprint path is just a static asset probe (image,
+/// font, stylesheet) — these confirm a tech stack is present but are not
+/// themselves interesting to expand sensitive backup/VCS-leak variants
+/// against. The list mirrors the noise filter used inside
+/// `tech_paths::backup_variants_for`.
+fn looks_like_static_asset_fingerprint_path(path: &str) -> bool {
+    let (path_part, _) = path.split_once('?').unwrap_or((path, ""));
+    let lowered = path_part.to_ascii_lowercase();
+    const NOISE_SUFFIXES: &[&str] = &[
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".woff",
+        ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".mp3", ".webm", ".pdf",
+        ".css", ".scss", ".sass", ".less",
+    ];
+    NOISE_SUFFIXES
+        .iter()
+        .any(|suffix| lowered.ends_with(suffix))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_tech_fingerprint_discovered_candidate(
     discovered: &mut Vec<DiscoveryPathCandidate>,
@@ -3813,20 +3840,44 @@ fn normalize_discovered_path(
         return None;
     }
 
+    // Tech-fingerprint profiles include curated query-bearing probes
+    // (e.g. /?author=1, /api/console/proxy?path=_cluster/health). The
+    // default normalization strips queries, which would collapse those to
+    // bare paths and lose the probe — preserve the query for the
+    // TechFingerprint policy.
+    let preserved_query = if matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint) {
+        resolved.query().map(str::to_owned)
+    } else {
+        None
+    };
+
     resolved.set_query(None);
     resolved.set_fragment(None);
     let path = sanitize_paths(&[resolved.path().to_string()])
         .into_iter()
         .next()?;
     if !(is_interesting_discovered_path(&path)
-        || matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
-            && is_authoritative_route_like_path(&path)
+        || (matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
+            && is_authoritative_route_like_path(&path))
         || matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint))
     {
         return None;
     }
 
-    Some(path)
+    // A tech-fingerprint candidate that collapses to bare `/` after the
+    // query is dropped (or was already the seed) is a no-op — drop it
+    // rather than re-enqueueing the seed.
+    if matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint)
+        && path == "/"
+        && preserved_query.is_none()
+    {
+        return None;
+    }
+
+    Some(match preserved_query {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    })
 }
 
 fn is_verbatim_discovered_candidate(candidate: &str) -> bool {
@@ -3844,8 +3895,8 @@ fn normalize_verbatim_discovered_path(
         .into_iter()
         .next()?;
     if !(is_interesting_discovered_path(&path)
-        || matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
-            && is_authoritative_route_like_path(&path)
+        || (matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
+            && is_authoritative_route_like_path(&path))
         || matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint))
     {
         return None;
@@ -4808,6 +4859,82 @@ paths:
             .find(|candidate| candidate.path == "/wp-login.php.bak")
             .expect("sensitive variant expansion should surface backup of discovered paths");
         assert_eq!(backup_variant.source, "sensitive-backup-variant");
+    }
+
+    #[test]
+    fn discovered_paths_preserve_query_strings_for_tech_fingerprint_candidates() {
+        let base_url = Url::parse("https://blog.example.com").expect("base url should parse");
+        let body = r#"
+            <html>
+              <head>
+                <meta name="generator" content="WordPress 6.4.1" />
+                <link rel="stylesheet" href="/wp-content/themes/twentytwentyfour/style.css" />
+              </head>
+              <body><p>hello</p></body>
+            </html>
+        "#;
+
+        let discovered = discover_candidate_path_candidates(&base_url, "/", 0, None, &[], body);
+
+        // /?author=1 is a curated WordPress fingerprint probe — without query
+        // preservation it collapses to "/" (the seed) and the probe is lost.
+        let author_probe = discovered
+            .iter()
+            .find(|candidate| candidate.path == "/?author=1")
+            .expect("WordPress /?author=1 fingerprint probe should preserve its query string");
+        assert_eq!(author_probe.source, "tech-wordpress");
+
+        // The bare "/" should NOT appear as a tech-wordpress candidate — it is
+        // the seed path and would be a no-op.
+        assert!(
+            !discovered
+                .iter()
+                .any(|candidate| candidate.path == "/" && candidate.source == "tech-wordpress"),
+            "tech-fingerprint candidates that collapse to bare / without a query \
+             must be dropped (they would re-enqueue the seed)"
+        );
+    }
+
+    #[test]
+    fn discovered_paths_skip_variant_expansion_for_static_asset_tech_paths() {
+        // The phpMyAdmin profile includes
+        // /phpmyadmin/themes/pmahomme/img/logo_right.png as a fingerprint
+        // probe. Running sensitive_variant_candidates over a static asset
+        // emits VCS-leak paths at a deep parent (e.g.
+        // /phpmyadmin/themes/pmahomme/img/.git/HEAD) which inflates the
+        // candidate set and is unlikely to exist anywhere except the document
+        // root.
+        let base_url = Url::parse("https://db.example.com").expect("base url should parse");
+        let headers = vec![("server".to_string(), "phpMyAdmin".to_string())];
+        let body = "<html><body>phpMyAdmin login</body></html>";
+
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/", 0, None, &headers, body);
+
+        // sanity check: the asset-style fingerprint probe IS in the candidate set
+        let logo_present = discovered.iter().any(|candidate| {
+            candidate.path == "/phpmyadmin/themes/pmahomme/img/logo_right.png"
+        });
+        assert!(
+            logo_present,
+            "phpMyAdmin asset-style fingerprint probe should surface as a candidate"
+        );
+
+        // but variant expansion at that asset's parent must NOT happen
+        assert!(
+            !discovered
+                .iter()
+                .any(|candidate| candidate.path
+                    == "/phpmyadmin/themes/pmahomme/img/.git/HEAD"),
+            "static-asset fingerprint probes must not expand into deep VCS-leak children"
+        );
+        assert!(
+            !discovered
+                .iter()
+                .any(|candidate| candidate.path
+                    == "/phpmyadmin/themes/pmahomme/img/.DS_Store"),
+            "static-asset fingerprint probes must not expand into deep parent-leak children"
+        );
     }
 
     #[test]
