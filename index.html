@@ -121,6 +121,14 @@
 				transform: translateY(0);
 			}
 
+			/* The skip link target lives inside <main id="app">, after the
+			   sticky appbar, so post-auth Tab order skips past the nav.
+			   Pre-auth, <main id="app"> is hidden — there's no nav to skip
+			   and no target — so suppress the skip link entirely. */
+			body:has(#app.hidden) .skip-link {
+				display: none;
+			}
+
 			#main-content:focus,
 			#main-content:focus-visible {
 				outline: none;
@@ -1128,8 +1136,6 @@
 				</p>
 			</header>
 
-			<div id="main-content" tabindex="-1"></div>
-
 			<section id="auth-card" class="card auth-card">
 				<h2>Sign in</h2>
 				<form id="login-form">
@@ -1221,6 +1227,8 @@
 						</div>
 					</div>
 				</header>
+
+				<div id="main-content" tabindex="-1"></div>
 
 				<h2 class="section-group-heading" id="section-overview">
 					<span>Overview</span>
