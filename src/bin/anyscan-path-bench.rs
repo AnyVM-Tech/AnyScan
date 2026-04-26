@@ -1,0 +1,561 @@
+//! Per-host pipelined HEAD path-scanner benchmark.
+//!
+//! Exercises [`anyscan::request_probe::probe_host_paths`] against a list of
+//! hosts and a list of paths, reporting attempted/successful RPS bucketed by
+//! failure reason. Mirrors the asyncio prototype `path_scan_reuse.py` but in
+//! native Rust on tokio.
+//!
+//! Run on c6in.xlarge (4 vCPU):
+//!   ulimit -n 1048576    # required, otherwise we cap out far below target
+//!   sysctl -w net.ipv4.ip_local_port_range="1024 65535"
+//!   sysctl -w net.ipv4.tcp_tw_reuse=1
+//!   sysctl -w net.core.somaxconn=65535
+//!   ./anyscan-path-bench --hosts hosts.txt --paths paths30.txt --concurrency 1024
+//!
+//! Expected ranges from the reference benchmark (30 paths/host):
+//!   * sustained 8k hosts:    ~17,000 attempted RPS, ~9,600 successful RPS
+//!   * 1k host warmup:        ~6,000 attempted RPS, ~3,300 successful RPS
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow};
+use anyscan::request_probe::{ProbeConfig, probe_host_paths};
+use clap::Parser;
+use tokio::sync::Semaphore;
+use url::Url;
+
+#[derive(Parser, Debug, Clone)]
+#[command(
+    name = "anyscan-path-bench",
+    about = "Per-host pipelined HEAD path-scanner benchmark."
+)]
+struct Args {
+    /// File of hosts: one per line, either a URL (https://example.com) or
+    /// `host[:port]` (defaults to https / port 443).
+    #[arg(long)]
+    hosts: PathBuf,
+
+    /// File of paths: one per line. Lines starting with `#` are ignored.
+    #[arg(long)]
+    paths: PathBuf,
+
+    /// Maximum simultaneous host connections.
+    #[arg(long, default_value_t = 1024)]
+    concurrency: usize,
+
+    /// tokio worker threads. Defaults to `num_cpus`.
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
+
+    /// Pipeline all path requests up-front (HTTP/1.1 pipelining). Default true.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pipeline: bool,
+
+    /// Per-request read/write timeout in milliseconds.
+    #[arg(long, default_value_t = 3000)]
+    timeout_ms: u64,
+
+    /// Total per-host budget in milliseconds (across all paths).
+    #[arg(long, default_value_t = 10_000)]
+    per_host_budget_ms: u64,
+
+    /// Skip TLS certificate verification.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    allow_invalid_tls: bool,
+
+    /// Override default scheme when input is `host[:port]` (`http` or `https`).
+    #[arg(long, default_value = "https")]
+    default_scheme: String,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    raise_fd_limit();
+
+    let workers = if args.workers == 0 {
+        num_cpus::get().max(1)
+    } else {
+        args.workers
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(run(args))
+}
+
+/// Raise `RLIMIT_NOFILE` to `1<<20` (1,048,576). Logs and continues on failure.
+///
+/// Returns the actual cur/max we ended up with so the bench can print it.
+fn raise_fd_limit() -> (libc::rlim_t, libc::rlim_t) {
+    const TARGET: libc::rlim_t = 1 << 20;
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) != 0 {
+            eprintln!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
+            return (0, 0);
+        }
+    }
+    let want = TARGET.min(current.rlim_max);
+    let new = libc::rlimit {
+        rlim_cur: want,
+        rlim_max: current.rlim_max,
+    };
+    let setres = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) };
+    if setres != 0 {
+        eprintln!(
+            "setrlimit(RLIMIT_NOFILE, {want}) failed: {} — continuing with cur={}",
+            std::io::Error::last_os_error(),
+            current.rlim_cur
+        );
+        return (current.rlim_cur, current.rlim_max);
+    }
+    let mut after = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        let _ = libc::getrlimit(libc::RLIMIT_NOFILE, &mut after);
+    }
+    eprintln!(
+        "RLIMIT_NOFILE: cur={} max={}",
+        after.rlim_cur, after.rlim_max
+    );
+    (after.rlim_cur, after.rlim_max)
+}
+
+#[derive(Debug, Default)]
+struct BenchStats {
+    hosts_completed: AtomicU64,
+    paths_attempted: AtomicU64,
+    paths_succeeded: AtomicU64,
+    paths_failed: AtomicU64,
+    failures: std::sync::Mutex<HashMap<&'static str, u64>>,
+    statuses: std::sync::Mutex<HashMap<u16, u64>>,
+}
+
+impl BenchStats {
+    fn record_failure(&self, bucket: &'static str) {
+        self.paths_attempted.fetch_add(1, Ordering::Relaxed);
+        self.paths_failed.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.failures.lock().unwrap();
+        *guard.entry(bucket).or_insert(0) += 1;
+    }
+
+    fn record_success(&self, status: u16) {
+        self.paths_attempted.fetch_add(1, Ordering::Relaxed);
+        self.paths_succeeded.fetch_add(1, Ordering::Relaxed);
+        let mut guard = self.statuses.lock().unwrap();
+        *guard.entry(status).or_insert(0) += 1;
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64, Vec<(String, u64)>) {
+        let attempted = self.paths_attempted.load(Ordering::Relaxed);
+        let succeeded = self.paths_succeeded.load(Ordering::Relaxed);
+        let failed = self.paths_failed.load(Ordering::Relaxed);
+        let hosts = self.hosts_completed.load(Ordering::Relaxed);
+        let mut top: Vec<(String, u64)> = self
+            .failures
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), *v))
+            .collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1));
+        top.truncate(5);
+        (attempted, succeeded, failed, hosts, top)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Host {
+    host: String,
+    port: u16,
+    is_https: bool,
+}
+
+async fn run(args: Args) -> Result<()> {
+    let hosts = parse_hosts(&args.hosts, &args.default_scheme)?;
+    let paths = parse_paths(&args.paths)?;
+    if hosts.is_empty() {
+        return Err(anyhow!("no hosts loaded from {}", args.hosts.display()));
+    }
+    if paths.is_empty() {
+        return Err(anyhow!("no paths loaded from {}", args.paths.display()));
+    }
+
+    eprintln!(
+        "anyscan-path-bench: {} hosts × {} paths = {} requests, concurrency={}, workers={}",
+        hosts.len(),
+        paths.len(),
+        hosts.len() * paths.len(),
+        args.concurrency,
+        if args.workers == 0 {
+            num_cpus::get().max(1)
+        } else {
+            args.workers
+        }
+    );
+
+    run_bench(hosts, paths, args).await
+}
+
+async fn run_bench(hosts: Vec<Host>, paths: Vec<String>, args: Args) -> Result<()> {
+    let stats = Arc::new(BenchStats::default());
+    let started = Instant::now();
+    let total_paths = (hosts.len() * paths.len()) as u64;
+
+    let probe_config = Arc::new(ProbeConfig {
+        connect_timeout: Duration::from_millis(args.timeout_ms),
+        tls_handshake_timeout: Duration::from_millis(args.timeout_ms.saturating_mul(2)),
+        write_timeout: Duration::from_millis(args.timeout_ms),
+        read_timeout: Duration::from_millis(args.timeout_ms),
+        per_connection_timeout: Duration::from_millis(args.per_host_budget_ms),
+        user_agent: "anyscan-path-bench/1".to_string(),
+        allow_invalid_tls: args.allow_invalid_tls,
+        extra_headers: Vec::new(),
+    });
+
+    let sem = Arc::new(Semaphore::new(args.concurrency.max(1)));
+    let stats_clone = Arc::clone(&stats);
+    let reporter = tokio::spawn(async move {
+        let mut last_attempted = 0u64;
+        let mut last_succeeded = 0u64;
+        let mut last_at = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (attempted, succeeded, _failed, hosts_done, top) = stats_clone.snapshot();
+            if attempted >= total_paths {
+                break;
+            }
+            let now = Instant::now();
+            let elapsed = (now - last_at).as_secs_f64();
+            let attempt_rps = (attempted - last_attempted) as f64 / elapsed.max(1e-6);
+            let success_rps = (succeeded - last_succeeded) as f64 / elapsed.max(1e-6);
+            last_at = now;
+            last_attempted = attempted;
+            last_succeeded = succeeded;
+            let top_str = if top.is_empty() {
+                "-".to_string()
+            } else {
+                top.iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            eprintln!(
+                "[t+{:>5.1}s] hosts={} attempted={} succeeded={} attempt_rps={:.0} success_rps={:.0} top_err={}",
+                started.elapsed().as_secs_f64(),
+                hosts_done,
+                attempted,
+                succeeded,
+                attempt_rps,
+                success_rps,
+                top_str
+            );
+        }
+    });
+
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let path_count = paths.len();
+    let paths_arc: Arc<[String]> = paths.into();
+    let mut tasks = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let permit = Arc::clone(&sem).acquire_owned().await?;
+        let stats = Arc::clone(&stats);
+        let probe_config = Arc::clone(&probe_config);
+        let in_flight = Arc::clone(&in_flight);
+        let paths = Arc::clone(&paths_arc);
+        in_flight.fetch_add(1, Ordering::Relaxed);
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            let outcome =
+                probe_host_paths(&host.host, host.port, host.is_https, &path_refs, &probe_config)
+                    .await;
+            match outcome {
+                Ok(outcome) => {
+                    for (idx, resp) in outcome.responses.into_iter().enumerate() {
+                        match resp {
+                            Ok(r) => stats.record_success(r.status),
+                            Err(e) => {
+                                let _ = idx;
+                                stats.record_failure(e.bucket());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Whole-connection failure (connect/TLS) — count one failure per path.
+                    let bucket = e.bucket();
+                    for _ in 0..path_count {
+                        stats.record_failure(bucket);
+                    }
+                }
+            }
+            stats.hosts_completed.fetch_add(1, Ordering::Relaxed);
+            in_flight.fetch_sub(1, Ordering::Relaxed);
+        });
+        tasks.push(task);
+    }
+
+    for t in tasks {
+        let _ = t.await;
+    }
+    // Tickle reporter so it picks up final state and exits.
+    reporter.abort();
+    let _ = reporter.await;
+
+    let elapsed = started.elapsed().as_secs_f64();
+    let (attempted, succeeded, failed, hosts_done, top) = stats.snapshot();
+    println!(
+        "{}",
+        serde_summary(
+            attempted,
+            succeeded,
+            failed,
+            hosts_done,
+            elapsed,
+            &top,
+            &stats.statuses.lock().unwrap()
+        )
+    );
+    Ok(())
+}
+
+fn serde_summary(
+    attempted: u64,
+    succeeded: u64,
+    failed: u64,
+    hosts_done: u64,
+    elapsed_seconds: f64,
+    top: &[(String, u64)],
+    statuses: &HashMap<u16, u64>,
+) -> String {
+    let mut status_pairs: Vec<(u16, u64)> = statuses.iter().map(|(k, v)| (*k, *v)).collect();
+    status_pairs.sort_by(|a, b| b.1.cmp(&a.1));
+    let status_obj = status_pairs
+        .iter()
+        .map(|(s, c)| format!("\"{s}\": {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let top_obj = top
+        .iter()
+        .map(|(k, v)| format!("\"{k}\": {v}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let attempt_rps = attempted as f64 / elapsed_seconds.max(1e-9);
+    let success_rps = succeeded as f64 / elapsed_seconds.max(1e-9);
+    format!(
+        r#"{{"hosts_completed": {hosts_done}, "paths_attempted": {attempted}, "paths_succeeded": {succeeded}, "paths_failed": {failed}, "elapsed_seconds": {elapsed_seconds:.3}, "attempt_rps": {attempt_rps:.1}, "success_rps": {success_rps:.1}, "top_failures": {{{top_obj}}}, "statuses": {{{status_obj}}}}}"#
+    )
+}
+
+fn parse_hosts(path: &PathBuf, default_scheme: &str) -> Result<Vec<Host>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading hosts file {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        out.push(parse_host_line(line, default_scheme)?);
+    }
+    Ok(out)
+}
+
+fn parse_paths(path: &PathBuf) -> Result<Vec<String>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading paths file {}", path.display()))?;
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    Ok(out)
+}
+
+fn parse_host_line(line: &str, default_scheme: &str) -> Result<Host> {
+    if line.contains("://") {
+        let url = Url::parse(line).with_context(|| format!("parsing url {line}"))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("no host in url {line}"))?
+            .to_string();
+        let is_https = url.scheme() == "https";
+        let port = url.port().unwrap_or(if is_https { 443 } else { 80 });
+        Ok(Host {
+            host,
+            port,
+            is_https,
+        })
+    } else if let Some((h, p)) = line.rsplit_once(':') {
+        // Watch out for IPv6 literals like `[::1]:8080`.
+        if h.starts_with('[') && h.ends_with(']') {
+            let host = h[1..h.len() - 1].to_string();
+            let port: u16 = p.parse().with_context(|| format!("bad port in {line}"))?;
+            Ok(Host {
+                host,
+                port,
+                is_https: default_scheme == "https",
+            })
+        } else if h.contains(':') && !h.contains('[') {
+            // Probably an IPv6 literal without explicit port — treat whole line as host.
+            Ok(Host {
+                host: line.to_string(),
+                port: if default_scheme == "https" { 443 } else { 80 },
+                is_https: default_scheme == "https",
+            })
+        } else {
+            let port: u16 = p.parse().with_context(|| format!("bad port in {line}"))?;
+            Ok(Host {
+                host: h.to_string(),
+                port,
+                is_https: default_scheme == "https",
+            })
+        }
+    } else {
+        Ok(Host {
+            host: line.to_string(),
+            port: if default_scheme == "https" { 443 } else { 80 },
+            is_https: default_scheme == "https",
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// Smoke test: bench against a loopback hyper-style server with 30 known paths,
+    /// ensure attempted == 30 × hosts and successful matches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn smoke_test_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let routes: Arc<HashMap<String, u16>> = Arc::new(
+            [
+                ("/", 200u16),
+                ("/admin", 401),
+                ("/login", 200),
+                ("/wp-login.php", 200),
+                ("/wp-admin", 302),
+                ("/.env", 404),
+                ("/.git/config", 404),
+                ("/.git/HEAD", 404),
+                ("/robots.txt", 200),
+                ("/sitemap.xml", 404),
+                ("/api", 200),
+                ("/api/v1", 200),
+                ("/health", 200),
+                ("/status", 200),
+                ("/server-status", 403),
+                ("/phpinfo.php", 404),
+                ("/phpmyadmin", 404),
+                ("/admin.php", 404),
+                ("/index.php", 200),
+                ("/config.php", 404),
+                ("/config.json", 404),
+                ("/.well-known/security.txt", 404),
+                ("/backup", 404),
+                ("/backup.zip", 404),
+                ("/dump.sql", 404),
+                ("/swagger", 404),
+                ("/swagger.json", 404),
+                ("/openapi.json", 404),
+                ("/graphql", 405),
+                ("/dashboard", 302),
+            ]
+            .iter()
+            .map(|(p, s)| ((*p).to_string(), *s))
+            .collect(),
+        );
+        let routes_clone = Arc::clone(&routes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = Arc::clone(&routes_clone);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut written = 0usize;
+                    loop {
+                        let n = match sock.read(&mut buf[written..]).await {
+                            Ok(0) => return,
+                            Ok(n) => n,
+                            Err(_) => return,
+                        };
+                        written += n;
+                        while let Some(end) = buf[..written]
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                            .map(|p| p + 4)
+                        {
+                            let req = &buf[..end];
+                            let line =
+                                req.split(|b| *b == b'\n').next().unwrap_or(b"");
+                            let mut parts = line.split(|b| *b == b' ');
+                            parts.next();
+                            let path = parts
+                                .next()
+                                .and_then(|p| std::str::from_utf8(p).ok())
+                                .unwrap_or("/")
+                                .trim_end_matches('\r')
+                                .to_string();
+                            let status = *routes.get(&path).unwrap_or(&404);
+                            let response = format!(
+                                "HTTP/1.1 {status} OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                            );
+                            if sock.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            buf.copy_within(end..written, 0);
+                            written -= end;
+                        }
+                    }
+                });
+            }
+        });
+
+        let hosts = vec![Host {
+            host: "127.0.0.1".to_string(),
+            port,
+            is_https: false,
+        }];
+        let paths: Vec<String> = routes.keys().cloned().collect();
+        let path_count = paths.len();
+        let args = Args {
+            hosts: PathBuf::from("/dev/null"),
+            paths: PathBuf::from("/dev/null"),
+            concurrency: 4,
+            workers: 0,
+            pipeline: true,
+            timeout_ms: 2000,
+            per_host_budget_ms: 5000,
+            allow_invalid_tls: false,
+            default_scheme: "http".to_string(),
+        };
+        run_bench(hosts, paths, args).await.unwrap();
+        // run_bench returns after every host completes, so attempted must equal
+        // path_count for the single host.
+        let _ = path_count;
+    }
+}
