@@ -79,20 +79,155 @@ impl Default for ProbeConfig {
 }
 
 /// One HEAD response, parsed up to (but not including) any body.
+///
+/// Header storage is one of two forms:
+///
+/// * **Raw**: the verbatim header section as it came off the wire (one
+///   `Vec<u8>` allocation per response). Built by [`read_one_response`]
+///   when parsing a real socket. Lookups iterate the bytes lazily with no
+///   per-header allocation.
+/// * **Owned**: an already-parsed `Vec<(String, String)>`. Built by
+///   [`ProbeResponse::from_owned`] when the headers came from a parser
+///   that already produced strings (e.g. `reqwest::HeaderMap` in the
+///   fetcher's proxy fallback). Avoids re-encoding to bytes only to
+///   re-decode them when the caller asks for an owned vec.
+///
+/// Callers access header pairs via [`headers`] / [`header`] (no
+/// allocation, works on either form), [`headers_owned`] (clones / parses
+/// into an owned vec), or [`into_headers_owned`] (consumes the response;
+/// returns the owned vec by move when the storage is already `Owned`).
+///
+/// Why this exists: profiling showed `parse_header`'s `to_string()` calls
+/// were ~6 small allocations per response × 1.6 M responses = ~10 M heap
+/// ops on a loopback bench run. Most callers (the bench, the fetcher's
+/// content-type lookup) only need a handful of headers; deferring the
+/// allocation lets them skip the rest entirely.
 #[derive(Debug, Clone)]
 pub struct ProbeResponse {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    headers: HeadersStorage,
     /// `Connection: close` was advertised by the server.
     pub server_closed: bool,
 }
 
+/// Internal: how `ProbeResponse` is holding its headers.
+#[derive(Debug, Clone)]
+enum HeadersStorage {
+    /// Verbatim header bytes — every line ends with `\n` (preceded
+    /// optionally by `\r`). Built by [`read_one_response`].
+    Raw(Vec<u8>),
+    /// Pre-parsed owned pairs. Built by [`ProbeResponse::from_owned`] when
+    /// the caller already had `(String, String)` tuples in hand.
+    Owned(Vec<(String, String)>),
+}
+
 impl ProbeResponse {
+    /// Construct from an owned list of `(name, value)` pairs. Stores the
+    /// vec as-is — no encoding to bytes — so callers that subsequently
+    /// drain the response with [`into_headers_owned`] get it back without
+    /// any reparse / reallocation.
+    pub fn from_owned(
+        status: u16,
+        headers: Vec<(String, String)>,
+        server_closed: bool,
+    ) -> Self {
+        Self {
+            status,
+            headers: HeadersStorage::Owned(headers),
+            server_closed,
+        }
+    }
+
+    /// Iterate `(name, value)` pairs without per-call heap allocation.
+    /// Lines that don't parse as a `name: value` pair are skipped (Raw
+    /// storage); for Owned storage every entry is yielded.
+    pub fn headers(&self) -> Headers<'_> {
+        Headers::new(&self.headers)
+    }
+
+    /// Look up a single header by case-insensitive name. Early-exits as
+    /// soon as the first match is found; no allocation.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
+        self.headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v)
+    }
+
+    /// Materialize all headers into an owned `Vec<(String, String)>`.
+    /// Clones if the storage is already `Owned`; parses-and-allocates if
+    /// the storage is `Raw`. Use [`into_headers_owned`] when consuming
+    /// the response to avoid the clone in the `Owned` case.
+    pub fn headers_owned(&self) -> Vec<(String, String)> {
+        match &self.headers {
+            HeadersStorage::Raw(_) => self
+                .headers()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            HeadersStorage::Owned(vec) => vec.clone(),
+        }
+    }
+
+    /// Consume the response and return its headers as an owned vec.
+    /// **Zero allocation** when the storage is already `Owned` (the inner
+    /// vec is moved out); parses-and-allocates when the storage is `Raw`.
+    /// Prefer this over [`headers_owned`] at consumer boundaries (e.g.
+    /// the fetcher building a `FetchedDocument`).
+    pub fn into_headers_owned(self) -> Vec<(String, String)> {
+        match self.headers {
+            HeadersStorage::Raw(bytes) => bytes
+                .split(|b| *b == b'\n')
+                .filter_map(parse_header_borrowed)
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            HeadersStorage::Owned(vec) => vec,
+        }
+    }
+}
+
+/// Iterator over a [`ProbeResponse`]'s headers. Statically dispatched
+/// over the two storage variants — no `dyn` allocation per call.
+pub struct Headers<'a> {
+    inner: HeadersInner<'a>,
+}
+
+enum HeadersInner<'a> {
+    Raw(&'a [u8]),
+    Owned(std::slice::Iter<'a, (String, String)>),
+}
+
+impl<'a> Headers<'a> {
+    fn new(storage: &'a HeadersStorage) -> Self {
+        let inner = match storage {
+            HeadersStorage::Raw(bytes) => HeadersInner::Raw(bytes.as_slice()),
+            HeadersStorage::Owned(vec) => HeadersInner::Owned(vec.iter()),
+        };
+        Self { inner }
+    }
+}
+
+impl<'a> Iterator for Headers<'a> {
+    type Item = (&'a str, &'a str);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            HeadersInner::Raw(rest) => loop {
+                if rest.is_empty() {
+                    return None;
+                }
+                let end = rest
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(rest.len(), |p| p + 1);
+                let (line, after) = rest.split_at(end);
+                *rest = after;
+                if let Some(parsed) = parse_header_borrowed(line) {
+                    return Some(parsed);
+                }
+            },
+            HeadersInner::Owned(iter) => {
+                iter.next().map(|(n, v)| (n.as_str(), v.as_str()))
+            }
+        }
     }
 }
 
@@ -508,7 +643,10 @@ where
         return Err(ProbeError::ConnectionReset);
     }
     let status = parse_status_line(&line)?;
-    let mut headers = Vec::with_capacity(8);
+    // Raw header bytes accumulator — one allocation per response, replacing
+    // the previous `Vec<(String, String)>` (1 Vec alloc + 2 String allocs per
+    // header). Capacity 256 covers a typical short HEAD response in one go.
+    let mut raw_headers: Vec<u8> = Vec::with_capacity(256);
     let mut server_closed = false;
     let mut consumed = n;
     loop {
@@ -522,14 +660,18 @@ where
         if line == b"\r\n" || line == b"\n" {
             break;
         }
-        if let Some((name, value)) = parse_header(&line) {
-            if name.eq_ignore_ascii_case("connection")
-                && value.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("close"))
-            {
-                server_closed = true;
+        // Detect Connection: close on the raw bytes — avoids the per-header
+        // String allocation that `parse_header` used to do.
+        if let Some(value) = header_value_if_name(&line, b"connection") {
+            for tok in value.split(|b| *b == b',') {
+                let tok = trim_ascii_ws(tok);
+                if tok.eq_ignore_ascii_case(b"close") {
+                    server_closed = true;
+                    break;
+                }
             }
-            headers.push((name, value));
         }
+        raw_headers.extend_from_slice(&line);
         if consumed >= HEADERS_BYTE_LIMIT {
             return Err(ProbeError::HeadersTooLarge {
                 limit: HEADERS_BYTE_LIMIT,
@@ -538,9 +680,54 @@ where
     }
     Ok(ProbeResponse {
         status,
-        headers,
+        headers: HeadersStorage::Raw(raw_headers),
         server_closed,
     })
+}
+
+/// If `line` is a `name: value\r?\n?` header whose name matches
+/// `expected_name` case-insensitively, return the (untrimmed) value bytes.
+///
+/// The name comparison trims leading/trailing ASCII whitespace before
+/// matching. RFC 7230 §3.2.4 says compliant senders MUST NOT put whitespace
+/// between the field name and `:`, but the previous (`String`-based)
+/// `parse_header` did `.trim()` on the name and we preserve that
+/// permissive behavior — there's no smuggling risk for an internal
+/// "is this Connection: close?" check.
+fn header_value_if_name<'a>(line: &'a [u8], expected_name: &[u8]) -> Option<&'a [u8]> {
+    let colon = line.iter().position(|b| *b == b':')?;
+    let name = trim_ascii_ws(&line[..colon]);
+    if !name.eq_ignore_ascii_case(expected_name) {
+        return None;
+    }
+    Some(&line[colon + 1..])
+}
+
+/// Trim leading & trailing ASCII whitespace (SP, HT, CR, LF) from a byte slice.
+fn trim_ascii_ws(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+    let Some(start) = start else { return &[]; };
+    let end = s.iter().rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')).unwrap();
+    &s[start..=end]
+}
+
+/// Parse a single header line `name: value\r?\n?` into borrowed `&str`
+/// halves. Returns `None` for blank lines, malformed lines, or non-UTF-8
+/// content. Used by [`ProbeResponse::headers`].
+fn parse_header_borrowed(line: &[u8]) -> Option<(&str, &str)> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        return None;
+    }
+    let colon = line.iter().position(|b| *b == b':')?;
+    let name = std::str::from_utf8(&line[..colon]).ok()?;
+    let value = std::str::from_utf8(&line[colon + 1..]).ok()?;
+    let name = name.trim_matches(|c: char| matches!(c, ' ' | '\t'));
+    let value = value.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, value))
 }
 
 /// Read up to (and including) the next `\n`, into `out`. Enforces `limit`:
@@ -661,20 +848,6 @@ fn parse_status_line(line: &[u8]) -> Result<u16, ProbeError> {
     code_str
         .parse::<u16>()
         .map_err(|_| ProbeError::MalformedResponse(format!("bad status code: {code_str}")))
-}
-
-fn parse_header(line: &[u8]) -> Option<(String, String)> {
-    let mut parts = line.splitn(2, |b| *b == b':');
-    let name = parts.next()?;
-    let value = parts.next()?;
-    let name = std::str::from_utf8(name).ok()?.trim();
-    let value = std::str::from_utf8(value).ok()?.trim_matches(|c: char| {
-        c == ' ' || c == '\t' || c == '\r' || c == '\n'
-    });
-    if name.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), value.to_string()))
 }
 
 /// Lazily initialised, process-wide TLS connectors.
@@ -1210,5 +1383,87 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// `Connection : close` (whitespace before the colon) was previously
+    /// handled by `parse_header`'s `.trim()` on the name. The new byte-level
+    /// check must keep that permissive behavior or the pipelined reader will
+    /// keep going past a server-signalled close and desync.
+    #[tokio::test]
+    async fn server_connection_close_with_whitespace_before_colon() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _rx = rx;
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Wait for one request, then reply with a quirky `Connection : close`
+                // (note the SP before the colon — RFC-illegal sender side, but real
+                // servers ship messages like this).
+                let mut buf = [0u8; 4096];
+                let mut written = 0usize;
+                while let Ok(n) = sock.read(&mut buf[written..]).await {
+                    if n == 0 {
+                        return;
+                    }
+                    written += n;
+                    if find_double_crlf(&buf[..written]).is_some() {
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection : close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        let paths: Vec<&str> = vec!["/a", "/b", "/c"];
+        let outcome = probe_host_paths("127.0.0.1", port, false, &paths, &cfg())
+            .await
+            .expect("probe ok");
+        assert_eq!(outcome.responses.len(), paths.len());
+        // First slot has the response with `Connection : close` — server_closed
+        // must be set so the loop fills remaining slots with ServerClosedEarly.
+        let first = outcome.responses[0].as_ref().expect("first slot ok");
+        assert_eq!(first.status, 200);
+        assert!(
+            first.server_closed,
+            "Connection : close (with whitespace) MUST trigger server_closed"
+        );
+        assert_eq!(outcome.server_closed_early, Some(0));
+        for (i, resp) in outcome.responses.iter().enumerate().skip(1) {
+            match resp {
+                Err(ProbeError::ServerClosedEarly { index }) => assert_eq!(*index, i),
+                other => panic!("slot {i}: expected ServerClosedEarly, got {other:?}"),
+            }
+        }
+        let _ = tx; // keep channel alive
+    }
+
+    /// `from_owned` should keep the inner `Vec<(String, String)>` intact so
+    /// that `into_headers_owned` returns it without reparse / reallocation.
+    /// Round-trip equality is the contract.
+    #[tokio::test]
+    async fn from_owned_round_trips_through_into_headers_owned() {
+        let pairs = vec![
+            ("Content-Type".to_string(), "text/html".to_string()),
+            ("X-Frame-Options".to_string(), "DENY".to_string()),
+            ("Cache-Control".to_string(), "max-age=0, must-revalidate".to_string()),
+        ];
+        let response = ProbeResponse::from_owned(200, pairs.clone(), false);
+        // header() must work on Owned storage.
+        assert_eq!(response.header("content-type"), Some("text/html"));
+        assert_eq!(response.header("X-FRAME-OPTIONS"), Some("DENY"));
+        assert_eq!(response.header("missing"), None);
+        // headers() iterator must yield the same pairs.
+        let iter_pairs: Vec<(String, String)> = response
+            .headers()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        assert_eq!(iter_pairs, pairs);
+        // into_headers_owned must return the original vec contents (the
+        // value-equality check is what matters; the move-vs-clone story is
+        // a perf detail that the tested API cannot directly observe).
+        let drained = response.into_headers_owned();
+        assert_eq!(drained, pairs);
     }
 }

@@ -1022,11 +1022,7 @@ impl Fetcher {
                                     })
                                 })
                                 .collect::<Vec<_>>();
-                            Ok(ProbeResponse {
-                                status,
-                                headers,
-                                server_closed: false,
-                            })
+                            Ok(ProbeResponse::from_owned(status, headers, false))
                         }
                         Err(error) => Err(anyhow!(error)),
                     }
@@ -1040,17 +1036,20 @@ impl Fetcher {
                         return Ok(None);
                     }
                     let content_type = response
-                        .headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, value)| value.clone());
+                        .header("content-type")
+                        .map(|v| v.to_string());
+                    let status = response.status;
+                    // Drain into the owned vec by moving (free for the
+                    // proxy/`Owned` storage path; parses-and-allocates
+                    // for the direct/`Raw` path, same cost as before).
+                    let headers = response.into_headers_owned();
                     return Ok(Some(ResponseSnapshot {
                         document: FetchedDocument {
                             path: path.to_string(),
                             url: url.to_string(),
-                            status: response.status,
+                            status,
                             content_type,
-                            headers: response.headers,
+                            headers,
                             body: String::new(),
                             truncated: false,
                             coverage_source: coverage_source.to_string(),
