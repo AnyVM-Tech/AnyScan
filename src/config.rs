@@ -488,6 +488,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "extended-debug-endpoints",
     "dependency-manifests",
     "container-orchestration",
+    "cicd-configs",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -716,6 +717,27 @@ const BACKUP_CONFIG_PATHS: &[&str] = &[
     "/config.yml.bak",
     "/application.yml.bak",
     "/settings.json.bak",
+];
+
+const CICD_CONFIG_PATHS: &[&str] = &[
+    "/.github/workflows/ci.yml",
+    "/.github/workflows/deploy.yml",
+    "/.github/workflows/release.yml",
+    "/.github/dependabot.yml",
+    "/.gitlab-ci.yml",
+    "/.gitlab/ci/main.yml",
+    "/Jenkinsfile",
+    "/jenkins.yml",
+    "/.circleci/config.yml",
+    "/azure-pipelines.yml",
+    "/.azure/pipelines.yml",
+    "/.travis.yml",
+    "/bitbucket-pipelines.yml",
+    "/.drone.yml",
+    "/cloudbuild.yaml",
+    "/buildspec.yml",
+    "/buildspec.yaml",
+    "/.woodpecker.yml",
 ];
 
 const TECH_SPRING_ACTUATOR_PATHS: &[&str] = &[
@@ -1552,6 +1574,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "extended-debug-endpoints" => Some(EXTENDED_DEBUG_ENDPOINT_PATHS),
         "dependency-manifests" => Some(DEPENDENCY_MANIFEST_PATHS),
         "container-orchestration" => Some(CONTAINER_ORCHESTRATION_PATHS),
+        "cicd-configs" => Some(CICD_CONFIG_PATHS),
         _ => None,
     }
 }
