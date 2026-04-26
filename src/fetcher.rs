@@ -207,6 +207,11 @@ const HIGH_PORT_SKIP_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 enum DiscoveryNormalizationPolicy {
     Default,
     Authoritative,
+    /// Curated tech-stack fingerprint paths (e.g. `/wp-login.php`,
+    /// `/manager/html`). The path list itself is the authority — emission
+    /// means the host fingerprinted as the relevant tech, so the per-path
+    /// interestingness/route-shape filter is bypassed.
+    TechFingerprint,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -550,6 +555,8 @@ impl Fetcher {
                             &base_url,
                             &snapshot.document.path,
                             path_depth,
+                            snapshot.document.content_type.as_deref(),
+                            &snapshot.document.headers,
                             &snapshot.document.body,
                         ) {
                             if scheduled_discovered_paths
@@ -1742,7 +1749,7 @@ fn seed_candidate_priority(
 
 #[cfg(test)]
 fn discover_candidate_paths(base_url: &Url, current_path: &str, body: &str) -> Vec<String> {
-    discover_candidate_path_candidates(base_url, current_path, 0, body)
+    discover_candidate_path_candidates(base_url, current_path, 0, None, &[], body)
         .into_iter()
         .map(|candidate| candidate.path)
         .collect()
@@ -1752,6 +1759,8 @@ fn discover_candidate_path_candidates(
     base_url: &Url,
     current_path: &str,
     current_depth: u8,
+    content_type: Option<&str>,
+    headers: &[(String, String)],
     body: &str,
 ) -> Vec<DiscoveryPathCandidate> {
     let mut discovered = Vec::new();
@@ -1821,6 +1830,46 @@ fn discover_candidate_path_candidates(
             candidate.score,
             next_depth,
         );
+    }
+
+    let tech_fingerprint_paths: Vec<String> =
+        crate::tech_paths::tech_path_candidates(current_path, content_type, headers, body)
+            .into_iter()
+            .map(|candidate| {
+                push_tech_fingerprint_discovered_candidate(
+                    &mut discovered,
+                    &mut seen,
+                    base_url,
+                    current_path,
+                    &candidate.path,
+                    candidate.source,
+                    candidate.score,
+                    next_depth,
+                );
+                candidate.path
+            })
+            .collect();
+
+    // Sensitive backup/swap and parent-directory VCS leak variants are
+    // expanded only over the tech-fingerprint paths (not over every
+    // already-discovered path). Expanding over every discovery would inject
+    // global high-score paths (e.g. /.git/HEAD at score 940) on every scan
+    // that discovered anything at all, crowding out legitimate
+    // html-link / sitemap discoveries under tight `max_discovered_paths_per_target`
+    // budgets.
+    for path in &tech_fingerprint_paths {
+        for candidate in crate::tech_paths::sensitive_variant_candidates(path) {
+            push_tech_fingerprint_discovered_candidate(
+                &mut discovered,
+                &mut seen,
+                base_url,
+                current_path,
+                &candidate.path,
+                candidate.source,
+                candidate.score,
+                next_depth,
+            );
+        }
     }
 
     let explicit_candidates = discovered
@@ -3648,6 +3697,31 @@ fn push_authoritative_discovered_candidate(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_tech_fingerprint_discovered_candidate(
+    discovered: &mut Vec<DiscoveryPathCandidate>,
+    seen: &mut HashMap<String, usize>,
+    base_url: &Url,
+    current_path: &str,
+    candidate: &str,
+    source: &'static str,
+    score: u16,
+    depth: u8,
+) {
+    push_discovered_candidate_with_floor(
+        discovered,
+        seen,
+        base_url,
+        current_path,
+        candidate,
+        source,
+        score,
+        discovered_score_floor(source),
+        depth,
+        DiscoveryNormalizationPolicy::TechFingerprint,
+    );
+}
+
 fn push_discovered_candidate_with_floor(
     discovered: &mut Vec<DiscoveryPathCandidate>,
     seen: &mut HashMap<String, usize>,
@@ -3746,7 +3820,8 @@ fn normalize_discovered_path(
         .next()?;
     if !(is_interesting_discovered_path(&path)
         || matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
-            && is_authoritative_route_like_path(&path))
+            && is_authoritative_route_like_path(&path)
+        || matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint))
     {
         return None;
     }
@@ -3770,7 +3845,8 @@ fn normalize_verbatim_discovered_path(
         .next()?;
     if !(is_interesting_discovered_path(&path)
         || matches!(policy, DiscoveryNormalizationPolicy::Authoritative)
-            && is_authoritative_route_like_path(&path))
+            && is_authoritative_route_like_path(&path)
+        || matches!(policy, DiscoveryNormalizationPolicy::TechFingerprint))
     {
         return None;
     }
@@ -4510,7 +4586,8 @@ mod tests {
         let base_url = Url::parse("https://app.example.com").expect("base url should parse");
         let body = "User-agent: *\nAllow: /admin/config\nDisallow: /backup/config.json.bak\nSitemap: /sitemap.xml\n";
 
-        let discovered = discover_candidate_path_candidates(&base_url, "/robots.txt", 0, body);
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/robots.txt", 0, None, &[], body);
         let sitemap = discovered
             .iter()
             .find(|candidate| candidate.path == "/sitemap.xml")
@@ -4564,7 +4641,8 @@ mod tests {
             </urlset>
         "#;
 
-        let discovered = discover_candidate_path_candidates(&base_url, "/sitemap.xml", 0, body);
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/sitemap.xml", 0, None, &[], body);
         let asset = discovered
             .iter()
             .find(|candidate| candidate.path == "/assets/app.js")
@@ -4588,6 +4666,8 @@ mod tests {
             &base_url,
             "/asset-manifest.json",
             0,
+            None,
+            &[],
             asset_manifest,
         );
         let bundle = discovered_assets
@@ -4604,8 +4684,14 @@ mod tests {
         assert_eq!(runtime.source, "asset-manifest");
 
         let web_manifest = r#"{"related_applications":[{"url":"/openapi.json"}],"shortcuts":[{"url":"/service-worker.js"}]}"#;
-        let discovered_manifest =
-            discover_candidate_path_candidates(&base_url, "/site.webmanifest", 0, web_manifest);
+        let discovered_manifest = discover_candidate_path_candidates(
+            &base_url,
+            "/site.webmanifest",
+            0,
+            None,
+            &[],
+            web_manifest,
+        );
         let schema = discovered_manifest
             .iter()
             .find(|candidate| candidate.path == "/openapi.json")
@@ -4634,7 +4720,8 @@ mod tests {
             }
         "#;
 
-        let discovered = discover_candidate_path_candidates(&base_url, "/openapi.json", 0, body);
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/openapi.json", 0, None, &[], body);
         let user_collection = discovered
             .iter()
             .find(|candidate| candidate.path == "/api/v1/users")
@@ -4663,7 +4750,8 @@ paths:
     get: {}
         "#;
 
-        let discovered = discover_candidate_path_candidates(&base_url, "/openapi.yaml", 0, body);
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/openapi.yaml", 0, None, &[], body);
         let graphql = discovered
             .iter()
             .find(|candidate| candidate.path == "/service/graphql")
@@ -4686,6 +4774,40 @@ paths:
         assert!(discovered.contains(&"/api/openapi.json".to_string()));
         assert!(discovered.contains(&"/api/graphql".to_string()));
         assert!(discovered.contains(&"/docs/openapi.json".to_string()));
+    }
+
+    #[test]
+    fn discovered_paths_surface_tech_fingerprint_candidates_for_wordpress_body() {
+        let base_url = Url::parse("https://blog.example.com").expect("base url should parse");
+        let body = r#"
+            <html>
+              <head>
+                <meta name="generator" content="WordPress 6.4.1" />
+                <link rel="stylesheet" href="/wp-content/themes/twentytwentyfour/style.css" />
+              </head>
+              <body><p>hello</p></body>
+            </html>
+        "#;
+
+        let discovered =
+            discover_candidate_path_candidates(&base_url, "/", 0, None, &[], body);
+        let wp_login = discovered
+            .iter()
+            .find(|candidate| candidate.path == "/wp-login.php")
+            .expect("wordpress fingerprint should surface /wp-login.php candidate");
+
+        assert_eq!(wp_login.source, "tech-wordpress");
+        assert!(
+            wp_login.score >= 820,
+            "tech-fingerprint score should be >= 820, was {}",
+            wp_login.score
+        );
+
+        let backup_variant = discovered
+            .iter()
+            .find(|candidate| candidate.path == "/wp-login.php.bak")
+            .expect("sensitive variant expansion should surface backup of discovered paths");
+        assert_eq!(backup_variant.source, "sensitive-backup-variant");
     }
 
     #[test]
