@@ -19,7 +19,7 @@ DEFAULT_RATE_LIMIT = 1_000
 DEFAULT_SENDER_THREADS = HOST_CPU_THREADS
 DEFAULT_RECEIVER_THREADS = HOST_CPU_THREADS
 DEFAULT_COOLDOWN_SECONDS = 5
-CURRENT_CHILD: subprocess.Popen[str] | None = None
+CURRENT_CHILD: subprocess.Popen[bytes] | None = None
 PROGRESS_LINE_RE = re.compile(
     r"(?P<minutes>\d+):(?P<seconds>\d+)\s+(?P<percent>\d+)%;\s+send:\s+"
     r"(?P<sent>\d+)\s+(?P<send_rate>[0-9.]+\s*[KMG]?p/s)\s+\((?P<avg_send_rate>[0-9.]+\s*[KMG]?p/s)\s+avg\);"
@@ -126,8 +126,6 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
     )
     ports = require_string(invocation, "ports")
     probe_module = env_string("SCANNER_PROBE_MODULE") or "tcp"
-    senders = max(1, env_int("SCANNER_SENDER_THREADS", DEFAULT_SENDER_THREADS))
-    receivers = max(1, env_int("SCANNER_RECEIVER_THREADS", DEFAULT_RECEIVER_THREADS))
     cooldown = max(0, env_int("SCANNER_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS))
 
     rate_limit = invocation.get("rate_limit")

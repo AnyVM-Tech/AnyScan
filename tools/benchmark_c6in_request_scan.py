@@ -140,11 +140,35 @@ def wait_for_ssh(public_ip: str, key_path: Path, timeout_seconds: int = 300) -> 
 
 
 def extract_urls_from_live_port_scan(port_scan_id: int, sample_size: int, seed: int, ports: set[int]) -> list[str]:
-    host = "10.87.212.41"
-    port = 6380
-    username = "default"
-    password = "inctNiqgE4JvilzgMg7Fy4Si9JUcayPZvKeeULembcI"
-    key = "anyscan:runtime_state"
+    host = os.environ.get("ANYSCAN_RUNTIME_STATE_HOST")
+    port_text = os.environ.get("ANYSCAN_RUNTIME_STATE_PORT")
+    username = os.environ.get("ANYSCAN_RUNTIME_STATE_USERNAME")
+    password = os.environ.get("ANYSCAN_RUNTIME_STATE_PASSWORD")
+    key = os.environ.get("ANYSCAN_RUNTIME_STATE_KEY")
+
+    missing = [
+        name
+        for name, value in [
+            ("ANYSCAN_RUNTIME_STATE_HOST", host),
+            ("ANYSCAN_RUNTIME_STATE_PORT", port_text),
+            ("ANYSCAN_RUNTIME_STATE_USERNAME", username),
+            ("ANYSCAN_RUNTIME_STATE_PASSWORD", password),
+            ("ANYSCAN_RUNTIME_STATE_KEY", key),
+        ]
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s) for live port scan runtime state access: "
+            + ", ".join(missing)
+        )
+
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise RuntimeError(
+            "ANYSCAN_RUNTIME_STATE_PORT must be a valid integer"
+        ) from exc
 
     def send_cmd(sock: socket.socket, *parts: str) -> None:
         out = [f"*{len(parts)}\r\n".encode()]
