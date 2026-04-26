@@ -1038,12 +1038,16 @@ impl Fetcher {
                     let content_type = response
                         .header("content-type")
                         .map(|v| v.to_string());
-                    let headers = response.headers_owned();
+                    let status = response.status;
+                    // Drain into the owned vec by moving (free for the
+                    // proxy/`Owned` storage path; parses-and-allocates
+                    // for the direct/`Raw` path, same cost as before).
+                    let headers = response.into_headers_owned();
                     return Ok(Some(ResponseSnapshot {
                         document: FetchedDocument {
                             path: path.to_string(),
                             url: url.to_string(),
-                            status: response.status,
+                            status,
                             content_type,
                             headers,
                             body: String::new(),
