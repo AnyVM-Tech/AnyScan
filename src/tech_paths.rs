@@ -151,11 +151,15 @@ pub fn detect_tech_fingerprints(
     body: &str,
 ) -> Vec<TechFingerprint> {
     let lowered_path = path.trim().to_ascii_lowercase();
-    let lowered_body = if body.len() > MAX_BODY_INSPECT_BYTES {
-        body[..MAX_BODY_INSPECT_BYTES].to_ascii_lowercase()
-    } else {
-        body.to_ascii_lowercase()
-    };
+    // Guard against UTF-8 boundary panics: a raw byte slice at
+    // MAX_BODY_INSPECT_BYTES can land inside a multi-byte codepoint and
+    // panic. `str::get` returns None on a non-boundary index; fall back to
+    // the full body in that (rare) case rather than crashing fingerprint
+    // detection for that target.
+    let lowered_body = body
+        .get(..MAX_BODY_INSPECT_BYTES)
+        .unwrap_or(body)
+        .to_ascii_lowercase();
     let lowered_ct = content_type
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default();
@@ -316,12 +320,16 @@ pub fn detect_tech_fingerprints(
         push_unique(&mut fingerprints, TechFingerprint::Kibana);
     }
 
-    // Prometheus
+    // Prometheus. The exposition format is `# HELP name ...` / `# TYPE name <kind>`
+    // (case-insensitive after to_ascii_lowercase). Match either the landing
+    // page tagline or `/metrics` returning a body with both HELP and TYPE
+    // markers, or a TYPE line for a `prometheus_*` self-metric (server
+    // exposes its own metrics under the `prometheus_` prefix).
     if lowered_body.contains("prometheus time series collection")
-        || lowered_body.contains("# typeprometheus_")
+        || lowered_body.contains("# type prometheus_")
         || lowered_path == "/metrics"
-            && lowered_body.contains("# help")
-            && lowered_body.contains("# type")
+            && lowered_body.contains("# help ")
+            && lowered_body.contains("# type ")
     {
         push_unique(&mut fingerprints, TechFingerprint::Prometheus);
     }
@@ -1392,6 +1400,45 @@ mod tests {
     fn detects_kibana_from_kbn_name_header() {
         let fps = header_only("kbn-name", "kibana");
         assert!(fps.contains(&TechFingerprint::Kibana));
+    }
+
+    #[test]
+    fn detects_prometheus_from_metrics_exposition_format() {
+        let body = "# HELP go_gc_duration_seconds Summary of the GC.\n\
+                    # TYPE go_gc_duration_seconds summary\n\
+                    go_gc_duration_seconds{quantile=\"0\"} 1.2e-05\n";
+        let fps =
+            detect_tech_fingerprints("/metrics", Some("text/plain"), &[], body);
+        assert!(fps.contains(&TechFingerprint::Prometheus));
+    }
+
+    #[test]
+    fn detects_prometheus_from_self_metric_type_line() {
+        // Prometheus servers expose their own internals under the
+        // `prometheus_*` namespace — a `# TYPE prometheus_xxx ...` line is
+        // distinctive even when path != /metrics.
+        let body = "# HELP prometheus_build_info A metric with a constant '1' value.\n\
+                    # TYPE prometheus_build_info gauge\n";
+        let fps =
+            detect_tech_fingerprints("/api/v1/status/buildinfo", None, &[], body);
+        assert!(fps.contains(&TechFingerprint::Prometheus));
+    }
+
+    #[test]
+    fn fingerprint_detection_does_not_panic_on_large_utf8_body_at_byte_boundary() {
+        // Build a body that exceeds MAX_BODY_INSPECT_BYTES and contains
+        // multi-byte codepoints straddling the 65_536 boundary. A naive
+        // `body[..65_536]` slice would panic; the boundary-safe path must
+        // succeed and return a valid (possibly empty) fingerprint list.
+        let mut body = String::with_capacity(MAX_BODY_INSPECT_BYTES + 64);
+        // Fill up to one byte short of the boundary with ASCII.
+        body.push_str(&"a".repeat(MAX_BODY_INSPECT_BYTES - 1));
+        // 4-byte codepoint: '🦀' = U+1F980, which spans the boundary.
+        body.push('🦀');
+        // Pad past the boundary so the slice attempt actually triggers.
+        body.push_str(&"b".repeat(64));
+        let fps = detect_tech_fingerprints("/", None, &[], &body);
+        assert!(fps.is_empty() || fps.iter().all(|f| !matches!(f, TechFingerprint::Prometheus)));
     }
 
     #[test]
