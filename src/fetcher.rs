@@ -925,7 +925,10 @@ impl Fetcher {
         let mut entries = self.deep_host_throttles.entries.lock().await;
         Arc::clone(entries.entry(key).or_insert_with(|| {
             Arc::new(HostThrottle::new(
-                self.scan.deep_max_concurrent_requests_per_host.max(1),
+                self.scan
+                    .deep_max_concurrent_requests_per_host
+                    .min(self.scan.max_concurrent_requests_per_host)
+                    .max(1),
                 Duration::from_millis(self.scan.host_backoff_initial_ms),
                 Duration::from_millis(self.scan.host_backoff_max_ms),
             ))
@@ -937,7 +940,10 @@ impl Fetcher {
         let mut entries = self.probe_host_throttles.entries.lock().await;
         Arc::clone(entries.entry(key).or_insert_with(|| {
             Arc::new(HostThrottle::new(
-                self.scan.probe_max_concurrent_requests_per_host.max(1),
+                self.scan
+                    .probe_max_concurrent_requests_per_host
+                    .min(self.scan.max_concurrent_requests_per_host)
+                    .max(1),
                 Duration::from_millis(self.scan.host_backoff_initial_ms),
                 Duration::from_millis(self.scan.host_backoff_max_ms),
             ))
@@ -4384,16 +4390,23 @@ mod tests {
         async fn catch_all(
             State(probe): State<ParallelismProbe>,
             Path(path): Path<String>,
-        ) -> ([(&'static str, &'static str); 1], String) {
+        ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
             let request_path = format!("/{path}");
-            if !request_path.contains("anyscan-control-") {
-                let current = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                record_max_parallelism(&probe.max_in_flight, current);
-                tokio::time::sleep(Duration::from_millis(75)).await;
-                probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+            if request_path.contains("anyscan-control-") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    String::new(),
+                );
             }
 
+            let current = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            record_max_parallelism(&probe.max_in_flight, current);
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+
             (
+                StatusCode::OK,
                 [("content-type", "application/json")],
                 format!("{{\"artifact\":\"{}\"}}", path.replace('/', "_")),
             )
@@ -4434,13 +4447,18 @@ mod tests {
             Path(path): Path<String>,
         ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
             let request_path = format!("/{path}");
-            if !request_path.contains("anyscan-control-") {
-                probe
-                    .request_times
-                    .lock()
-                    .await
-                    .push((request_path.clone(), Instant::now()));
+            if request_path.contains("anyscan-control-") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    String::new(),
+                );
             }
+            probe
+                .request_times
+                .lock()
+                .await
+                .push((request_path.clone(), Instant::now()));
 
             let status = if request_path == "/throttle" {
                 StatusCode::TOO_MANY_REQUESTS
@@ -4481,6 +4499,17 @@ mod tests {
             Path(path): Path<String>,
         ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
             let request_path = format!("/{path}");
+            // The control probe must NOT return 200 (which would trigger the
+            // catch-all-host bail-out) yet still produce the same response body
+            // shape as random paths so that the response-similarity baseline
+            // matches the wildcard \`/missing\` fetch and filters it.
+            if request_path.contains("anyscan-control-") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    "not-found-template".to_string(),
+                );
+            }
             if request_path == "/admin" {
                 return (
                     StatusCode::OK,
@@ -5243,6 +5272,7 @@ paths:
         config.scan.max_paths_per_target = 3;
         config.scan.max_parallel_paths_per_target = 3;
         config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target = TargetRecord {
             id: 7,
@@ -5284,6 +5314,7 @@ paths:
         config.scan.max_parallel_paths_per_target = 2;
         config.scan.max_concurrent_requests_per_host = 1;
         config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target_a = TargetRecord {
             id: 7,
@@ -5339,6 +5370,7 @@ paths:
         config.scan.host_backoff_initial_ms = 80;
         config.scan.host_backoff_max_ms = 80;
         config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target = TargetRecord {
             id: 9,
@@ -5654,6 +5686,7 @@ paths:
         config.scan.max_discovered_paths_per_target = 8;
         config.scan.gobuster.enabled = true;
         config.scan.gobuster.wordlist = vec!["admin".to_string(), "missing".to_string()];
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         config.validate().expect("gobuster config should validate");
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target = TargetRecord {
