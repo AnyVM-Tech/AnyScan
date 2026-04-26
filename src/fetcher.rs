@@ -4176,6 +4176,65 @@ mod tests {
             .unwrap_or_else(|| panic!("missing coverage source {source}"))
     }
 
+    async fn spawn_build_artifacts_test_server() -> (JoinHandle<()>, String, Arc<Mutex<Vec<String>>>) {
+        async fn record_hit(
+            State(hits): State<Arc<Mutex<Vec<String>>>>,
+            Path(path): Path<String>,
+        ) -> (StatusCode, [(&'static str, &'static str); 1], &'static str) {
+            let request_path = format!("/{path}");
+            if request_path.contains("anyscan-control-") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    "not-found",
+                );
+            }
+            let response = match request_path.as_str() {
+                "/.next/BUILD_ID" => (
+                    StatusCode::OK,
+                    [("content-type", "text/plain")],
+                    "abc123",
+                ),
+                "/.vercel/output/config.json" => (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    "{\"version\":3,\"routes\":[]}",
+                ),
+                "/_buildManifest.js" => (
+                    StatusCode::OK,
+                    [("content-type", "application/javascript")],
+                    "self.__BUILD_MANIFEST=function(){}();",
+                ),
+                _ => (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    "not-found",
+                ),
+            };
+            hits.lock().await.push(request_path);
+            response
+        }
+
+        let hits: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/{*path}", get(record_hit))
+            .with_state(Arc::clone(&hits));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("build artifacts listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("build artifacts listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("build artifacts test server should stay available")
+        });
+
+        (handle, format!("http://{}", address), hits)
+    }
+
     async fn spawn_fetcher_test_server() -> (JoinHandle<()>, String) {
         let app = Router::new()
             .route(
@@ -6139,6 +6198,61 @@ paths:
                 .iter()
                 .map(|document| document.path.clone())
                 .collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn build_artifacts_profile_fetches_next_and_nuxt_artifacts_through_fetcher() {
+        let (server, base_url, hits) = spawn_build_artifacts_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.inventory.default_paths.clear();
+        config.inventory.path_profiles = vec!["build-artifacts".to_string()];
+        config.scan.max_paths_per_target = 64;
+        config.scan.max_discovered_paths_per_target = 0;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+        config
+            .validate()
+            .expect("build-artifacts profile should validate");
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 99,
+            label: "build-artifacts".to_string(),
+            base_url,
+            paths: Vec::new(),
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Manual,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        fetcher
+            .fetch_target(&target)
+            .await
+            .expect("build-artifacts fetch should succeed");
+
+        let recorded = hits.lock().await;
+        assert!(
+            recorded.iter().any(|path| path == "/.next/BUILD_ID"),
+            "expected /.next/BUILD_ID to be requested, got {:?}",
+            *recorded
+        );
+        assert!(
+            recorded.iter().any(|path| path == "/.vercel/output/config.json"),
+            "expected /.vercel/output/config.json to be requested, got {:?}",
+            *recorded
+        );
+        assert!(
+            recorded.iter().any(|path| path == "/_buildManifest.js"),
+            "expected /_buildManifest.js to be requested, got {:?}",
+            *recorded
         );
 
         server.abort();
