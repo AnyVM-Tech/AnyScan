@@ -940,4 +940,88 @@ mod tests {
         );
         assert_eq!(entry.coverage_status, PluginCoverageStatus::FirstClass);
     }
+
+    #[test]
+    fn bundled_http_rules_include_graphql_discovery_signatures() {
+        let rules: Vec<serde_json::Value> =
+            serde_json::from_str(super::BUNDLED_HTTP_RULES).expect("bundled http rules parse");
+
+        let find_rule = |plugin_id: &str| -> &serde_json::Value {
+            rules
+                .iter()
+                .find(|rule| rule.get("plugin_id").and_then(|v| v.as_str()) == Some(plugin_id))
+                .unwrap_or_else(|| panic!("missing bundled http rule {plugin_id}"))
+        };
+        let rule_string =
+            |rule: &serde_json::Value, key: &str| -> Option<String> {
+                rule.get(key).and_then(|v| v.as_str()).map(str::to_string)
+            };
+
+        for (plugin_id, expected_severity) in [
+            ("GraphQLEndpointPlugin", "low"),
+            ("GraphiQLConsolePlugin", "medium"),
+            ("GraphQLPlaygroundConsolePlugin", "medium"),
+            ("GraphQLIntrospectionResponsePlugin", "medium"),
+            ("GraphQLErrorEnvelopePlugin", "medium"),
+        ] {
+            let rule = find_rule(plugin_id);
+            assert_eq!(
+                rule_string(rule, "severity").as_deref(),
+                Some(expected_severity),
+                "{plugin_id} severity"
+            );
+        }
+
+        let endpoint_rule = find_rule("GraphQLEndpointPlugin");
+        let endpoint_paths: Vec<&str> = endpoint_rule
+            .get("any_of_path_contains")
+            .and_then(|v| v.as_array())
+            .map(|values| values.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        for expected_path in [
+            "/graphql",
+            "/graphiql",
+            "/playground",
+            "/altair",
+            "/voyager",
+            "/api/graphql",
+            "/v1/graphql",
+            "/v2/graphql",
+            "/__graphql",
+            "/api/graphql/console",
+            "/.netlify/functions/graphql",
+            "/api/2018-09-25/graphql",
+        ] {
+            assert!(
+                endpoint_paths.contains(&expected_path),
+                "endpoint discovery rule missing {expected_path}"
+            );
+        }
+
+        let graphiql_regex_src = rule_string(find_rule("GraphiQLConsolePlugin"), "body_regex")
+            .expect("graphiql rule body_regex");
+        let graphiql_regex =
+            regex::Regex::new(&graphiql_regex_src).expect("graphiql body_regex compiles");
+        for graphiql_fixture in [
+            "<html><head><title>GraphiQL</title></head><body></body></html>",
+            "<div id=\"graphiql\"></div>",
+            "<script src=\"//cdn.example.test/react-graphiql/index.js\"></script>",
+        ] {
+            assert!(
+                graphiql_regex.is_match(graphiql_fixture),
+                "graphiql body_regex must match: {graphiql_fixture}"
+            );
+        }
+
+        // Privacy invariant: rules carry tags/metadata only; reviewer_notes is moderator-only and
+        // must never reach non-moderator sessions, so it must not be embedded in bundled rules.
+        for rule in &rules {
+            if let Some(object) = rule.as_object() {
+                assert!(
+                    !object.contains_key("reviewer_notes"),
+                    "bundled http rules must not embed reviewer_notes"
+                );
+            }
+        }
+    }
 }
