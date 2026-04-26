@@ -973,6 +973,7 @@ impl Fetcher {
                         user_agent: self.scan.user_agent.clone(),
                         allow_invalid_tls: self.scan.allow_invalid_tls,
                         extra_headers: Vec::new(),
+                        pipeline: true,
                     };
                     let host = match url.host_str() {
                         Some(host) => host.to_string(),

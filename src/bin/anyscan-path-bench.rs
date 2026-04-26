@@ -154,29 +154,92 @@ fn raise_fd_limit() -> (u64, u64) {
     (0, 0)
 }
 
-#[derive(Debug, Default)]
+/// Every probe-error bucket we know about, mirroring `ProbeError::bucket()`.
+/// The bench pre-populates an `AtomicU64` for each so `record_failure` can
+/// resolve the bucket → counter without taking a lock. If `ProbeError` ever
+/// adds a bucket and this list isn't updated, the increment falls through
+/// to `failure_other` (still counted, surfaced as `unknown_bucket`).
+const ALL_FAILURE_BUCKETS: &[&str] = &[
+    "connect_timeout",
+    "connect_error",
+    "tls_handshake",
+    "invalid_host",
+    "invalid_request",
+    "write_timeout",
+    "write_error",
+    "read_timeout",
+    "connection_reset",
+    "malformed_response",
+    "server_closed_early",
+    "write_aborted",
+    "budget_exhausted",
+    "headers_too_large",
+];
+
+/// Number of slots in the per-status counter array. HTTP status is `u16`, so
+/// every possible value indexes directly without a hash. `65536 × 8 B = 512 KiB`
+/// — a one-time allocation per process, 0.0% of any realistic scanner's RSS.
+const STATUS_CODE_SLOTS: usize = u16::MAX as usize + 1;
+
+#[derive(Debug)]
 struct BenchStats {
     hosts_completed: AtomicU64,
     paths_attempted: AtomicU64,
     paths_succeeded: AtomicU64,
     paths_failed: AtomicU64,
-    failures: std::sync::Mutex<HashMap<&'static str, u64>>,
-    statuses: std::sync::Mutex<HashMap<u16, u64>>,
+    /// Per-status-code counter, indexed by HTTP status. Replaces the previous
+    /// `Mutex<HashMap<u16, u64>>` that was the dominant contention point in
+    /// the per-response hot path: profiling against an in-process loopback
+    /// server (16 384 hosts × 100 paths, 8 worker threads) showed the lock
+    /// alone cost 43–83 % of attempt RPS depending on `--concurrency`.
+    statuses: Box<[AtomicU64]>,
+    /// Pre-populated mapping of failure bucket → atomic counter. Read-only
+    /// after `BenchStats::new`, so `HashMap::get` does no synchronization.
+    failure_buckets: HashMap<&'static str, AtomicU64>,
+    /// Catch-all for any bucket not present in `ALL_FAILURE_BUCKETS`. Should
+    /// stay at 0 in practice — non-zero means `ProbeError` added a new bucket
+    /// and this file wasn't updated.
+    failure_other: AtomicU64,
+}
+
+impl Default for BenchStats {
+    fn default() -> Self {
+        let statuses: Box<[AtomicU64]> = (0..STATUS_CODE_SLOTS)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        let mut failure_buckets =
+            HashMap::with_capacity(ALL_FAILURE_BUCKETS.len());
+        for &b in ALL_FAILURE_BUCKETS {
+            failure_buckets.insert(b, AtomicU64::new(0));
+        }
+        BenchStats {
+            hosts_completed: AtomicU64::new(0),
+            paths_attempted: AtomicU64::new(0),
+            paths_succeeded: AtomicU64::new(0),
+            paths_failed: AtomicU64::new(0),
+            statuses,
+            failure_buckets,
+            failure_other: AtomicU64::new(0),
+        }
+    }
 }
 
 impl BenchStats {
     fn record_failure(&self, bucket: &'static str) {
         self.paths_attempted.fetch_add(1, Ordering::Relaxed);
         self.paths_failed.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self.failures.lock().unwrap();
-        *guard.entry(bucket).or_insert(0) += 1;
+        if let Some(counter) = self.failure_buckets.get(bucket) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.failure_other.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn record_success(&self, status: u16) {
         self.paths_attempted.fetch_add(1, Ordering::Relaxed);
         self.paths_succeeded.fetch_add(1, Ordering::Relaxed);
-        let mut guard = self.statuses.lock().unwrap();
-        *guard.entry(status).or_insert(0) += 1;
+        // Bound check is elided: `status as usize` is always < STATUS_CODE_SLOTS.
+        self.statuses[status as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> (u64, u64, u64, u64, Vec<(String, u64)>) {
@@ -185,15 +248,32 @@ impl BenchStats {
         let failed = self.paths_failed.load(Ordering::Relaxed);
         let hosts = self.hosts_completed.load(Ordering::Relaxed);
         let mut top: Vec<(String, u64)> = self
-            .failures
-            .lock()
-            .unwrap()
+            .failure_buckets
             .iter()
-            .map(|(k, v)| ((*k).to_string(), *v))
+            .map(|(k, c)| ((*k).to_string(), c.load(Ordering::Relaxed)))
+            .filter(|(_, v)| *v > 0)
             .collect();
+        let other = self.failure_other.load(Ordering::Relaxed);
+        if other > 0 {
+            top.push(("unknown_bucket".to_string(), other));
+        }
         top.sort_by(|a, b| b.1.cmp(&a.1));
         top.truncate(5);
         (attempted, succeeded, failed, hosts, top)
+    }
+
+    /// Snapshot the per-status counter array into a `HashMap<u16, u64>` of
+    /// non-zero entries. Called once at the end of the run for the JSON
+    /// summary; iterates 65 536 atomics (~tens of µs).
+    fn statuses_snapshot(&self) -> HashMap<u16, u64> {
+        let mut out = HashMap::new();
+        for (code, atomic) in self.statuses.iter().enumerate() {
+            let v = atomic.load(Ordering::Relaxed);
+            if v > 0 {
+                out.insert(code as u16, v);
+            }
+        }
+        out
     }
 }
 
@@ -348,7 +428,7 @@ async fn run_bench(hosts: Vec<Host>, paths: Vec<String>, args: Args) -> Result<B
 
     let elapsed = started.elapsed().as_secs_f64();
     let (attempted, succeeded, failed, hosts_done, top) = stats.snapshot();
-    let statuses_snapshot: HashMap<u16, u64> = stats.statuses.lock().unwrap().clone();
+    let statuses_snapshot: HashMap<u16, u64> = stats.statuses_snapshot();
     let summary = BenchSummary {
         hosts_completed: hosts_done,
         paths_attempted: attempted,
