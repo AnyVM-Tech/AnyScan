@@ -20,14 +20,14 @@
 //! The graceful-FIN -> RST switch is the single biggest fix: ~50% of hosts on the
 //! open internet stall ~30 s on `wait_closed()`.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
@@ -54,6 +54,12 @@ pub struct ProbeConfig {
     pub allow_invalid_tls: bool,
     /// Extra request headers (e.g. `Authorization`, custom `Cookie`).
     pub extra_headers: Vec<(String, String)>,
+    /// When true (default), write all path requests up-front then drain
+    /// responses (HTTP/1.1 pipelining). When false, write one request at a
+    /// time, read its response, then move to the next — still on a single
+    /// keep-alive connection. The bench binary's `--pipeline` flag flips
+    /// this so A/B comparisons of pipelined-vs-sequential are meaningful.
+    pub pipeline: bool,
 }
 
 impl Default for ProbeConfig {
@@ -67,6 +73,7 @@ impl Default for ProbeConfig {
             user_agent: DEFAULT_USER_AGENT.to_string(),
             allow_invalid_tls: false,
             extra_headers: Vec::new(),
+            pipeline: true,
         }
     }
 }
@@ -125,6 +132,10 @@ pub enum ProbeError {
     TlsHandshake { host: String, message: String },
     #[error("invalid SNI / hostname: {host}")]
     InvalidHost { host: String },
+    /// Returned when the request would smuggle additional bytes through
+    /// CR/LF/NUL injection in host, path, user-agent, or header values.
+    #[error("invalid request input: {reason}")]
+    InvalidRequest { reason: String },
     #[error("write timeout")]
     WriteTimeout,
     #[error("write error: {0}")]
@@ -154,6 +165,7 @@ impl ProbeError {
                 "tls_handshake"
             }
             ProbeError::InvalidHost { .. } => "invalid_host",
+            ProbeError::InvalidRequest { .. } => "invalid_request",
             ProbeError::WriteTimeout => "write_timeout",
             ProbeError::WriteError(_) => "write_error",
             ProbeError::ReadTimeout => "read_timeout",
@@ -212,6 +224,22 @@ pub async fn probe_host_paths(
         });
     }
 
+    // --- 0. Reject CR/LF/NUL in any field that lands directly in the request
+    // bytes. Without this, a path or header value containing "\r\n" would let
+    // a caller smuggle additional headers or whole requests, and the response
+    // parser would happily desync. We bucket as `invalid_request` so the
+    // bench / fetcher can count and surface them without confusing them with
+    // real network failures.
+    validate_request_token("host", host)?;
+    validate_request_token("user_agent", &config.user_agent)?;
+    for (idx, path) in paths.iter().enumerate() {
+        validate_request_token(&format!("path[{idx}]"), path)?;
+    }
+    for (name, value) in &config.extra_headers {
+        validate_header_name(name)?;
+        validate_request_token(&format!("header value for {name}"), value)?;
+    }
+
     // --- 1. TCP connect with bucketed timeout ---
     let tcp = match timeout(config.connect_timeout, TcpStream::connect((host, port))).await {
         Ok(Ok(stream)) => stream,
@@ -243,8 +271,10 @@ pub async fn probe_host_paths(
 
     let deadline = tokio::time::Instant::now() + config.per_connection_timeout;
 
+    let host_header = format_host_header(host, port, is_https);
+
     if is_https {
-        let connector = build_tls_connector(config.allow_invalid_tls)?;
+        let connector = tls_connector(config.allow_invalid_tls)?;
         let server_name = ServerName::try_from(host.to_string())
             .map_err(|_| ProbeError::InvalidHost {
                 host: host.to_string(),
@@ -268,15 +298,54 @@ pub async fn probe_host_paths(
                 });
             }
         };
-        run_pipeline(tls, host, paths, config, deadline).await
+        run_pipeline(tls, &host_header, paths, config, deadline).await
     } else {
-        run_pipeline(tcp, host, paths, config, deadline).await
+        run_pipeline(tcp, &host_header, paths, config, deadline).await
     }
+}
+
+/// Per-RFC-7230 §5.4 the `Host` header MUST include the port when it differs
+/// from the scheme default. Some virtual-host configurations route requests
+/// differently (or 400) when the authority is missing the port.
+fn format_host_header(host: &str, port: u16, is_https: bool) -> String {
+    let default = if is_https { 443 } else { 80 };
+    if port == default {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn write_request_into(
+    buf: &mut Vec<u8>,
+    host_header: &str,
+    path: &str,
+    is_last: bool,
+    config: &ProbeConfig,
+) {
+    let connection = if is_last { "close" } else { "keep-alive" };
+    // HEAD — no body. We only ever read header bytes.
+    buf.extend_from_slice(b"HEAD ");
+    buf.extend_from_slice(path.as_bytes());
+    buf.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    buf.extend_from_slice(host_header.as_bytes());
+    buf.extend_from_slice(b"\r\nUser-Agent: ");
+    buf.extend_from_slice(config.user_agent.as_bytes());
+    buf.extend_from_slice(b"\r\nAccept: */*\r\nConnection: ");
+    buf.extend_from_slice(connection.as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    for (name, value) in &config.extra_headers {
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(b": ");
+        buf.extend_from_slice(value.as_bytes());
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf.extend_from_slice(b"\r\n");
 }
 
 async fn run_pipeline<S>(
     stream: S,
-    host: &str,
+    host_header: &str,
     paths: &[&str],
     config: &ProbeConfig,
     deadline: tokio::time::Instant,
@@ -284,53 +353,37 @@ async fn run_pipeline<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf: Vec<u8> = Vec::with_capacity(paths.len() * 256);
-    for (idx, path) in paths.iter().enumerate() {
-        let last = idx + 1 == paths.len();
-        let connection = if last { "close" } else { "keep-alive" };
-        // HEAD — no body. We only ever read header bytes.
-        buf.extend_from_slice(b"HEAD ");
-        buf.extend_from_slice(path.as_bytes());
-        buf.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        buf.extend_from_slice(host.as_bytes());
-        buf.extend_from_slice(b"\r\nUser-Agent: ");
-        buf.extend_from_slice(config.user_agent.as_bytes());
-        buf.extend_from_slice(b"\r\nAccept: */*\r\nConnection: ");
-        buf.extend_from_slice(connection.as_bytes());
-        buf.extend_from_slice(b"\r\n");
-        for (name, value) in &config.extra_headers {
-            buf.extend_from_slice(name.as_bytes());
-            buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
-            buf.extend_from_slice(b"\r\n");
-        }
-        buf.extend_from_slice(b"\r\n");
-    }
-
     let (read_half, mut write_half) = tokio::io::split(stream);
-
-    // Pipeline write: one syscall-ish flush, no per-path round-trips.
-    match timeout(config.write_timeout, async {
-        write_half.write_all(&buf).await?;
-        write_half.flush().await
-    })
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            if matches!(err.kind(), std::io::ErrorKind::ConnectionReset) {
-                return Err(ProbeError::ConnectionReset);
-            }
-            return Err(ProbeError::WriteError(err.to_string()));
-        }
-        Err(_) => return Err(ProbeError::WriteTimeout),
-    }
-
     let mut reader = BufReader::with_capacity(16 * 1024, read_half);
     let mut responses: Vec<Result<ProbeResponse, ProbeError>> = Vec::with_capacity(paths.len());
     let mut server_closed_early: Option<usize> = None;
 
+    if config.pipeline {
+        // Write all requests in one buffered flush, then drain responses.
+        let mut buf: Vec<u8> = Vec::with_capacity(paths.len() * 256);
+        for (idx, path) in paths.iter().enumerate() {
+            let last = idx + 1 == paths.len();
+            write_request_into(&mut buf, host_header, path, last, config);
+        }
+        write_with_timeout(&mut write_half, &buf, config.write_timeout).await?;
+    }
+
     for idx in 0..paths.len() {
+        // Sequential mode writes the request *before* each read.
+        if !config.pipeline {
+            let mut buf: Vec<u8> = Vec::with_capacity(256);
+            let last = idx + 1 == paths.len();
+            write_request_into(&mut buf, host_header, paths[idx], last, config);
+            if let Err(e) = write_with_timeout(&mut write_half, &buf, config.write_timeout).await {
+                responses.push(Err(e));
+                for filler in (idx + 1)..paths.len() {
+                    responses.push(Err(ProbeError::ServerClosedEarly { index: filler }));
+                }
+                server_closed_early.get_or_insert(idx);
+                break;
+            }
+        }
+
         let now = tokio::time::Instant::now();
         if now >= deadline {
             for filler in idx..paths.len() {
@@ -343,9 +396,13 @@ where
         let parsed = match timeout(read_budget, read_one_response(&mut reader)).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(err)) => {
+                // Any framing-level error desyncs the byte stream — we can't
+                // safely parse subsequent responses on the same connection.
                 let propagating = matches!(
                     err,
-                    ProbeError::ConnectionReset | ProbeError::MalformedResponse(_)
+                    ProbeError::ConnectionReset
+                        | ProbeError::MalformedResponse(_)
+                        | ProbeError::HeadersTooLarge { .. }
                 );
                 responses.push(Err(err));
                 if propagating {
@@ -389,6 +446,32 @@ where
         responses,
         server_closed_early,
     })
+}
+
+async fn write_with_timeout<W>(
+    writer: &mut W,
+    buf: &[u8],
+    write_timeout: Duration,
+) -> Result<(), ProbeError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match timeout(write_timeout, async {
+        writer.write_all(buf).await?;
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            if matches!(err.kind(), std::io::ErrorKind::ConnectionReset) {
+                Err(ProbeError::ConnectionReset)
+            } else {
+                Err(ProbeError::WriteError(err.to_string()))
+            }
+        }
+        Err(_) => Err(ProbeError::WriteTimeout),
+    }
 }
 
 async fn read_one_response<R>(reader: &mut BufReader<R>) -> Result<ProbeResponse, ProbeError>
@@ -437,6 +520,13 @@ where
     })
 }
 
+/// Read up to (and including) the next `\n`, into `out`. Enforces `limit`:
+/// if reached without a `\n`, returns `HeadersTooLarge` (the caller treats
+/// this as fatal and tears the connection down — see `run_pipeline`).
+///
+/// Uses [`AsyncBufReadExt::read_until`] so the inner `BufReader` services
+/// reads in 16 KiB chunks rather than one syscall per byte. This matters
+/// at high RPS: per-byte was ~50× slower in profiling.
 async fn read_line<R>(
     reader: &mut BufReader<R>,
     out: &mut Vec<u8>,
@@ -445,33 +535,83 @@ async fn read_line<R>(
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut total = 0usize;
-    loop {
-        let mut byte = [0u8; 1];
-        match reader.read_exact(&mut byte).await {
-            Ok(_) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-                if total == 0 {
+    let initial_len = out.len();
+    match reader.read_until(b'\n', out).await {
+        Ok(0) => Ok(0),
+        Ok(_) => {
+            let read = out.len() - initial_len;
+            // No newline was ever seen and the read returned because the inner
+            // buffer drained at EOF: classify as connection reset.
+            if !out.ends_with(b"\n") {
+                if read == 0 {
                     return Ok(0);
                 }
                 return Err(ProbeError::ConnectionReset);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
-                return Err(ProbeError::ConnectionReset);
+            if read > limit {
+                return Err(ProbeError::HeadersTooLarge { limit });
             }
-            Err(err) => {
-                return Err(ProbeError::MalformedResponse(err.to_string()));
+            Ok(read)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
+            if out.len() == initial_len {
+                Ok(0)
+            } else {
+                Err(ProbeError::ConnectionReset)
             }
         }
-        out.push(byte[0]);
-        total += 1;
-        if byte[0] == b'\n' {
-            return Ok(total);
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+            Err(ProbeError::ConnectionReset)
         }
-        if total >= limit {
-            return Err(ProbeError::HeadersTooLarge { limit });
+        Err(err) => Err(ProbeError::MalformedResponse(err.to_string())),
+    }
+}
+
+/// Reject CR/LF/NUL in any user-controlled field that lands directly in the
+/// HTTP request bytes. This is the canonical CRLF-injection guard: without
+/// it a path of `/foo\r\nX-Smuggle: 1` would let the caller inject extra
+/// headers (or whole pipelined requests) and the response parser would
+/// happily desync.
+fn validate_request_token(field: &str, value: &str) -> Result<(), ProbeError> {
+    if let Some(idx) = value
+        .as_bytes()
+        .iter()
+        .position(|b| matches!(b, b'\r' | b'\n' | 0))
+    {
+        return Err(ProbeError::InvalidRequest {
+            reason: format!(
+                "{field} contains forbidden control byte 0x{:02x} at offset {idx}",
+                value.as_bytes()[idx]
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Header field names per RFC 7230 are restricted to visible ASCII (no
+/// whitespace, no separators). Be conservative here: `tchar`-only.
+fn validate_header_name(name: &str) -> Result<(), ProbeError> {
+    if name.is_empty() {
+        return Err(ProbeError::InvalidRequest {
+            reason: "empty header name".into(),
+        });
+    }
+    for (idx, b) in name.as_bytes().iter().enumerate() {
+        let allowed = matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.'
+                | b'^' | b'_' | b'`' | b'|' | b'~'
+        ) || b.is_ascii_alphanumeric();
+        if !allowed {
+            return Err(ProbeError::InvalidRequest {
+                reason: format!(
+                    "header name contains forbidden byte 0x{:02x} at offset {idx}",
+                    b
+                ),
+            });
         }
     }
+    Ok(())
 }
 
 fn parse_status_line(line: &[u8]) -> Result<u16, ProbeError> {
@@ -508,21 +648,46 @@ fn parse_header(line: &[u8]) -> Option<(String, String)> {
     Some((name.to_string(), value.to_string()))
 }
 
-fn build_tls_connector(allow_invalid: bool) -> Result<TlsConnector, ProbeError> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = if allow_invalid {
-        ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth()
+/// Lazily initialised, process-wide TLS connectors.
+///
+/// `rustls::crypto::ring::default_provider().install_default()` MUST be
+/// called at most once per process — subsequent calls error. And the
+/// `ClientConfig` itself is heavy: building the verifier, copying the root
+/// store, and wrapping in `Arc` every probe was measurable overhead at
+/// thousands-of-RPS rates. Cache once, share via `Arc`.
+static TLS_VERIFYING: OnceLock<TlsConnector> = OnceLock::new();
+static TLS_NOVERIFY: OnceLock<TlsConnector> = OnceLock::new();
+static CRYPTO_INSTALLED: OnceLock<()> = OnceLock::new();
+
+fn tls_connector(allow_invalid: bool) -> Result<TlsConnector, ProbeError> {
+    CRYPTO_INSTALLED.get_or_init(|| {
+        // Idempotent: returns Err if already installed (e.g. by reqwest in
+        // the same process). We only care that it ends up installed, not who
+        // won the race.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    let cell = if allow_invalid {
+        &TLS_NOVERIFY
     } else {
-        let mut roots = RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
+        &TLS_VERIFYING
     };
-    Ok(TlsConnector::from(Arc::new(config)))
+    Ok(cell
+        .get_or_init(|| {
+            let config = if allow_invalid {
+                ClientConfig::builder()
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                    .with_no_client_auth()
+            } else {
+                let mut roots = RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth()
+            };
+            TlsConnector::from(Arc::new(config))
+        })
+        .clone())
 }
 
 #[derive(Debug)]
@@ -660,6 +825,7 @@ mod tests {
             user_agent: "anyscan-test/1".into(),
             allow_invalid_tls: true,
             extra_headers: Vec::new(),
+            pipeline: true,
         }
     }
 
@@ -800,5 +966,127 @@ mod tests {
             }
             Ok(_) => panic!("expected connect failure"),
         }
+    }
+
+    #[tokio::test]
+    async fn crlf_in_path_rejected_pre_connect() {
+        // The smuggle attempt: a path with embedded \r\nX-Smuggled. We don't
+        // want it on the wire. Connect refused on port 1 would *also* surface
+        // here, so any non-`invalid_request` bucket is a regression.
+        let outcome = probe_host_paths(
+            "127.0.0.1",
+            1,
+            false,
+            &["/foo\r\nX-Smuggle: 1"],
+            &cfg(),
+        )
+        .await;
+        match outcome {
+            Err(ProbeError::InvalidRequest { reason }) => {
+                assert!(reason.contains("path"), "reason should mention path: {reason}");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn crlf_in_extra_header_value_rejected() {
+        let mut config = cfg();
+        config.extra_headers.push(("X-Foo".into(), "bar\r\nX-Y: z".into()));
+        let outcome = probe_host_paths("127.0.0.1", 1, false, &["/"], &config).await;
+        assert!(matches!(outcome, Err(ProbeError::InvalidRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn invalid_header_name_rejected() {
+        let mut config = cfg();
+        config.extra_headers.push(("X Foo".into(), "bar".into()));
+        let outcome = probe_host_paths("127.0.0.1", 1, false, &["/"], &config).await;
+        assert!(matches!(outcome, Err(ProbeError::InvalidRequest { .. })));
+    }
+
+    #[tokio::test]
+    async fn host_header_includes_non_default_port() {
+        // Capture the full request and assert the Host header contains the port.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
+        let captured_clone = Arc::clone(&captured);
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            let mut written = 0usize;
+            loop {
+                let n = match sock.read(&mut buf[written..]).await {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                written += n;
+                if find_double_crlf(&buf[..written]).is_some() {
+                    captured_clone.lock().await.extend_from_slice(&buf[..written]);
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    return;
+                }
+            }
+        });
+        let outcome = probe_host_paths("127.0.0.1", port, false, &["/"], &cfg())
+            .await
+            .expect("probe ok");
+        assert!(outcome.responses[0].is_ok());
+        // Give the captor a tick.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bytes = captured.lock().await.clone();
+        let request = String::from_utf8_lossy(&bytes);
+        let expected = format!("Host: 127.0.0.1:{port}\r\n");
+        assert!(
+            request.contains(&expected),
+            "expected `{expected}` in request, got:\n{request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_header_omits_default_port() {
+        // Default-port (443 over https / 80 over http) requests must NOT
+        // include the port in the Host header. We can't easily bind 80 in a
+        // test, so exercise the helper directly.
+        assert_eq!(format_host_header("example.com", 80, false), "example.com");
+        assert_eq!(format_host_header("example.com", 443, true), "example.com");
+        assert_eq!(
+            format_host_header("example.com", 8080, false),
+            "example.com:8080"
+        );
+        assert_eq!(
+            format_host_header("example.com", 8443, true),
+            "example.com:8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_mode_writes_one_request_at_a_time() {
+        // Server returns a different status per path. With pipeline=false the
+        // function must still return all responses in input order.
+        let mut routes = HashMap::new();
+        routes.insert("/a".to_string(), 201u16);
+        routes.insert("/b".to_string(), 202);
+        routes.insert("/c".to_string(), 203);
+        let (host, port, _shutdown) = spawn_test_server(routes).await;
+        let mut config = cfg();
+        config.pipeline = false;
+        let paths = ["/a", "/b", "/c"];
+        let outcome = probe_host_paths(&host, port, false, &paths, &config)
+            .await
+            .expect("sequential probe ok");
+        assert_eq!(outcome.responses.len(), 3);
+        let codes: Vec<u16> = outcome
+            .responses
+            .iter()
+            .map(|r| r.as_ref().unwrap().status)
+            .collect();
+        assert_eq!(codes, vec![201, 202, 203]);
     }
 }
