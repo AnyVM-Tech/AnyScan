@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -3909,7 +3909,7 @@ async fn port_scan_progress_reporter(
     let mut last_receive_rate = 0u64;
     let mut last_progress_percent = None;
     let mut last_checkpoint_data = None::<String>;
-    let mut last_output_snapshot = None::<String>;
+    let mut last_output_snapshot_len: Option<u64> = None;
     let scanner_interface = resolve_scanner_interface_name();
     let mut last_interface_counters = scanner_interface
         .as_deref()
@@ -3917,6 +3917,10 @@ async fn port_scan_progress_reporter(
     let mut last_interface_sample_at = Instant::now();
     let mut estimated_sent_total = 0u64;
     let total_targets_estimate = estimate_target_packet_total(&target_range, &requested_ports);
+    let mut counter = ScannerOutputCounter::new(&requested_ports);
+    let resume_min_interval = port_scan_resume_state_min_interval();
+    let resume_min_bytes_delta = port_scan_resume_state_min_bytes_delta();
+    let mut last_resume_push_at: Option<Instant> = None;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
@@ -3924,7 +3928,8 @@ async fn port_scan_progress_reporter(
                 if cancelled.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                let mut progress = read_scanner_progress_count(&output_path, &requested_ports, &output_format)?;
+                counter.refresh(&output_path, &output_format)?;
+                let mut progress = read_scanner_progress_snapshot(&output_path, &counter)?;
                 if progress.probe_rate_millis == 0
                     && progress.receive_rate_millis == 0
                     && progress.progress_percent.is_none()
@@ -3974,22 +3979,85 @@ async fn port_scan_progress_reporter(
                 let checkpoint_data = fs::read_to_string(&checkpoint_path)
                     .ok()
                     .filter(|value| !value.trim().is_empty());
-                let output_snapshot = fs::read_to_string(&output_path)
-                    .ok()
-                    .filter(|value| !value.trim().is_empty());
-                if checkpoint_data != last_checkpoint_data || output_snapshot != last_output_snapshot
-                {
-                    last_checkpoint_data = checkpoint_data.clone();
-                    last_output_snapshot = output_snapshot.clone();
+                let output_size = fs::metadata(&output_path).ok().map(|meta| meta.len());
+                let checkpoint_changed = checkpoint_data != last_checkpoint_data;
+                let now = Instant::now();
+                let interval_elapsed = last_resume_push_at
+                    .map(|prev| now.saturating_duration_since(prev) >= resume_min_interval)
+                    .unwrap_or(true);
+                let should_push_resume = should_push_resume_state(
+                    checkpoint_changed,
+                    interval_elapsed,
+                    last_output_snapshot_len,
+                    output_size,
+                    resume_min_bytes_delta,
+                );
+                if should_push_resume {
+                    let output_snapshot = if output_size.is_some() {
+                        fs::read_to_string(&output_path)
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                    } else {
+                        None
+                    };
                     let _ = store.update_port_scan_resume_state_if_owned(
                         port_scan_id,
                         checkpoint_data.as_deref(),
                         output_snapshot.as_deref(),
                     )?;
+                    last_checkpoint_data = checkpoint_data;
+                    last_output_snapshot_len = output_size;
+                    last_resume_push_at = Some(now);
                 }
             }
         }
     }
+}
+
+const PORT_SCAN_RESUME_STATE_INTERVAL_SECONDS_ENV: &str =
+    "ANYSCAN_PORT_SCAN_RESUME_STATE_INTERVAL_SECONDS";
+const PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA_ENV: &str =
+    "ANYSCAN_PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA";
+const DEFAULT_PORT_SCAN_RESUME_STATE_INTERVAL_SECONDS: u64 = 30;
+const DEFAULT_PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA: u64 = 256 * 1024;
+
+fn port_scan_resume_state_min_interval() -> Duration {
+    let secs = resolve_optional_env(PORT_SCAN_RESUME_STATE_INTERVAL_SECONDS_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PORT_SCAN_RESUME_STATE_INTERVAL_SECONDS)
+        .max(2);
+    Duration::from_secs(secs)
+}
+
+fn port_scan_resume_state_min_bytes_delta() -> u64 {
+    resolve_optional_env(PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA_ENV)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA)
+}
+
+fn should_push_resume_state(
+    checkpoint_changed: bool,
+    interval_elapsed: bool,
+    last_output_snapshot_len: Option<u64>,
+    output_size: Option<u64>,
+    resume_min_bytes_delta: u64,
+) -> bool {
+    if checkpoint_changed {
+        return true;
+    }
+    // Output rotated/truncated: push immediately so persisted resume state
+    // doesn't lag behind a smaller-but-different file.
+    if let (Some(prev), Some(current)) = (last_output_snapshot_len, output_size) {
+        if current < prev {
+            return true;
+        }
+    }
+    let bytes_grew_enough = match (last_output_snapshot_len, output_size) {
+        (Some(prev), Some(current)) => current.saturating_sub(prev) >= resume_min_bytes_delta,
+        (None, Some(current)) => current > 0,
+        _ => false,
+    };
+    output_size.is_some() && (interval_elapsed || bytes_grew_enough)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4006,36 +4074,167 @@ struct NetworkPacketCounters {
     rx_packets: u64,
 }
 
-fn read_scanner_progress_count(
-    output_path: &Path,
-    requested_ports: &str,
-    output_format: &str,
-) -> Result<ScannerProgressCounts> {
-    let mut progress = ScannerProgressCounts::default();
-    if output_path.exists() {
-        let contents = fs::read_to_string(output_path)
-            .with_context(|| format!("failed to read scanner progress file {}", output_path.display()))?;
-        progress.discovered_endpoints_total = match output_format {
-            "endpoint_lines" => contents
-                .lines()
-                .filter_map(|line| {
-                    let token = line.trim();
-                    if token.is_empty() || token.starts_with('#') {
-                        return None;
-                    }
-                    parse_endpoint_token(token, single_requested_port(requested_ports).ok().flatten())
-                        .ok()
-                        .flatten()
-                        .map(|endpoint| format!("{}:{}", endpoint.host, endpoint.port))
-                })
-                .collect::<HashSet<_>>()
-                .len() as u64,
-            _ => contents
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count() as u64,
-        };
+/// Incremental endpoint counter: re-parsing the full output file each tick is
+/// O(N²) over the scan, so we track byte offset plus the dedup set instead.
+struct ScannerOutputCounter {
+    offset: u64,
+    seen: HashSet<String>,
+    fallback_port: Option<u16>,
+    leftover: String,
+    // (device, inode) of the file we last consumed. A change here means the
+    // file was unlinked-and-recreated; the saved offset is meaningless against
+    // the new inode even if the new size happens to be >= the old offset.
+    file_id: Option<(u64, u64)>,
+}
+
+impl ScannerOutputCounter {
+    fn new(requested_ports: &str) -> Self {
+        let fallback_port = single_requested_port(requested_ports).ok().flatten();
+        Self {
+            offset: 0,
+            seen: HashSet::new(),
+            fallback_port,
+            leftover: String::new(),
+            file_id: None,
+        }
     }
+
+    fn count(&self) -> u64 {
+        self.seen.len() as u64
+    }
+
+    fn rewind(&mut self) {
+        self.offset = 0;
+        self.seen.clear();
+        self.leftover.clear();
+    }
+
+    fn refresh(&mut self, output_path: &Path, output_format: &str) -> Result<()> {
+        let metadata = match fs::metadata(output_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(anyhow!(error)).with_context(|| {
+                    format!(
+                        "failed to stat scanner progress file {}",
+                        output_path.display()
+                    )
+                });
+            }
+        };
+        let size = metadata.len();
+        let current_id = file_identity(&metadata);
+        let inode_changed = matches!(
+            (self.file_id, current_id),
+            (Some(prev), Some(now)) if prev != now
+        );
+        if size < self.offset || inode_changed {
+            // Output truncated or rotated (size shrank, or unlink+recreate
+            // produced a new inode even at >= the old size); rewind and reparse.
+            self.rewind();
+        }
+        self.file_id = current_id.or(self.file_id);
+        if size == self.offset {
+            return Ok(());
+        }
+        let mut file = fs::File::open(output_path).with_context(|| {
+            format!(
+                "failed to open scanner progress file {}",
+                output_path.display()
+            )
+        })?;
+        if self.offset > 0 {
+            file.seek(SeekFrom::Start(self.offset))
+                .with_context(|| {
+                    format!(
+                        "failed to seek scanner progress file {} to {}",
+                        output_path.display(),
+                        self.offset
+                    )
+                })?;
+        }
+        let mut buffer = Vec::with_capacity((size - self.offset) as usize);
+        file.read_to_end(&mut buffer).with_context(|| {
+            format!(
+                "failed to read scanner progress file {}",
+                output_path.display()
+            )
+        })?;
+        self.offset = size;
+        let chunk = String::from_utf8_lossy(&buffer);
+        let mut combined = std::mem::take(&mut self.leftover);
+        combined.push_str(chunk.as_ref());
+        let ends_with_newline = combined.ends_with('\n') || combined.ends_with('\r');
+        let mut iter = combined.split(['\n', '\r']).peekable();
+        while let Some(piece) = iter.next() {
+            if iter.peek().is_none() && !ends_with_newline {
+                self.leftover = piece.to_string();
+                break;
+            }
+            let token = piece.trim();
+            if token.is_empty() || token.starts_with('#') {
+                continue;
+            }
+            match output_format {
+                "endpoint_lines" => {
+                    if let Ok(Some(endpoint)) = parse_endpoint_token(token, self.fallback_port) {
+                        let key = format!("{}:{}", endpoint.host, endpoint.port);
+                        self.seen.insert(key);
+                    }
+                }
+                "json_lines" => {
+                    if let Some(key) = parse_json_endpoint_key(token, self.fallback_port) {
+                        self.seen.insert(key);
+                    }
+                }
+                _ => {
+                    self.seen.insert(token.to_string());
+                }
+            }
+        }
+        if ends_with_newline {
+            self.leftover.clear();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+fn parse_json_endpoint_key(line: &str, fallback_port: Option<u16>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let host = value
+        .get("host")
+        .and_then(|value| value.as_str())
+        .or_else(|| value.get("ip").and_then(|value| value.as_str()))
+        .or_else(|| value.get("address").and_then(|value| value.as_str()))?;
+    let port = value
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u16)
+        .or(fallback_port)?;
+    Some(format!("{host}:{port}"))
+}
+
+fn read_scanner_progress_snapshot(
+    output_path: &Path,
+    counter: &ScannerOutputCounter,
+) -> Result<ScannerProgressCounts> {
+    let mut progress = ScannerProgressCounts {
+        discovered_endpoints_total: counter.count(),
+        ..ScannerProgressCounts::default()
+    };
     let progress_path = output_path.with_file_name(
         output_path
             .file_name()
@@ -4847,13 +5046,16 @@ fn load_effective_runtime_config(
 mod tests {
     use super::{
         DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
-        apply_follow_on_selection_mode_to_targets,
+        ScannerOutputCounter, apply_follow_on_selection_mode_to_targets,
         derive_protocol_plugin_findings_with_active_mode, normalize_platform_architecture,
         normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
-        scanner_target_range_for_adapter, validated_target_tag,
+        scanner_target_range_for_adapter, should_push_resume_state, validated_target_tag,
     };
     use anyscan::core::TargetDefinition;
     use std::collections::HashSet;
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
 
     fn endpoint(
         host: &str,
@@ -5218,5 +5420,280 @@ mod tests {
             normalize_platform_architecture("arm64"),
             Some("aarch64".to_string())
         );
+    }
+
+    fn unique_scratch_path(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        path.push(format!(
+            "anyscan-test-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        path
+    }
+
+    #[test]
+    fn scanner_output_counter_tracks_only_new_lines_across_refreshes() {
+        let path = unique_scratch_path("counter-incremental");
+        fs::write(&path, "10.0.0.1:80\n10.0.0.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+        counter
+            .refresh(&path, "endpoint_lines")
+            .expect("first refresh should succeed");
+        assert_eq!(counter.count(), 2);
+        let offset_after_first = counter.offset;
+
+        let mut handle = fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append should open");
+        writeln!(handle, "10.0.0.3:80").unwrap();
+        writeln!(handle, "10.0.0.1:80").unwrap();
+        drop(handle);
+
+        counter
+            .refresh(&path, "endpoint_lines")
+            .expect("second refresh should succeed");
+        assert_eq!(counter.count(), 3);
+        assert!(counter.offset > offset_after_first);
+
+        // Re-running with no new bytes should be a no-op.
+        let offset_before_idle = counter.offset;
+        counter
+            .refresh(&path, "endpoint_lines")
+            .expect("idle refresh should succeed");
+        assert_eq!(counter.count(), 3);
+        assert_eq!(counter.offset, offset_before_idle);
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scanner_output_counter_handles_partial_lines_at_buffer_boundary() {
+        let path = unique_scratch_path("counter-partial");
+        // Two complete entries plus a partial line at the end.
+        fs::write(&path, "10.0.0.1:443\n10.0.0.2:443\n10.0.0").unwrap();
+        let mut counter = ScannerOutputCounter::new("443");
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert_eq!(counter.count(), 2);
+
+        // Complete the partial entry on the next append.
+        let mut handle = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(handle, ".3:443").unwrap();
+        drop(handle);
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let mut endpoints: Vec<_> = counter.seen.iter().cloned().collect();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.1:443".to_string(),
+                "10.0.0.2:443".to_string(),
+                "10.0.0.3:443".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    // Run with:
+    //   cargo test --release --bin anyscan-worker bench_progress_reporter_parsing \
+    //       -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_progress_reporter_parsing() {
+        let path = unique_scratch_path("counter-bench");
+        let total_lines = 200_000usize;
+        let chunk = total_lines / 100; // 100 reporter ticks
+        // Pre-fill empty file.
+        fs::write(&path, "").unwrap();
+
+        // Legacy approach: read whole file + collect into HashSet on each tick.
+        let legacy_start = std::time::Instant::now();
+        let mut written = 0usize;
+        for _ in 0..100 {
+            let mut handle = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for i in 0..chunk {
+                writeln!(handle, "10.{}.{}.{}:80", (written + i) / 65536 % 256,
+                    (written + i) / 256 % 256, (written + i) % 256).unwrap();
+            }
+            drop(handle);
+            written += chunk;
+            let contents = fs::read_to_string(&path).unwrap();
+            let count = contents
+                .lines()
+                .filter_map(|line| {
+                    let token = line.trim();
+                    if token.is_empty() || token.starts_with('#') {
+                        return None;
+                    }
+                    Some(token.to_string())
+                })
+                .collect::<HashSet<_>>()
+                .len();
+            assert_eq!(count, written);
+        }
+        let legacy = legacy_start.elapsed();
+
+        // Reset for incremental approach.
+        fs::write(&path, "").unwrap();
+        let incremental_start = std::time::Instant::now();
+        let mut counter = ScannerOutputCounter::new("80");
+        let mut written = 0usize;
+        for _ in 0..100 {
+            let mut handle = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            for i in 0..chunk {
+                writeln!(handle, "10.{}.{}.{}:80", (written + i) / 65536 % 256,
+                    (written + i) / 256 % 256, (written + i) % 256).unwrap();
+            }
+            drop(handle);
+            written += chunk;
+            counter.refresh(&path, "endpoint_lines").unwrap();
+            assert_eq!(counter.count() as usize, written);
+        }
+        let incremental = incremental_start.elapsed();
+
+        println!(
+            "progress reporter parsing benchmark ({total_lines} endpoints over 100 ticks):"
+        );
+        println!("  legacy (full reparse):      {legacy:?}");
+        println!("  incremental (this PR):      {incremental:?}");
+        let ratio = legacy.as_secs_f64() / incremental.as_secs_f64().max(1e-9);
+        println!("  speedup:                    {ratio:.2}x");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scanner_output_counter_resets_when_output_file_truncates() {
+        let path = unique_scratch_path("counter-truncate");
+        fs::write(&path, "10.0.0.1:22\n10.0.0.2:22\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("22");
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert_eq!(counter.count(), 2);
+
+        // Simulate file rotation / truncate (smaller size than previous read).
+        fs::write(&path, "10.0.0.9:22\n").unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert_eq!(counter.count(), 1);
+        assert!(counter.seen.contains("10.0.0.9:22"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn should_push_resume_state_forces_push_when_output_rotates() {
+        // 8 KiB delta threshold, lots of headroom.
+        let delta = 8 * 1024;
+        // Output shrunk (rotation/truncation) and checkpoint hasn't changed.
+        assert!(should_push_resume_state(
+            false,
+            false,
+            Some(1_000_000),
+            Some(2048),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn should_push_resume_state_holds_when_growth_below_threshold_and_interval_not_elapsed() {
+        let delta = 256 * 1024;
+        // 64 KiB grew, threshold 256 KiB, interval not yet elapsed → don't push.
+        assert!(!should_push_resume_state(
+            false,
+            false,
+            Some(1_000_000),
+            Some(1_064_000),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn should_push_resume_state_pushes_on_first_observation_with_content() {
+        let delta = 256 * 1024;
+        // First push when there's any content and interval considered elapsed.
+        assert!(should_push_resume_state(false, true, None, Some(1024), delta));
+    }
+
+    #[test]
+    fn should_push_resume_state_pushes_on_checkpoint_change_even_when_quiet() {
+        let delta = 256 * 1024;
+        // Even with no growth and no interval, a checkpoint change forces a push.
+        assert!(should_push_resume_state(
+            true,
+            false,
+            Some(1_000_000),
+            Some(1_000_000),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn scanner_output_counter_rewinds_when_inode_changes_at_same_or_larger_size() {
+        let path = unique_scratch_path("counter-inode");
+        // First file: two endpoints.
+        fs::write(&path, "10.0.0.1:80\n10.0.0.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert_eq!(counter.count(), 2);
+        let original_offset = counter.offset;
+
+        // Replace the file with a brand-new inode whose size is >= the old
+        // offset and whose content is entirely different. Without inode
+        // tracking, the old offset would skip the new prefix and the old
+        // dedup set would keep the stale endpoints in the count.
+        let _ = fs::remove_file(&path);
+        let new_contents = "10.0.0.9:80\n10.0.0.10:80\n10.0.0.11:80\n";
+        fs::write(&path, new_contents).unwrap();
+        // Sanity: new file is >= old offset.
+        let new_size = fs::metadata(&path).unwrap().len();
+        assert!(new_size >= original_offset);
+
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let mut endpoints: Vec<_> = counter.seen.iter().cloned().collect();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.10:80".to_string(),
+                "10.0.0.11:80".to_string(),
+                "10.0.0.9:80".to_string(),
+            ]
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scanner_output_counter_dedupes_json_lines_on_host_and_port() {
+        let path = unique_scratch_path("counter-json");
+        // Same host:port emitted twice with different field ordering and a
+        // noise field; should count once. A second distinct host:port plus
+        // an `ip` alias and a missing-port line that uses the fallback.
+        let contents = concat!(
+            r#"{"host":"10.0.0.5","port":443,"service":"https"}"#, "\n",
+            r#"{"port":443,"host":"10.0.0.5","extra":"noise"}"#, "\n",
+            r#"{"host":"10.0.0.6","port":443}"#, "\n",
+            r#"{"ip":"10.0.0.7","port":443}"#, "\n",
+            r#"{"address":"10.0.0.8"}"#, "\n",
+            "not-json-line\n",
+        );
+        fs::write(&path, contents).unwrap();
+        let mut counter = ScannerOutputCounter::new("443");
+        counter.refresh(&path, "json_lines").unwrap();
+        let mut endpoints: Vec<_> = counter.seen.iter().cloned().collect();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.5:443".to_string(),
+                "10.0.0.6:443".to_string(),
+                "10.0.0.7:443".to_string(),
+                "10.0.0.8:443".to_string(),
+            ]
+        );
+        let _ = fs::remove_file(&path);
     }
 }

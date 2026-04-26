@@ -17,7 +17,9 @@ from pathlib import Path
 HOST_CPU_THREADS = max(1, os.cpu_count() or 1)
 DEFAULT_RATE_LIMIT = 1_000
 DEFAULT_SENDER_THREADS = HOST_CPU_THREADS
-DEFAULT_RECEIVER_THREADS = HOST_CPU_THREADS
+# Receivers serialize on the AF_PACKET queue, so per-CPU spawning wastes
+# cycles on lock contention without raising capture throughput.
+DEFAULT_RECEIVER_THREADS = 1
 DEFAULT_COOLDOWN_SECONDS = 5
 CURRENT_CHILD: subprocess.Popen[bytes] | None = None
 PROGRESS_LINE_RE = re.compile(
