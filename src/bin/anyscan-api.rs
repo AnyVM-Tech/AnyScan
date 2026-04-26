@@ -6,7 +6,10 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path as FsPath, PathBuf},
     process::Command as ProcessCommand,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -3366,12 +3369,36 @@ struct HostedAgentBundleBuildOptions {
     fingerprint: Option<String>,
 }
 
+// Drop-guard that flips an atomic flag when the awaiting future is dropped.
+// Used by `rebuild_hosted_agent_bundle_blocking` to propagate caller-side
+// cancellation into the spawn_blocking task so abandoned work doesn't queue
+// up behind the build lock.
+struct RequestCancelledGuard {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for RequestCancelledGuard {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+}
+
 // Acquires `hosted_agent_bundle_build_lock` and runs the synchronous bundle
 // rebuild on the blocking pool. The lock is acquired *inside* the
 // spawn_blocking task so that caller-side cancellation (client disconnect,
 // timeout) cannot drop the guard while the rebuild is still in flight — that
 // would let a concurrent request start a second rebuild, defeating the
 // serialization the lock is there to provide.
+//
+// A `RequestCancelledGuard` flips an atomic flag when the awaiting future is
+// dropped, so canceled callers don't leave queued spawn_blocking tasks that
+// still queue on the build lock and run a real rebuild for nobody. The
+// blocking task checks the flag at two slow points — before queueing on
+// `blocking_lock()`, and immediately after acquiring it — and bails with no
+// state mutation if the caller is already gone. Past those checks the
+// rebuild is "committed" and runs to completion: interrupting it mid-flight
+// would leave inconsistent on-disk artifacts and a half-applied lease
+// marker.
 async fn rebuild_hosted_agent_bundle_blocking(
     state: &AppState,
     platform_key: &str,
@@ -3381,8 +3408,28 @@ async fn rebuild_hosted_agent_bundle_blocking(
     let config = state.config.clone();
     let platform_key_owned = platform_key.to_string();
     let platform_key_for_log = platform_key.to_string();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let task_cancelled = cancelled.clone();
+    // Held for the lifetime of this future. When the future is dropped at
+    // `.await` (caller cancellation), drop sets `cancelled = true`. The
+    // spawned task holds its own clone of the Arc and observes the flip.
+    let _cancel_guard = RequestCancelledGuard { cancelled };
     tokio::task::spawn_blocking(move || -> Result<HostedAgentBundleInfo, StatusCode> {
+        if task_cancelled.load(Ordering::Acquire) {
+            warn!(
+                platform_key = %platform_key_owned,
+                "skipping hosted agent bundle build: caller dropped before lock acquisition"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
         let _guard = lock.blocking_lock();
+        if task_cancelled.load(Ordering::Acquire) {
+            warn!(
+                platform_key = %platform_key_owned,
+                "skipping hosted agent bundle build: caller dropped while waiting for build lock"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
         if !options.skip_recheck {
             if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
                 &platform_key_owned,
@@ -3390,8 +3437,22 @@ async fn rebuild_hosted_agent_bundle_blocking(
             )
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             {
+                if options.mark_leased && task_cancelled.load(Ordering::Acquire) {
+                    warn!(
+                        platform_key = %platform_key_owned,
+                        "skipping hosted agent bundle lease: caller dropped after cache hit"
+                    );
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
                 return finalize_hosted_agent_bundle(bundle, options.mark_leased);
             }
+        }
+        if task_cancelled.load(Ordering::Acquire) {
+            warn!(
+                platform_key = %platform_key_owned,
+                "skipping hosted agent bundle build: caller dropped after cache miss"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
         let bundle = rebuild_hosted_agent_bundle(&config, &platform_key_owned).map_err(|error| {
             warn!(
