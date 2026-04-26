@@ -194,7 +194,7 @@ struct BenchStats {
     /// alone cost 43–83 % of attempt RPS depending on `--concurrency`.
     statuses: Box<[AtomicU64]>,
     /// Pre-populated mapping of failure bucket → atomic counter. Read-only
-    /// after `BenchStats::new`, so `HashMap::get` does no synchronization.
+    /// after `BenchStats::default`, so `HashMap::get` does no synchronization.
     failure_buckets: HashMap<&'static str, AtomicU64>,
     /// Catch-all for any bucket not present in `ALL_FAILURE_BUCKETS`. Should
     /// stay at 0 in practice — non-zero means `ProbeError` added a new bucket
