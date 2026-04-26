@@ -2324,6 +2324,9 @@ pub enum ApiEvent {
         port_scan: PortScanRecord,
         error: String,
     },
+    PortScanStopped {
+        port_scan: PortScanRecord,
+    },
     PublicWorkflowRecorded {
         workflow: PublicWorkflowKind,
         record_id: i64,

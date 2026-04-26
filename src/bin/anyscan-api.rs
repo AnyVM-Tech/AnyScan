@@ -2401,9 +2401,8 @@ async fn stop_port_scan(
         .store
         .append_event(
             None,
-            &ApiEvent::PortScanFailed {
+            &ApiEvent::PortScanStopped {
                 port_scan: port_scan.clone(),
-                error: notes.clone(),
             },
         )
         .map_err(|error| {

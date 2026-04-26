@@ -1564,6 +1564,31 @@ fn parse_port_scan_ipv4_address(value: &str, target_range: &str) -> Result<Ipv4A
         .with_context(|| format!("port scan target_range {target_range} must use IPv4 addresses"))
 }
 
+fn port_scan_range_is_allowed(
+    inventory: &InventoryConfig,
+    target_range: &PortScanTargetRange,
+) -> bool {
+    if inventory.allowed_host_suffixes.is_empty()
+        && inventory.allowed_hosts.is_empty()
+        && inventory.allowed_cidrs.is_empty()
+    {
+        return true;
+    }
+
+    if target_range.is_single_host() {
+        return inventory.host_is_allowed(&target_range.start_ip().to_string());
+    }
+
+    inventory.allowed_cidrs.iter().any(|allowed_cidr| {
+        InventoryCidr::parse(allowed_cidr)
+            .map(|cidr| {
+                cidr.contains(IpAddr::V4(target_range.start_ip()))
+                    && cidr.contains(IpAddr::V4(target_range.end_ip()))
+            })
+            .unwrap_or(false)
+    })
+}
+
 pub fn parse_port_scan_ports(value: &str) -> Result<Vec<u16>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -2670,13 +2695,28 @@ impl AppConfig {
 
     pub fn normalize_port_scan_request(&self, request: PortScanRequest) -> Result<PortScanRequest> {
         let target_range = PortScanTargetRange::parse(&request.target_range)?;
+        if !port_scan_range_is_allowed(&self.inventory, &target_range) {
+            return Err(anyhow!(
+                "port scan target_range {} is outside inventory allowlists",
+                target_range.canonical_string()
+            ));
+        }
 
         let normalized_ports = request
             .ports
             .chars()
             .filter(|character| !character.is_whitespace())
             .collect::<String>();
-        let _ports = parse_port_scan_ports(&normalized_ports)?;
+        let ports = parse_port_scan_ports(&normalized_ports)?;
+        if let Some(port) = ports
+            .iter()
+            .copied()
+            .find(|port| !self.inventory.port_is_allowed(Some(*port)))
+        {
+            return Err(anyhow!(
+                "port scan port {port} is outside inventory.allowed_ports"
+            ));
+        }
 
         let tags = normalize_worker_tags(&request.tags);
         let worker_pool = request
@@ -3772,17 +3812,51 @@ mod tests {
         );
     }
 
+    // The WIP that landed in PR #3 originally bypassed the port-scan
+    // inventory allowlists (target_range and per-port). Restored on review;
+    // the two tests below cover the rejection behavior the bypass had elided.
     #[test]
-    fn normalize_port_scan_request_allows_ranges_outside_inventory_allowlists() {
+    fn normalize_port_scan_request_rejects_target_range_outside_inventory_allowlists() {
         let mut config = AppConfig::default();
         config.inventory.allowed_host_suffixes.clear();
         config.inventory.allowed_cidrs = vec!["10.0.0.0/24".to_string()];
         config.inventory.allowed_ports = vec![80];
         config.validate().expect("config should validate");
 
-        let normalized = config
+        let error = config
             .normalize_port_scan_request(PortScanRequest {
                 target_range: "10.0.1.0/24".to_string(),
+                ports: "80".to_string(),
+                schemes: crate::core::PortScanSchemePolicy::Auto,
+                tags: Vec::new(),
+                rate_limit: 10,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+            })
+            .expect_err("out-of-allowlist target_range must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("target_range 10.0.1.0/24 is outside inventory allowlists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn normalize_port_scan_request_rejects_port_outside_inventory_allowlists() {
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes.clear();
+        config.inventory.allowed_cidrs = vec!["10.0.0.0/24".to_string()];
+        config.inventory.allowed_ports = vec![80];
+        config.validate().expect("config should validate");
+
+        let error = config
+            .normalize_port_scan_request(PortScanRequest {
+                target_range: "10.0.0.5".to_string(),
                 ports: "8080".to_string(),
                 schemes: crate::core::PortScanSchemePolicy::Auto,
                 tags: Vec::new(),
@@ -3793,10 +3867,14 @@ mod tests {
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
             })
-            .expect("port scan request should ignore inventory allowlists");
+            .expect_err("out-of-allowlist port must be rejected");
 
-        assert_eq!(normalized.target_range, "10.0.1.0/24");
-        assert_eq!(normalized.ports, "8080");
+        assert!(
+            error
+                .to_string()
+                .contains("port 8080 is outside inventory.allowed_ports"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

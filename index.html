@@ -5991,6 +5991,8 @@
 					}
 					case 'port_scan_failed':
 						return `Port scan #${event.port_scan.id} failed: ${event.error}`;
+					case 'port_scan_stopped':
+						return `Port scan #${event.port_scan.id} stopped by operator`;
 					case 'worker_state_changed':
 						return `Worker ${event.worker.display_name || event.worker.worker_id} is now ${formatHumanLabel(event.worker.lifecycle_state)}`;
 					case 'worker_remote_update_requested':
