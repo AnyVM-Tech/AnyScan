@@ -973,6 +973,7 @@ impl Fetcher {
                         user_agent: self.scan.user_agent.clone(),
                         allow_invalid_tls: self.scan.allow_invalid_tls,
                         extra_headers: Vec::new(),
+                        pipeline: true,
                     };
                     let host = match url.host_str() {
                         Some(host) => host.to_string(),
@@ -1021,11 +1022,7 @@ impl Fetcher {
                                     })
                                 })
                                 .collect::<Vec<_>>();
-                            Ok(ProbeResponse {
-                                status,
-                                headers,
-                                server_closed: false,
-                            })
+                            Ok(ProbeResponse::from_owned(status, headers, false))
                         }
                         Err(error) => Err(anyhow!(error)),
                     }
@@ -1039,17 +1036,16 @@ impl Fetcher {
                         return Ok(None);
                     }
                     let content_type = response
-                        .headers
-                        .iter()
-                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
-                        .map(|(_, value)| value.clone());
+                        .header("content-type")
+                        .map(|v| v.to_string());
+                    let headers = response.headers_owned();
                     return Ok(Some(ResponseSnapshot {
                         document: FetchedDocument {
                             path: path.to_string(),
                             url: url.to_string(),
                             status: response.status,
                             content_type,
-                            headers: response.headers,
+                            headers,
                             body: String::new(),
                             truncated: false,
                             coverage_source: coverage_source.to_string(),

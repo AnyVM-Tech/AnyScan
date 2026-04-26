@@ -79,20 +79,82 @@ impl Default for ProbeConfig {
 }
 
 /// One HEAD response, parsed up to (but not including) any body.
+///
+/// Header storage is *raw bytes* — the response section between the status
+/// line and the terminating CRLF, with each line newline-terminated. Callers
+/// access header pairs through [`ProbeResponse::headers`] (zero-allocation
+/// iterator) or [`ProbeResponse::header`] (early-exit lookup). To keep an
+/// owned `Vec<(String, String)>` for downstream storage (e.g. fetcher's
+/// `FetchedDocument`), use [`ProbeResponse::headers_owned`].
+///
+/// Why raw bytes: profiling showed `parse_header`'s `to_string()` calls were
+/// 6 small allocations per response × 1.6 M responses = ~10 M heap ops on a
+/// loopback bench run. Most callers (the bench, the fetcher's content-type
+/// lookup) only need a handful of headers; deferring the allocation lets
+/// them skip the rest entirely.
 #[derive(Debug, Clone)]
 pub struct ProbeResponse {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    /// Raw header bytes — every line ends with `\n` (preceded optionally by
+    /// `\r`). Access via [`headers`] / [`header`] / [`headers_owned`].
+    raw_headers: Vec<u8>,
     /// `Connection: close` was advertised by the server.
     pub server_closed: bool,
 }
 
 impl ProbeResponse {
+    /// Construct from an owned list of (name, value) pairs. Used by callers
+    /// that source headers from a different parser (e.g. the fetcher's proxy
+    /// path which gets a `reqwest::HeaderMap`).
+    pub fn from_owned(
+        status: u16,
+        headers: Vec<(String, String)>,
+        server_closed: bool,
+    ) -> Self {
+        let mut raw_headers = Vec::with_capacity(headers.iter().map(|(n, v)| n.len() + v.len() + 4).sum());
+        for (name, value) in &headers {
+            raw_headers.extend_from_slice(name.as_bytes());
+            raw_headers.extend_from_slice(b": ");
+            raw_headers.extend_from_slice(value.as_bytes());
+            raw_headers.extend_from_slice(b"\r\n");
+        }
+        Self {
+            status,
+            raw_headers,
+            server_closed,
+        }
+    }
+
+    /// Iterate `(name, value)` pairs without per-call heap allocation.
+    /// Returned slices borrow from the response's raw header bytes; trailing
+    /// CR/LF/SP/TAB are trimmed. Lines that don't parse as a `name: value`
+    /// pair are skipped.
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.raw_headers.split(|b| *b == b'\n').filter_map(parse_header_borrowed)
+    }
+
+    /// Look up a single header by case-insensitive name. Early-exits as soon
+    /// as the first match is found; no allocation.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
+        self.headers()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v)
+    }
+
+    /// Materialize all headers into an owned `Vec<(String, String)>`. Used
+    /// by callers that need to store the headers past the lifetime of the
+    /// `ProbeResponse` (e.g. the fetcher's `FetchedDocument`).
+    pub fn headers_owned(&self) -> Vec<(String, String)> {
+        self.headers()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Borrow the raw header bytes (everything between the status line and
+    /// the terminating empty line). For advanced callers that want to do
+    /// their own parsing.
+    pub fn raw_headers(&self) -> &[u8] {
+        &self.raw_headers
     }
 }
 
@@ -508,7 +570,10 @@ where
         return Err(ProbeError::ConnectionReset);
     }
     let status = parse_status_line(&line)?;
-    let mut headers = Vec::with_capacity(8);
+    // Raw header bytes accumulator — one allocation per response, replacing
+    // the previous `Vec<(String, String)>` (1 Vec alloc + 2 String allocs per
+    // header). Capacity 256 covers a typical short HEAD response in one go.
+    let mut raw_headers: Vec<u8> = Vec::with_capacity(256);
     let mut server_closed = false;
     let mut consumed = n;
     loop {
@@ -522,14 +587,18 @@ where
         if line == b"\r\n" || line == b"\n" {
             break;
         }
-        if let Some((name, value)) = parse_header(&line) {
-            if name.eq_ignore_ascii_case("connection")
-                && value.split(',').any(|tok| tok.trim().eq_ignore_ascii_case("close"))
-            {
-                server_closed = true;
+        // Detect Connection: close on the raw bytes — avoids the per-header
+        // String allocation that `parse_header` used to do.
+        if let Some(value) = header_value_if_name(&line, b"connection") {
+            for tok in value.split(|b| *b == b',') {
+                let tok = trim_ascii_ws(tok);
+                if tok.eq_ignore_ascii_case(b"close") {
+                    server_closed = true;
+                    break;
+                }
             }
-            headers.push((name, value));
         }
+        raw_headers.extend_from_slice(&line);
         if consumed >= HEADERS_BYTE_LIMIT {
             return Err(ProbeError::HeadersTooLarge {
                 limit: HEADERS_BYTE_LIMIT,
@@ -538,9 +607,49 @@ where
     }
     Ok(ProbeResponse {
         status,
-        headers,
+        raw_headers,
         server_closed,
     })
+}
+
+/// If `line` is a `name: value\r?\n?` header whose name matches
+/// `expected_name` case-insensitively, return the (untrimmed) value bytes.
+fn header_value_if_name<'a>(line: &'a [u8], expected_name: &[u8]) -> Option<&'a [u8]> {
+    let colon = line.iter().position(|b| *b == b':')?;
+    if colon != expected_name.len() {
+        return None;
+    }
+    if !line[..colon].eq_ignore_ascii_case(expected_name) {
+        return None;
+    }
+    Some(&line[colon + 1..])
+}
+
+/// Trim leading & trailing ASCII whitespace (SP, HT, CR, LF) from a byte slice.
+fn trim_ascii_ws(s: &[u8]) -> &[u8] {
+    let start = s.iter().position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+    let Some(start) = start else { return &[]; };
+    let end = s.iter().rposition(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')).unwrap();
+    &s[start..=end]
+}
+
+/// Parse a single header line `name: value\r?\n?` into borrowed `&str`
+/// halves. Returns `None` for blank lines, malformed lines, or non-UTF-8
+/// content. Used by [`ProbeResponse::headers`].
+fn parse_header_borrowed(line: &[u8]) -> Option<(&str, &str)> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.is_empty() {
+        return None;
+    }
+    let colon = line.iter().position(|b| *b == b':')?;
+    let name = std::str::from_utf8(&line[..colon]).ok()?;
+    let value = std::str::from_utf8(&line[colon + 1..]).ok()?;
+    let name = name.trim_matches(|c: char| matches!(c, ' ' | '\t'));
+    let value = value.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, value))
 }
 
 /// Read up to (and including) the next `\n`, into `out`. Enforces `limit`:
@@ -661,20 +770,6 @@ fn parse_status_line(line: &[u8]) -> Result<u16, ProbeError> {
     code_str
         .parse::<u16>()
         .map_err(|_| ProbeError::MalformedResponse(format!("bad status code: {code_str}")))
-}
-
-fn parse_header(line: &[u8]) -> Option<(String, String)> {
-    let mut parts = line.splitn(2, |b| *b == b':');
-    let name = parts.next()?;
-    let value = parts.next()?;
-    let name = std::str::from_utf8(name).ok()?.trim();
-    let value = std::str::from_utf8(value).ok()?.trim_matches(|c: char| {
-        c == ' ' || c == '\t' || c == '\r' || c == '\n'
-    });
-    if name.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), value.to_string()))
 }
 
 /// Lazily initialised, process-wide TLS connectors.
