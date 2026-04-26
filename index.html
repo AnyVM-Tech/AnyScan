@@ -121,6 +121,11 @@
 				transform: translateY(0);
 			}
 
+			#main-content:focus,
+			#main-content:focus-visible {
+				outline: none;
+			}
+
 			.shell {
 				width: min(var(--container-max), calc(100vw - 32px));
 				margin: 0 auto;
@@ -1210,7 +1215,7 @@
 					</div>
 				</header>
 
-				<div id="main-content"></div>
+				<div id="main-content" tabindex="-1"></div>
 
 				<h2 class="section-group-heading" id="section-overview">
 					<span>Overview</span>
