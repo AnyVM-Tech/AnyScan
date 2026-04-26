@@ -7,5 +7,6 @@ pub mod fetcher;
 pub mod ops;
 pub mod plugins;
 pub mod public_verification;
+pub mod request_probe;
 pub mod store;
 pub mod worker_api;
