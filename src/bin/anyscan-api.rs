@@ -3437,8 +3437,22 @@ async fn rebuild_hosted_agent_bundle_blocking(
             )
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             {
+                if options.mark_leased && task_cancelled.load(Ordering::Acquire) {
+                    warn!(
+                        platform_key = %platform_key_owned,
+                        "skipping hosted agent bundle lease: caller dropped after cache hit"
+                    );
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
                 return finalize_hosted_agent_bundle(bundle, options.mark_leased);
             }
+        }
+        if task_cancelled.load(Ordering::Acquire) {
+            warn!(
+                platform_key = %platform_key_owned,
+                "skipping hosted agent bundle build: caller dropped after cache miss"
+            );
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
         let bundle = rebuild_hosted_agent_bundle(&config, &platform_key_owned).map_err(|error| {
             warn!(
