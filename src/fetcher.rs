@@ -5848,4 +5848,96 @@ paths:
 
         server.abort();
     }
+
+    async fn spawn_graphiql_test_server() -> (JoinHandle<()>, String) {
+        let app = Router::new().route(
+            "/graphql",
+            get(|| async {
+                Html(
+                    "<!doctype html><html><head><title>GraphiQL</title></head><body><div id=\"graphiql\"></div><script src=\"//cdn.jsdelivr.net/react-graphiql/index.js\"></script></body></html>",
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("graphiql listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("graphiql listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("graphiql server should stay available")
+        });
+
+        (handle, format!("http://{}", address))
+    }
+
+    #[tokio::test]
+    async fn graphql_discovery_fires_on_graphiql_html_through_fetcher() {
+        let (server, base_url) = spawn_graphiql_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 1;
+        config.scan.enable_path_discovery = false;
+        config.scan.enable_all_plugins_for_testing = true;
+
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 1042,
+            label: "graphql-discovery".to_string(),
+            base_url,
+            paths: vec!["/graphql".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("graphiql fetch should succeed");
+
+        let graphiql_doc = report
+            .documents
+            .iter()
+            .find(|document| document.path == "/graphql")
+            .expect("graphiql document fetched");
+        assert!(
+            graphiql_doc.body.contains("<title>GraphiQL</title>"),
+            "expected GraphiQL HTML body, got {}",
+            graphiql_doc.body
+        );
+
+        let detectors = crate::detectors::DetectorEngine::from_config(&config)
+            .expect("detector engine should build from config");
+        let findings = detectors.scan_document(graphiql_doc);
+
+        let graphql_finding = findings.iter().find(|finding| {
+            let detector_or_plugin = finding
+                .plugin_metadata
+                .as_ref()
+                .map(|metadata| metadata.plugin_id.as_str())
+                .unwrap_or(finding.detector.as_str());
+            let lowered = detector_or_plugin.to_ascii_lowercase();
+            lowered.contains("graphql") || lowered.contains("graphiql")
+        });
+
+        assert!(
+            graphql_finding.is_some(),
+            "expected a GraphQL-related finding for graphiql HTML, got detectors: {:?}",
+            findings
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
 }

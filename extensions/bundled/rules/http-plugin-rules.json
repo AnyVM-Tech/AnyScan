@@ -102,6 +102,126 @@
     "product_name": "geoserver"
   },
   {
+    "plugin_id": "GraphQLEndpointPlugin",
+    "severity": "low",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http",
+      "endpoint_discovery",
+      "graphql"
+    ],
+    "summary": "GraphQL-style endpoint path was reachable on a public response.",
+    "evidence_template": "{product_name} endpoint markers were observed at {path}.",
+    "evidence": "GraphQL-style endpoint path was reachable on a public response.",
+    "aliases": [],
+    "any_of_path_contains": [
+      "/graphql",
+      "/graphiql",
+      "/playground",
+      "/altair",
+      "/voyager",
+      "/api/graphql",
+      "/v1/graphql",
+      "/v2/graphql",
+      "/__graphql",
+      "/api/graphql/console",
+      "/.netlify/functions/graphql",
+      "/api/2018-09-25/graphql"
+    ],
+    "path_not_contains": [
+      "/docs",
+      "/documentation",
+      "/blog",
+      "/changelog",
+      "/help"
+    ],
+    "product_name": "graphql"
+  },
+  {
+    "plugin_id": "GraphiQLConsolePlugin",
+    "severity": "medium",
+    "confidence": "high",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http",
+      "graphql",
+      "exposed_console"
+    ],
+    "summary": "GraphiQL console HTML markers were observed in a public response.",
+    "evidence_template": "{product_name} console markers were observed at {path}.",
+    "evidence": "GraphiQL console HTML markers were observed in a public response.",
+    "aliases": [],
+    "body_regex": "(?i)(?:<title>\\s*GraphiQL\\s*</title>|id=[\"']graphiql[\"']|react-graphiql)",
+    "product_name": "graphiql"
+  },
+  {
+    "plugin_id": "GraphQLPlaygroundConsolePlugin",
+    "severity": "medium",
+    "confidence": "high",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http",
+      "graphql",
+      "exposed_console"
+    ],
+    "summary": "GraphQL Playground console HTML markers were observed in a public response.",
+    "evidence_template": "{product_name} console markers were observed at {path}.",
+    "evidence": "GraphQL Playground console HTML markers were observed in a public response.",
+    "aliases": [],
+    "body_regex": "(?i)(?:<title>\\s*GraphQL\\s+Playground\\s*</title>|playground\\.min\\.js)",
+    "product_name": "graphql playground"
+  },
+  {
+    "plugin_id": "GraphQLIntrospectionResponsePlugin",
+    "severity": "medium",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http",
+      "graphql",
+      "introspection"
+    ],
+    "summary": "GraphQL introspection response markers were observed in a public response.",
+    "evidence_template": "{product_name} introspection markers were observed at {path}.",
+    "evidence": "GraphQL introspection response markers were observed in a public response.",
+    "aliases": [],
+    "body_regex": "(?:\"__schema\"\\s*:\\s*\\{|\"types\"\\s*:\\s*\\[\\s*\\{\\s*\"kind\"\\s*:\\s*\"OBJECT\")",
+    "product_name": "graphql"
+  },
+  {
+    "plugin_id": "GraphQLErrorEnvelopePlugin",
+    "severity": "medium",
+    "confidence": "medium",
+    "review_labels": [
+      "best_effort",
+      "bundled_rule",
+      "generated_rule",
+      "http_rule",
+      "passive_http",
+      "graphql",
+      "fingerprint"
+    ],
+    "summary": "GraphQL error envelope markers were observed in a public response.",
+    "evidence_template": "{product_name} error envelope markers were observed at {path}.",
+    "evidence": "GraphQL error envelope markers were observed in a public response.",
+    "aliases": [],
+    "body_regex": "\\{\\s*\"errors\"\\s*:\\s*\\[\\s*\\{\\s*\"message\"\\s*:",
+    "product_name": "graphql"
+  },
+  {
     "plugin_id": "GuacamolePlugin",
     "severity": "high",
     "confidence": "medium",
