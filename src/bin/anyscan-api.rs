@@ -3278,16 +3278,7 @@ async fn lease_cached_hosted_agent_bundle(
     state: &AppState,
     platform_key: &str,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
-    let current_fingerprint = match current_hosted_agent_bundle_source_fingerprint() {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            warn!(
-                ?error,
-                "failed to compute hosted agent bundle source fingerprint; falling back to latest cached bundle"
-            );
-            None
-        }
-    };
+    let current_fingerprint = compute_hosted_agent_bundle_source_fingerprint(platform_key);
     if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
         platform_key,
         current_fingerprint.as_deref(),
@@ -3299,39 +3290,32 @@ async fn lease_cached_hosted_agent_bundle(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
     }
 
-    let _guard = state.hosted_agent_bundle_build_lock.lock().await;
-    if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+    rebuild_hosted_agent_bundle_blocking(
+        state,
         platform_key,
-        current_fingerprint.as_deref(),
+        HostedAgentBundleBuildOptions {
+            skip_recheck: false,
+            mark_leased: true,
+            fingerprint: current_fingerprint,
+        },
     )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    {
-        mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
-    }
-
-    let bundle = rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+    .await
 }
 
 async fn allocate_fresh_hosted_agent_bundle(
     state: &AppState,
     platform_key: &str,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
-    let _guard = state.hosted_agent_bundle_build_lock.lock().await;
-    let bundle = rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
+    rebuild_hosted_agent_bundle_blocking(
+        state,
+        platform_key,
+        HostedAgentBundleBuildOptions {
+            skip_recheck: true,
+            mark_leased: true,
+            fingerprint: None,
+        },
+    )
+    .await
 }
 
 async fn ensure_hosted_agent_bundle(
@@ -3339,41 +3323,121 @@ async fn ensure_hosted_agent_bundle(
     platform_key: &str,
     force_rebuild: bool,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
-    let current_fingerprint = match current_hosted_agent_bundle_source_fingerprint() {
+    let current_fingerprint = compute_hosted_agent_bundle_source_fingerprint(platform_key);
+    if !force_rebuild {
+        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+            platform_key,
+            current_fingerprint.as_deref(),
+        )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        {
+            return Ok(bundle);
+        }
+    }
+    rebuild_hosted_agent_bundle_blocking(
+        state,
+        platform_key,
+        HostedAgentBundleBuildOptions {
+            skip_recheck: force_rebuild,
+            mark_leased: false,
+            fingerprint: current_fingerprint,
+        },
+    )
+    .await
+}
+
+fn compute_hosted_agent_bundle_source_fingerprint(platform_key: &str) -> Option<String> {
+    match current_hosted_agent_bundle_source_fingerprint() {
         Ok(fingerprint) => Some(fingerprint),
         Err(error) => {
             warn!(
                 ?error,
+                platform_key = %platform_key,
                 "failed to compute hosted agent bundle source fingerprint; falling back to latest cached bundle"
             );
             None
         }
-    };
-    if !force_rebuild {
-        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
-            platform_key,
-            current_fingerprint.as_deref(),
-        )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        {
-            return Ok(bundle);
-        }
     }
-    let _guard = state.hosted_agent_bundle_build_lock.lock().await;
-    if !force_rebuild {
-        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
-            platform_key,
-            current_fingerprint.as_deref(),
-        )
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        {
-            return Ok(bundle);
+}
+
+struct HostedAgentBundleBuildOptions {
+    skip_recheck: bool,
+    mark_leased: bool,
+    fingerprint: Option<String>,
+}
+
+// Acquires `hosted_agent_bundle_build_lock` and runs the synchronous bundle
+// rebuild on the blocking pool. The lock is acquired *inside* the
+// spawn_blocking task so that caller-side cancellation (client disconnect,
+// timeout) cannot drop the guard while the rebuild is still in flight — that
+// would let a concurrent request start a second rebuild, defeating the
+// serialization the lock is there to provide.
+async fn rebuild_hosted_agent_bundle_blocking(
+    state: &AppState,
+    platform_key: &str,
+    options: HostedAgentBundleBuildOptions,
+) -> Result<HostedAgentBundleInfo, StatusCode> {
+    let lock = state.hosted_agent_bundle_build_lock.clone();
+    let config = state.config.clone();
+    let platform_key_owned = platform_key.to_string();
+    let platform_key_for_log = platform_key.to_string();
+    tokio::task::spawn_blocking(move || -> Result<HostedAgentBundleInfo, StatusCode> {
+        let _guard = lock.blocking_lock();
+        if !options.skip_recheck {
+            if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+                &platform_key_owned,
+                options.fingerprint.as_deref(),
+            )
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            {
+                return finalize_hosted_agent_bundle(bundle, options.mark_leased);
+            }
         }
-    }
-    rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
+        let bundle = rebuild_hosted_agent_bundle(&config, &platform_key_owned).map_err(|error| {
+            warn!(
+                ?error,
+                platform_key = %platform_key_owned,
+                "failed to rebuild hosted agent bundle"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        finalize_hosted_agent_bundle(bundle, options.mark_leased)
     })
+    .await
+    .map_err(|error| {
+        if error.is_panic() {
+            warn!(
+                ?error,
+                platform_key = %platform_key_for_log,
+                "hosted agent bundle build task panicked"
+            );
+        } else if error.is_cancelled() {
+            warn!(
+                ?error,
+                platform_key = %platform_key_for_log,
+                "hosted agent bundle build task was cancelled"
+            );
+        } else {
+            warn!(
+                ?error,
+                platform_key = %platform_key_for_log,
+                "hosted agent bundle build task failed"
+            );
+        }
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?
+}
+
+fn finalize_hosted_agent_bundle(
+    bundle: HostedAgentBundleInfo,
+    mark_leased: bool,
+) -> Result<HostedAgentBundleInfo, StatusCode> {
+    if !mark_leased {
+        return Ok(bundle);
+    }
+    mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 fn rebuild_hosted_agent_bundle(
