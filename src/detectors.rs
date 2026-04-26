@@ -5907,9 +5907,16 @@ mod tests {
             "/.env",
             "OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmnopqrstuv",
         ));
-        assert_eq!(findings.len(), 1);
-        assert!(findings[0].redacted_value.contains("****"));
-        assert_eq!(findings[0].path, "/.env");
+        // The path-exposure detector \`dotenv_file_exposed\` co-fires on any
+        // \`/.env\` body containing \`api_key=\` regardless of the secret value,
+        // so this test asserts only on the secret detector it is checking
+        // for redaction behavior on.
+        let openai = findings
+            .iter()
+            .find(|finding| finding.detector == "openai_api_key")
+            .expect("openai_api_key finding for sk-proj credential");
+        assert!(openai.redacted_value.contains("****"));
+        assert_eq!(openai.path, "/.env");
     }
 
     #[test]
@@ -7213,8 +7220,15 @@ mod tests {
             "/.docker/config.json",
             r#"{"auths":{"registry.example.test":{"auth":"QWxhZGRpbjpPcGVuU2VzYW1lMTIzNDU2"}}}"#,
         ));
-        assert_eq!(docker_findings.len(), 1);
-        assert_eq!(docker_findings[0].detector, "docker_registry_auth");
+        // The path-exposure detector \`json_config_file_exposed\` co-fires on
+        // \`/.docker/config.json\` whenever the body is a JSON object. Assert
+        // only on the specific structured-credential detector under test.
+        assert!(
+            docker_findings
+                .iter()
+                .any(|finding| finding.detector == "docker_registry_auth"),
+            "expected docker_registry_auth finding, got {docker_findings:?}",
+        );
 
         let kube_findings = engine.scan_document(&document(
             "/.kube/config",
@@ -7557,7 +7571,17 @@ mod tests {
             "/.docker/config.json",
             r#"{"auths":{"registry.example.test":{"auth":"<redacted>"}}}"#,
         ));
-        assert!(docker_findings.is_empty());
+        // The path-exposure detector \`json_config_file_exposed\` co-fires on
+        // any JSON body at \`/.docker/config.json\` independently of the
+        // \`auth\` value. The contract under test is that the structured
+        // \`docker_registry_auth\` detector recognizes the placeholder and
+        // does not fire, so assert only on that detector being absent.
+        assert!(
+            docker_findings
+                .iter()
+                .all(|finding| finding.detector != "docker_registry_auth"),
+            "docker_registry_auth must not fire on placeholder \"<redacted>\", got {docker_findings:?}",
+        );
     }
 
     #[test]
@@ -7585,8 +7609,18 @@ mod tests {
             "OPENAI_API_KEY=sk-proj-1234567890abcdefghijklmnopqrstuv",
         ));
 
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].detector, "openai_api_key");
+        let detectors = findings
+            .iter()
+            .map(|finding| finding.detector.as_str())
+            .collect::<HashSet<_>>();
+        // The specific OpenAI detector must fire and crowd out any generic
+        // \`generic_api_key\`/\`generic_access_token\` match for the same value.
+        // The path-exposure detector \`dotenv_file_exposed\` is allowed to
+        // co-fire because it reports a different concern (file on a public
+        // path) and is not a generic-secret detector.
+        assert!(detectors.contains("openai_api_key"));
+        assert!(!detectors.contains("generic_api_key"));
+        assert!(!detectors.contains("generic_access_token"));
     }
 
     #[test]
