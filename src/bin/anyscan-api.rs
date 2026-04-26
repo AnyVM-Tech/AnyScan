@@ -3311,10 +3311,7 @@ async fn lease_cached_hosted_agent_bundle(
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
     }
 
-    let bundle = rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let bundle = rebuild_hosted_agent_bundle_blocking(state.config.clone(), platform_key.to_string()).await?;
     mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
@@ -3325,10 +3322,7 @@ async fn allocate_fresh_hosted_agent_bundle(
     platform_key: &str,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
     let _guard = state.hosted_agent_bundle_build_lock.lock().await;
-    let bundle = rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let bundle = rebuild_hosted_agent_bundle_blocking(state.config.clone(), platform_key.to_string()).await?;
     mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?)
@@ -3370,10 +3364,23 @@ async fn ensure_hosted_agent_bundle(
             return Ok(bundle);
         }
     }
-    rebuild_hosted_agent_bundle(&state.config, platform_key).map_err(|error| {
-        warn!(?error, "failed to rebuild hosted agent bundle");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    rebuild_hosted_agent_bundle_blocking(state.config.clone(), platform_key.to_string()).await
+}
+
+async fn rebuild_hosted_agent_bundle_blocking(
+    config: AppConfig,
+    platform_key: String,
+) -> Result<HostedAgentBundleInfo, StatusCode> {
+    tokio::task::spawn_blocking(move || rebuild_hosted_agent_bundle(&config, &platform_key))
+        .await
+        .map_err(|error| {
+            warn!(?error, "hosted agent bundle build task panicked");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .map_err(|error| {
+            warn!(?error, "failed to rebuild hosted agent bundle");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 fn rebuild_hosted_agent_bundle(
