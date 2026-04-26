@@ -3985,15 +3985,13 @@ async fn port_scan_progress_reporter(
                 let interval_elapsed = last_resume_push_at
                     .map(|prev| now.saturating_duration_since(prev) >= resume_min_interval)
                     .unwrap_or(true);
-                let bytes_grew_enough = match (last_output_snapshot_len, output_size) {
-                    (Some(prev), Some(current)) => {
-                        current.saturating_sub(prev) >= resume_min_bytes_delta
-                    }
-                    (None, Some(current)) => current > 0,
-                    _ => false,
-                };
-                let should_push_resume = checkpoint_changed
-                    || (output_size.is_some() && (interval_elapsed || bytes_grew_enough));
+                let should_push_resume = should_push_resume_state(
+                    checkpoint_changed,
+                    interval_elapsed,
+                    last_output_snapshot_len,
+                    output_size,
+                    resume_min_bytes_delta,
+                );
                 if should_push_resume {
                     let output_snapshot = if output_size.is_some() {
                         fs::read_to_string(&output_path)
@@ -4035,6 +4033,31 @@ fn port_scan_resume_state_min_bytes_delta() -> u64 {
     resolve_optional_env(PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA_ENV)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(DEFAULT_PORT_SCAN_RESUME_STATE_MIN_BYTES_DELTA)
+}
+
+fn should_push_resume_state(
+    checkpoint_changed: bool,
+    interval_elapsed: bool,
+    last_output_snapshot_len: Option<u64>,
+    output_size: Option<u64>,
+    resume_min_bytes_delta: u64,
+) -> bool {
+    if checkpoint_changed {
+        return true;
+    }
+    // Output rotated/truncated: push immediately so persisted resume state
+    // doesn't lag behind a smaller-but-different file.
+    if let (Some(prev), Some(current)) = (last_output_snapshot_len, output_size) {
+        if current < prev {
+            return true;
+        }
+    }
+    let bytes_grew_enough = match (last_output_snapshot_len, output_size) {
+        (Some(prev), Some(current)) => current.saturating_sub(prev) >= resume_min_bytes_delta,
+        (None, Some(current)) => current > 0,
+        _ => false,
+    };
+    output_size.is_some() && (interval_elapsed || bytes_grew_enough)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -4145,6 +4168,11 @@ impl ScannerOutputCounter {
                         self.seen.insert(key);
                     }
                 }
+                "json_lines" => {
+                    if let Some(key) = parse_json_endpoint_key(token, self.fallback_port) {
+                        self.seen.insert(key);
+                    }
+                }
                 _ => {
                     self.seen.insert(token.to_string());
                 }
@@ -4155,6 +4183,21 @@ impl ScannerOutputCounter {
         }
         Ok(())
     }
+}
+
+fn parse_json_endpoint_key(line: &str, fallback_port: Option<u16>) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let host = value
+        .get("host")
+        .and_then(|value| value.as_str())
+        .or_else(|| value.get("ip").and_then(|value| value.as_str()))
+        .or_else(|| value.get("address").and_then(|value| value.as_str()))?;
+    let port = value
+        .get("port")
+        .and_then(|value| value.as_u64())
+        .map(|value| value as u16)
+        .or(fallback_port)?;
+    Some(format!("{host}:{port}"))
 }
 
 fn read_scanner_progress_snapshot(
@@ -4979,7 +5022,7 @@ mod tests {
         ScannerOutputCounter, apply_follow_on_selection_mode_to_targets,
         derive_protocol_plugin_findings_with_active_mode, normalize_platform_architecture,
         normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
-        scanner_target_range_for_adapter, validated_target_tag,
+        scanner_target_range_for_adapter, should_push_resume_state, validated_target_tag,
     };
     use anyscan::core::TargetDefinition;
     use std::collections::HashSet;
@@ -5511,6 +5554,84 @@ mod tests {
         assert_eq!(counter.count(), 1);
         assert!(counter.seen.contains("10.0.0.9:22"));
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn should_push_resume_state_forces_push_when_output_rotates() {
+        // 8 KiB delta threshold, lots of headroom.
+        let delta = 8 * 1024;
+        // Output shrunk (rotation/truncation) and checkpoint hasn't changed.
+        assert!(should_push_resume_state(
+            false,
+            false,
+            Some(1_000_000),
+            Some(2048),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn should_push_resume_state_holds_when_growth_below_threshold_and_interval_not_elapsed() {
+        let delta = 256 * 1024;
+        // 64 KiB grew, threshold 256 KiB, interval not yet elapsed → don't push.
+        assert!(!should_push_resume_state(
+            false,
+            false,
+            Some(1_000_000),
+            Some(1_064_000),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn should_push_resume_state_pushes_on_first_observation_with_content() {
+        let delta = 256 * 1024;
+        // First push when there's any content and interval considered elapsed.
+        assert!(should_push_resume_state(false, true, None, Some(1024), delta));
+    }
+
+    #[test]
+    fn should_push_resume_state_pushes_on_checkpoint_change_even_when_quiet() {
+        let delta = 256 * 1024;
+        // Even with no growth and no interval, a checkpoint change forces a push.
+        assert!(should_push_resume_state(
+            true,
+            false,
+            Some(1_000_000),
+            Some(1_000_000),
+            delta,
+        ));
+    }
+
+    #[test]
+    fn scanner_output_counter_dedupes_json_lines_on_host_and_port() {
+        let path = unique_scratch_path("counter-json");
+        // Same host:port emitted twice with different field ordering and a
+        // noise field; should count once. A second distinct host:port plus
+        // an `ip` alias and a missing-port line that uses the fallback.
+        let contents = concat!(
+            r#"{"host":"10.0.0.5","port":443,"service":"https"}"#, "\n",
+            r#"{"port":443,"host":"10.0.0.5","extra":"noise"}"#, "\n",
+            r#"{"host":"10.0.0.6","port":443}"#, "\n",
+            r#"{"ip":"10.0.0.7","port":443}"#, "\n",
+            r#"{"address":"10.0.0.8"}"#, "\n",
+            "not-json-line\n",
+        );
+        fs::write(&path, contents).unwrap();
+        let mut counter = ScannerOutputCounter::new("443");
+        counter.refresh(&path, "json_lines").unwrap();
+        let mut endpoints: Vec<_> = counter.seen.iter().cloned().collect();
+        endpoints.sort();
+        assert_eq!(
+            endpoints,
+            vec![
+                "10.0.0.5:443".to_string(),
+                "10.0.0.6:443".to_string(),
+                "10.0.0.7:443".to_string(),
+                "10.0.0.8:443".to_string(),
+            ]
+        );
         let _ = fs::remove_file(&path);
     }
 }
