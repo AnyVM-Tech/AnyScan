@@ -1284,6 +1284,7 @@ async fn process_port_scan(
             output_path: output_path.clone(),
             output_format: adapter.output_format().to_string(),
             cancelled: cancelled.clone(),
+            should_resume,
         };
         Some(tokio::spawn(async move {
             streaming_followon_flusher(streaming_ctx, streaming_shutdown_rx).await
@@ -4222,6 +4223,12 @@ struct StreamingFollowOnContext {
     output_path: PathBuf,
     output_format: String,
     cancelled: Arc<AtomicBool>,
+    /// True when `restore_port_scan_resume_state` repopulated the scanner
+    /// output file from a checkpoint. The flusher must skip-ahead through
+    /// the pre-existing content so it does not re-emit endpoints that were
+    /// already streamed (and possibly already host-scanned) in the prior
+    /// life of this port scan.
+    should_resume: bool,
 }
 
 async fn streaming_followon_flusher(
@@ -4234,6 +4241,29 @@ async fn streaming_followon_flusher(
     }
     let tunables = StreamingFollowOnTunables::from_env();
     let mut counter = ScannerOutputCounter::new(&ctx.port_scan.ports);
+
+    if ctx.should_resume {
+        // Prime the counter from the restored output so prior endpoints
+        // populate `seen` (preventing re-emission) and add them to the
+        // flushed set so the end-of-scan filter does not re-queue host-scan
+        // jobs for them either.
+        if let Err(error) = counter.refresh(&ctx.output_path, &ctx.output_format) {
+            warn!(
+                port_scan_id = ctx.port_scan.id,
+                %error,
+                "streaming follow-on resume seed read failed"
+            );
+        }
+        let resumed_keys = counter.drain_new_keys();
+        if !resumed_keys.is_empty() {
+            summary.notes.push(format!(
+                "streaming follow-on skipped re-emitting {} pre-resume endpoint(s)",
+                resumed_keys.len()
+            ));
+            summary.flushed_endpoint_keys.extend(resumed_keys);
+        }
+    }
+
     let mut last_flush_at = Instant::now();
     let requested_by = ctx
         .port_scan
@@ -4359,10 +4389,13 @@ async fn streaming_followon_flusher(
                 summary
                     .notes
                     .push(format!("streaming follow-on batch flush failed: {error}"));
-                // Treat keys as flushed to avoid retrying the same failing
-                // batch every poll. The endpoints will still be picked up by
-                // the final import pass.
-                summary.flushed_endpoint_keys.extend(keys.into_iter());
+                // Do NOT mark these keys as flushed. The counter has them in
+                // `seen` (so they will not re-emit in subsequent streaming
+                // batches this life), but leaving them out of
+                // `flushed_endpoint_keys` lets the end-of-scan
+                // `filter_endpoints_excluding_streamed` keep them in the
+                // final import pass — that is the recovery path for any
+                // transient importer/queue/store failure here.
                 last_flush_at = Instant::now();
             }
         }
@@ -4446,8 +4479,7 @@ fn filter_endpoints_excluding_streamed(
     endpoints
         .iter()
         .filter(|endpoint| {
-            let key = format!("{}:{}", endpoint.host, endpoint.port);
-            !flushed_keys.contains(&key)
+            !flushed_keys.contains(&endpoint_cache_key(&endpoint.host, endpoint.port))
         })
         .cloned()
         .collect()
@@ -4591,8 +4623,7 @@ impl ScannerOutputCounter {
             match output_format {
                 "endpoint_lines" => {
                     if let Ok(Some(endpoint)) = parse_endpoint_token(token, self.fallback_port) {
-                        let key = format!("{}:{}", endpoint.host, endpoint.port);
-                        self.record_key(key);
+                        self.record_key(endpoint_cache_key(&endpoint.host, endpoint.port));
                     }
                 }
                 "json_lines" => {
@@ -4635,7 +4666,21 @@ fn parse_json_endpoint_key(line: &str, fallback_port: Option<u16>) -> Option<Str
         .and_then(|value| value.as_u64())
         .map(|value| value as u16)
         .or(fallback_port)?;
-    Some(format!("{host}:{port}"))
+    Some(endpoint_cache_key(host, port))
+}
+
+/// Canonical "host:port" cache key shared between the streaming counter,
+/// `parse_endpoint_token`, and the final-import filter. IPv6 hosts contain
+/// ':' literally, so a naïve `{host}:{port}` would collide and round-trip
+/// incorrectly (e.g. "2001:db8::1:80" cannot be re-parsed unambiguously).
+/// The bracketed form `[host]:port` parses through `SocketAddr::from_str`
+/// and is unique across all endpoints.
+fn endpoint_cache_key(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn read_scanner_progress_snapshot(
@@ -5458,10 +5503,10 @@ mod tests {
     use super::{
         DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
         ScannerOutputCounter, apply_follow_on_selection_mode_to_targets,
-        derive_protocol_plugin_findings_with_active_mode,
+        derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
         filter_endpoints_excluding_streamed, normalize_platform_architecture,
-        normalize_platform_operating_system, parse_ip_addr_show_output, parse_json_endpoint_lines,
-        scanner_target_range_for_adapter, should_push_resume_state,
+        normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
+        parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
         streaming_followon_should_flush, validated_target_tag,
     };
     use anyscan::core::TargetDefinition;
@@ -6339,6 +6384,94 @@ mod tests {
         all_keys.sort();
         let unique: std::collections::HashSet<_> = all_keys.iter().cloned().collect();
         assert_eq!(unique.len(), all_keys.len());
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn endpoint_cache_key_round_trips_for_ipv4_and_ipv6() {
+        // IPv4 keys keep the bare host:port form so the existing zmap output
+        // continues to work unchanged.
+        assert_eq!(endpoint_cache_key("10.0.0.1", 80), "10.0.0.1:80");
+
+        // IPv6 hosts contain ':' literally; without bracketing the key would
+        // collide with another endpoint and could not be unambiguously
+        // re-parsed. The bracketed form is canonical and round-trips through
+        // `parse_endpoint_token` (which delegates to `SocketAddr::parse`).
+        let v6_key = endpoint_cache_key("2001:db8::1", 443);
+        assert_eq!(v6_key, "[2001:db8::1]:443");
+        let parsed = parse_endpoint_token(&v6_key, None)
+            .expect("parse")
+            .expect("non-empty");
+        assert_eq!(parsed.host, "2001:db8::1");
+        assert_eq!(parsed.port, 443);
+        // Round-tripping the parsed endpoint must produce the same key.
+        assert_eq!(endpoint_cache_key(&parsed.host, parsed.port), v6_key);
+
+        // Already-bracketed inputs are not re-bracketed.
+        assert_eq!(endpoint_cache_key("[fe80::1]", 22), "[fe80::1]:22");
+    }
+
+    #[test]
+    fn filter_endpoints_excluding_streamed_handles_ipv6_keys() {
+        let endpoints = vec![
+            DiscoveredEndpoint {
+                host: "2001:db8::1".to_string(),
+                port: 443,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+            DiscoveredEndpoint {
+                host: "10.0.0.5".to_string(),
+                port: 443,
+                service_name: None,
+                transport: None,
+                tags: Vec::new(),
+                version: None,
+                reported_plugins: Vec::new(),
+            },
+        ];
+        let mut flushed = HashSet::new();
+        flushed.insert(endpoint_cache_key("2001:db8::1", 443));
+
+        let remaining = filter_endpoints_excluding_streamed(&endpoints, &flushed);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].host, "10.0.0.5");
+    }
+
+    #[test]
+    fn scanner_output_counter_seen_set_dedupes_resumed_content() {
+        // Simulates the resume seed path: the scanner output file already
+        // contains pre-resume endpoints, the flusher refresh+drain prologue
+        // moves them into `seen` (without re-emission), and a subsequent
+        // refresh after the scanner appends new lines drains only the new
+        // post-resume endpoints.
+        let path = unique_scratch_path("counter-resume-seed");
+        fs::write(&path, "1.1.1.1:80\n2.2.2.2:80\n").unwrap();
+        let mut counter = ScannerOutputCounter::new("80");
+
+        // Resume prologue: refresh, drain, discard (or stash as flushed).
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let resumed = counter.drain_new_keys();
+        assert_eq!(resumed.len(), 2);
+        // After draining, `seen` still contains them — a re-refresh of the
+        // same file does NOT re-emit.
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        assert!(counter.drain_new_keys().is_empty());
+
+        // Scanner appends a new line; only the new key drains.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"3.3.3.3:80\n")
+            .unwrap();
+        counter.refresh(&path, "endpoint_lines").unwrap();
+        let post = counter.drain_new_keys();
+        assert_eq!(post, vec!["3.3.3.3:80".to_string()]);
 
         let _ = fs::remove_file(&path);
     }

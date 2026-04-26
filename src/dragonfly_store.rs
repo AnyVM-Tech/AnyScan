@@ -2078,18 +2078,7 @@ impl DragonflyAnyScanStore {
         if run_ids.is_empty() {
             return Ok(0);
         }
-        let run_set: HashSet<i64> = run_ids.iter().copied().collect();
-        self.with_state(|state| {
-            let count = state
-                .jobs
-                .iter()
-                .filter(|job| {
-                    run_set.contains(&job.run_id)
-                        && matches!(job.status, JobStatus::Pending | JobStatus::InProgress)
-                })
-                .count() as u64;
-            Ok(count)
-        })
+        self.with_state(|state| Ok(count_active_jobs_for_runs_in_state(state, run_ids)))
     }
 
     pub fn record_finding(&self, finding: &NewFinding) -> Result<FindingRecord> {
@@ -7800,6 +7789,24 @@ fn complete_port_scan_if_owned_in_state(
     Ok(Some(record.port_scan.clone()))
 }
 
+fn count_active_jobs_for_runs_in_state(
+    state: &DragonflyRuntimeState,
+    run_ids: &[i64],
+) -> u64 {
+    if run_ids.is_empty() {
+        return 0;
+    }
+    let run_set: HashSet<i64> = run_ids.iter().copied().collect();
+    state
+        .jobs
+        .iter()
+        .filter(|job| {
+            run_set.contains(&job.run_id)
+                && matches!(job.status, JobStatus::Pending | JobStatus::InProgress)
+        })
+        .count() as u64
+}
+
 fn append_port_scan_follow_on_run_id_in_state(
     state: &mut DragonflyRuntimeState,
     port_scan_id: i64,
@@ -11168,26 +11175,16 @@ mod tests {
         state.jobs.push(sample_job(3, 100, JobStatus::Completed));
         state.jobs.push(sample_job(4, 200, JobStatus::Pending));
 
-        // Closure mirrors the production filter.
-        let count = |runs: &[i64]| -> u64 {
-            if runs.is_empty() {
-                return 0;
-            }
-            let run_set: HashSet<i64> = runs.iter().copied().collect();
-            state
-                .jobs
-                .iter()
-                .filter(|job| {
-                    run_set.contains(&job.run_id)
-                        && matches!(job.status, JobStatus::Pending | JobStatus::InProgress)
-                })
-                .count() as u64
-        };
-
-        assert_eq!(count(&[100]), 2);
-        assert_eq!(count(&[100, 200]), 3);
-        assert_eq!(count(&[200]), 1);
-        assert_eq!(count(&[]), 0);
+        // Drive the same in-state helper the production
+        // `DragonflyAnyScanStore::count_active_jobs_for_runs` invokes,
+        // so a regression in the filter logic fails this test.
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[100]), 2);
+        assert_eq!(
+            super::count_active_jobs_for_runs_in_state(&state, &[100, 200]),
+            3
+        );
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[200]), 1);
+        assert_eq!(super::count_active_jobs_for_runs_in_state(&state, &[]), 0);
     }
 
     #[test]
