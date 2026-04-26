@@ -64,6 +64,7 @@ use chrono::Utc;
 use clap::Parser;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::Duration as CookieDuration;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -81,6 +82,7 @@ const HOSTED_AGENT_BUNDLE_REFRESH_PATH: &str = "/api/agent/bundles/refresh";
 const HOSTED_AGENT_BUNDLE_ARTIFACT_PATH_PREFIX: &str = "/api/agent/bundles";
 const HOSTED_AGENT_BUNDLE_CHUNK_SIZE: usize = 64 * 1024;
 const HOSTED_AGENT_BUNDLE_KEEP_COUNT: usize = 5;
+const HOSTED_AGENT_BUNDLE_FINGERPRINT_LEN: usize = 12;
 const HOSTED_OPENWRT_OPAL_OUTPUT_DIR: &str = "/var/lib/anyscan/openwrt-opal";
 const HOSTED_OPENWRT_OPAL_INSTALL_PATH: &str = "/api/openwrt/opal/install.sh";
 const HOSTED_OPENWRT_OPAL_FILE_PATH_PREFIX: &str = "/api/openwrt/opal/files";
@@ -305,8 +307,18 @@ struct HostedAgentBundleInfo {
     sha256_name: String,
     bundle_path: PathBuf,
     sha256_path: PathBuf,
+    metadata_path: PathBuf,
     lease_marker_path: PathBuf,
     leased: bool,
+    source_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostedAgentBundleMetadata {
+    platform_key: String,
+    bundle_name: String,
+    source_fingerprint: String,
+    built_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -496,6 +508,7 @@ async fn main() -> Result<()> {
             "/api/port-scans",
             get(list_port_scans).post(queue_port_scan),
         )
+        .route("/api/port-scans/{port_scan_id}/stop", post(stop_port_scan))
         .route("/api/worker-pools", get(list_worker_pools))
         .route("/api/workers", get(list_workers))
         .route(
@@ -546,6 +559,7 @@ async fn main() -> Result<()> {
             post(reject_bootstrap_candidate),
         )
         .route("/api/runs", get(list_runs).post(queue_run))
+        .route("/api/runs/{run_id}/stop", post(stop_run))
         .route("/api/schedules", get(list_schedules).post(create_schedule))
         .route("/api/findings", get(list_findings))
         .route("/api/findings/publications", get(list_finding_publications))
@@ -686,6 +700,13 @@ async fn hosted_agent_install_script(
     )?;
     let install_url_base =
         append_optional_query_parameter(install_url_base, "base_url", query.base_url.as_deref())?;
+    let runtime_management_url = query
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_base_url)
+        .or_else(|| Some(base_url.clone()));
 
     let Some(platform_key) = query
         .platform
@@ -712,6 +733,7 @@ cleanup() {{
     rm -rf "$WORKDIR"
 }}
 trap cleanup EXIT
+{runtime_env_exports}
 
 normalize_platform_os() {{
     local value="${{1:-}}"
@@ -751,6 +773,8 @@ curl -fsSL \
 exec bash "$WORKDIR/agent-install.sh"
 "#,
             install_url = shell_single_quote(&install_url_base),
+            runtime_env_exports =
+                render_install_runtime_overrides_script(runtime_management_url.as_deref()),
         );
         return Ok((
             [
@@ -833,6 +857,7 @@ cleanup() {{
     rm -rf "$WORKDIR"
 }}
 trap cleanup EXIT
+{runtime_env_exports}
 
 fetch() {{
     local url="$1"
@@ -922,6 +947,8 @@ exec bash "$WORKDIR/bootstrap-agent-host.sh" \
             shell_single_quote("false")
         },
         bootstrap_url = shell_single_quote(&bootstrap_url),
+        runtime_env_exports =
+            render_install_runtime_overrides_script(runtime_management_url.as_deref()),
     );
     Ok((
         [
@@ -1504,10 +1531,18 @@ async fn worker_control(
             if !requested_worker_id.is_empty() && requested_worker_id != envelope.worker_id {
                 return Err(StatusCode::BAD_REQUEST);
             }
-            state
+            if let Err(registration_error) = state
                 .store
                 .authenticate_worker_registration_token(&envelope.worker_id, &envelope.worker_token)
-                .map_err(worker_auth_error_status)?;
+            {
+                state
+                    .store
+                    .authenticate_registered_worker_token(
+                        &envelope.worker_id,
+                        &envelope.worker_token,
+                    )
+                    .map_err(|_| worker_auth_error_status(registration_error))?;
+            }
         }
         _ => {
             state
@@ -1658,12 +1693,36 @@ async fn worker_control(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
             }
         }
+        WorkerControlRequest::AcknowledgeStoppingRun { run_id, notes } => {
+            WorkerControlResponse::OptionalFinishedRun {
+                run: state
+                    .store
+                    .acknowledge_stopping_run(run_id, notes.as_deref())
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            }
+        }
         WorkerControlRequest::GetRun { run_id } => WorkerControlResponse::OptionalRun {
             run: state
                 .store
                 .get_run(run_id)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         },
+        WorkerControlRequest::GetPortScan { port_scan_id } => {
+            WorkerControlResponse::OptionalPortScan {
+                port_scan: state
+                    .store
+                    .get_port_scan(port_scan_id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            }
+        }
+        WorkerControlRequest::LoadPortScanResumeState { port_scan_id } => {
+            WorkerControlResponse::OptionalPortScanResumeState {
+                resume_state: state
+                    .store
+                    .load_port_scan_resume_state(port_scan_id)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            }
+        }
         WorkerControlRequest::ClaimNextPendingJob {
             run_id,
             lease_seconds,
@@ -1716,6 +1775,52 @@ async fn worker_control(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
             }
         }
+        WorkerControlRequest::UpdatePortScanProgressIfOwned {
+            port_scan_id,
+            discovered_endpoints_total,
+            probe_rate_millis,
+            receive_rate_millis,
+            progress_percent,
+        } => WorkerControlResponse::OptionalPortScan {
+            port_scan: state
+                .store
+                .update_port_scan_progress_if_owned(
+                    port_scan_id,
+                    &envelope.worker_id,
+                    discovered_endpoints_total,
+                    probe_rate_millis,
+                    receive_rate_millis,
+                    progress_percent,
+                )
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        },
+        WorkerControlRequest::UpdatePortScanResumeStateIfOwned {
+            port_scan_id,
+            checkpoint_data,
+            output_snapshot,
+        } => WorkerControlResponse::OptionalPortScan {
+            port_scan: state
+                .store
+                .update_port_scan_resume_state_if_owned(
+                    port_scan_id,
+                    &envelope.worker_id,
+                    checkpoint_data.as_deref(),
+                    output_snapshot.as_deref(),
+                )
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        },
+        WorkerControlRequest::AnnotatePortScanIfOwned { port_scan_id, note } => {
+            WorkerControlResponse::OptionalPortScan {
+                port_scan: state
+                    .store
+                    .annotate_port_scan_if_owned(
+                        port_scan_id,
+                        &envelope.worker_id,
+                        &note,
+                    )
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            }
+        }
         WorkerControlRequest::CompletePortScanIfOwned {
             port_scan_id,
             discovered_endpoints_total,
@@ -1744,6 +1849,15 @@ async fn worker_control(
             port_scan: state
                 .store
                 .fail_port_scan_if_owned(port_scan_id, &envelope.worker_id, notes.as_deref())
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        },
+        WorkerControlRequest::AcknowledgeStoppingPortScan {
+            port_scan_id,
+            notes,
+        } => WorkerControlResponse::OptionalPortScan {
+            port_scan: state
+                .store
+                .acknowledge_stopping_port_scan(port_scan_id, notes.as_deref())
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         },
         WorkerControlRequest::CreateBootstrapCandidates {
@@ -1897,7 +2011,10 @@ async fn dashboard(
     snapshot.workers = state
         .store
         .list_workers()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(enrich_worker_with_bundle_state)
+        .collect();
     snapshot.extensions = state
         .config
         .load_extension_manifests()
@@ -2224,12 +2341,16 @@ async fn queue_port_scan(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
     Json(payload): Json<PortScanQueueRequest>,
-) -> Result<Json<PortScanRecord>, StatusCode> {
-    let session = require_write_access(&state, &jar)?;
+) -> Result<Json<PortScanRecord>, (StatusCode, String)> {
+    let session =
+        require_write_access(&state, &jar).map_err(|status| (status, status.to_string()))?;
     let normalized = state
         .config
         .normalize_port_scan_request(payload.request)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| {
+            warn!(?error, "failed to normalize port scan request");
+            (StatusCode::BAD_REQUEST, error.to_string())
+        })?;
     let active_policy =
         resolve_active_authorized_execution(&state.config, payload.active_authorized_plugins);
     let port_scan = state
@@ -2239,7 +2360,10 @@ async fn queue_port_scan(
             &normalized,
             &active_policy,
         )
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| {
+            warn!(?error, "failed to queue port scan");
+            (StatusCode::BAD_REQUEST, error.to_string())
+        })?;
     state
         .store
         .append_event(
@@ -2248,7 +2372,49 @@ async fn queue_port_scan(
                 port_scan: port_scan.clone(),
             },
         )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            warn!(?error, "failed to append port scan queued event");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to append port scan event".to_string(),
+            )
+        })?;
+    Ok(Json(port_scan))
+}
+
+async fn stop_port_scan(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(port_scan_id): Path<i64>,
+) -> Result<Json<PortScanRecord>, (StatusCode, String)> {
+    let session =
+        require_write_access(&state, &jar).map_err(|status| (status, status.to_string()))?;
+    let notes = format!("stopped by operator {}", session.username);
+    let port_scan = state
+        .store
+        .stop_port_scan(port_scan_id, Some(&notes))
+        .map_err(|error| {
+            warn!(?error, port_scan_id, "failed to stop port scan");
+            (StatusCode::BAD_REQUEST, error.to_string())
+        })?;
+    state
+        .store
+        .append_event(
+            None,
+            &ApiEvent::PortScanStopped {
+                port_scan: port_scan.clone(),
+            },
+        )
+        .map_err(|error| {
+            warn!(
+                ?error,
+                port_scan_id, "failed to append stopped port scan event"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to append port scan stop event".to_string(),
+            )
+        })?;
     Ok(Json(port_scan))
 }
 
@@ -2260,7 +2426,10 @@ async fn list_workers(
     let workers = state
         .store
         .list_workers()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(enrich_worker_with_bundle_state)
+        .collect();
     Ok(Json(workers))
 }
 
@@ -2286,6 +2455,7 @@ async fn get_worker(
         .store
         .get_worker(&worker_id)
         .map_err(|_| StatusCode::BAD_REQUEST)?
+        .map(enrich_worker_with_bundle_state)
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(worker))
 }
@@ -2301,6 +2471,7 @@ async fn update_worker_lifecycle(
         .store
         .update_worker_lifecycle_state(&worker_id, payload.lifecycle_state)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let worker = enrich_worker_with_bundle_state(worker);
     state
         .store
         .append_event(
@@ -2323,6 +2494,7 @@ async fn request_worker_remote_update(
         .store
         .request_worker_remote_update(&worker_id)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let worker = enrich_worker_with_bundle_state(worker);
     state
         .store
         .append_event(
@@ -2343,7 +2515,10 @@ async fn request_all_worker_remote_updates(
     let workers = state
         .store
         .request_all_worker_remote_updates()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_iter()
+        .map(enrich_worker_with_bundle_state)
+        .collect::<Vec<_>>();
     for worker in &workers {
         state
             .store
@@ -2613,6 +2788,48 @@ async fn queue_run(
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(summary))
+}
+
+async fn stop_run(
+    State(state): State<Arc<AppState>>,
+    jar: CookieJar,
+    Path(run_id): Path<i64>,
+) -> Result<Json<ScanRunRecord>, (StatusCode, String)> {
+    let session =
+        require_write_access(&state, &jar).map_err(|status| (status, status.to_string()))?;
+    let notes = format!("stopped by operator {}", session.username);
+    let run = state
+        .store
+        .stop_run(run_id, Some(&notes))
+        .map_err(|error| {
+            warn!(?error, run_id, "failed to stop run");
+            (StatusCode::BAD_REQUEST, error.to_string())
+        })?;
+    let summary = state.store.summary(run_id).map_err(|error| {
+        warn!(?error, run_id, "failed to summarize stopped run");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to summarize stopped run".to_string(),
+        )
+    })?;
+    state
+        .store
+        .append_event(
+            Some(run_id),
+            &ApiEvent::RunFailed {
+                run: run.clone(),
+                summary,
+                error: notes.clone(),
+            },
+        )
+        .map_err(|error| {
+            warn!(?error, run_id, "failed to append stopped run event");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to append run stop event".to_string(),
+            )
+        })?;
+    Ok(Json(run))
 }
 
 async fn list_schedules(
@@ -3014,6 +3231,20 @@ fn append_optional_query_parameter(
     append_query_parameter(url_value, key, value)
 }
 
+fn render_install_runtime_overrides_script(runtime_management_url: Option<&str>) -> String {
+    let Some(runtime_management_url) = runtime_management_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return String::new();
+    };
+    format!(
+        "export INSTALL_CONTROL_URL_OVERRIDE={control_url}\nexport INSTALL_MANAGEMENT_URL_OVERRIDE={management_url}\nexport INSTALL_CONTROL_PROXY_URL_OVERRIDE=''\n",
+        control_url = shell_single_quote(runtime_management_url),
+        management_url = shell_single_quote(runtime_management_url),
+    )
+}
+
 fn normalize_platform_key(value: &str) -> Result<String, StatusCode> {
     let mut normalized = value.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -3047,8 +3278,32 @@ async fn lease_cached_hosted_agent_bundle(
     state: &AppState,
     platform_key: &str,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
+    let current_fingerprint = match current_hosted_agent_bundle_source_fingerprint() {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            warn!(
+                ?error,
+                "failed to compute hosted agent bundle source fingerprint; falling back to latest cached bundle"
+            );
+            None
+        }
+    };
+    if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+        platform_key,
+        current_fingerprint.as_deref(),
+    )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(resolve_hosted_agent_bundle_by_name(&bundle.bundle_name)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?);
+    }
+
     let _guard = state.hosted_agent_bundle_build_lock.lock().await;
-    if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(platform_key)
+    if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+        platform_key,
+        current_fingerprint.as_deref(),
+    )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     {
         mark_hosted_agent_bundle_leased(&bundle).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -3084,8 +3339,21 @@ async fn ensure_hosted_agent_bundle(
     platform_key: &str,
     force_rebuild: bool,
 ) -> Result<HostedAgentBundleInfo, StatusCode> {
+    let current_fingerprint = match current_hosted_agent_bundle_source_fingerprint() {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(error) => {
+            warn!(
+                ?error,
+                "failed to compute hosted agent bundle source fingerprint; falling back to latest cached bundle"
+            );
+            None
+        }
+    };
     if !force_rebuild {
-        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(platform_key)
+        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+            platform_key,
+            current_fingerprint.as_deref(),
+        )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         {
             return Ok(bundle);
@@ -3093,7 +3361,10 @@ async fn ensure_hosted_agent_bundle(
     }
     let _guard = state.hosted_agent_bundle_build_lock.lock().await;
     if !force_rebuild {
-        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(platform_key)
+        if let Some(bundle) = find_latest_available_hosted_agent_bundle_for_platform(
+            platform_key,
+            current_fingerprint.as_deref(),
+        )
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         {
             return Ok(bundle);
@@ -3110,33 +3381,44 @@ fn rebuild_hosted_agent_bundle(
     platform_key: &str,
 ) -> Result<HostedAgentBundleInfo> {
     let bundle_output_dir = PathBuf::from(HOSTED_AGENT_BUNDLE_OUTPUT_DIR);
+    let build_root = PathBuf::from(HOSTED_AGENT_BUNDLE_BUILD_ROOT);
     fs::create_dir_all(&bundle_output_dir)
         .with_context(|| format!("failed to create {}", bundle_output_dir.display()))?;
-
-    let staging_root = PathBuf::from(HOSTED_AGENT_BUNDLE_BUILD_ROOT).join(format!(
-        "bundle-build-{}-{}",
-        Utc::now().timestamp_millis(),
-        std::process::id()
-    ));
-    fs::create_dir_all(&staging_root)
-        .with_context(|| format!("failed to create {}", staging_root.display()))?;
-    write_hosted_agent_bundle_assets(&staging_root)?;
-
-    let packager_script = staging_root.join("package-worker-bundle.sh");
+    fs::create_dir_all(&build_root)
+        .with_context(|| format!("failed to create {}", build_root.display()))?;
     let native_platform_key = native_hosted_agent_platform_key();
     if platform_key != native_platform_key {
         return Err(anyhow!(
             "no local hosted bundle build pipeline is configured for platform {platform_key}; publish a prebuilt bundle for that platform first"
         ));
     }
-    let bundle_name = format!(
-        "agent-bundle-{}__{}-{}",
+    let source_fingerprint = current_hosted_agent_bundle_source_fingerprint()?;
+    let fingerprint_short = &source_fingerprint[..source_fingerprint
+        .len()
+        .min(HOSTED_AGENT_BUNDLE_FINGERPRINT_LEN)];
+    let stage_root = build_root.join(format!(
+        "{}-{}-{}",
         platform_key,
         Utc::now().format("%Y%m%d%H%M%S"),
         std::process::id()
+    ));
+    if stage_root.exists() {
+        fs::remove_dir_all(&stage_root)
+            .with_context(|| format!("failed to clear {}", stage_root.display()))?;
+    }
+    fs::create_dir_all(&stage_root)
+        .with_context(|| format!("failed to create {}", stage_root.display()))?;
+    write_hosted_agent_bundle_assets(&stage_root)?;
+    let packager_script = stage_root.join("package-worker-bundle.sh");
+    let bundle_name = format!(
+        "agent-bundle-{}__{}-{}-{}",
+        platform_key,
+        Utc::now().format("%Y%m%d%H%M%S"),
+        std::process::id(),
+        fingerprint_short,
     );
     let mut command = ProcessCommand::new("/usr/bin/bash");
-    command.arg(&packager_script).current_dir(&staging_root);
+    command.arg(&packager_script).current_dir(&stage_root);
     command.env("DIST_DIR", &bundle_output_dir);
     command.env("ANYSCAN_PACKAGE_BUNDLE_NAME", &bundle_name);
     command.env("ANYSCAN_PACKAGE_BUNDLE_PLATFORM", platform_key);
@@ -3165,10 +3447,10 @@ fn rebuild_hosted_agent_bundle(
     let output = command
         .output()
         .with_context(|| format!("failed to execute {}", packager_script.display()))?;
+    let _ = fs::remove_dir_all(&stage_root);
     if !output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let _ = fs::remove_dir_all(&staging_root);
         return Err(anyhow!(
             "hosted agent bundle build failed (status {}): stdout:\n{}\nstderr:\n{}",
             output.status,
@@ -3176,14 +3458,16 @@ fn rebuild_hosted_agent_bundle(
             stderr.trim()
         ));
     }
-
-    let bundle = find_latest_hosted_agent_bundle_for_platform(platform_key)?.ok_or_else(|| {
-        anyhow!("hosted agent bundle build completed, but no output bundle was found")
-    })?;
+    write_hosted_agent_bundle_metadata(
+        &bundle_output_dir,
+        &bundle_name,
+        platform_key,
+        &source_fingerprint,
+    )?;
+    let bundle = resolve_hosted_agent_bundle_by_name(&format!("{bundle_name}.tar.gz"))?;
     if let Err(error) = prune_hosted_agent_bundles(HOSTED_AGENT_BUNDLE_KEEP_COUNT) {
         warn!(?error, "failed to prune old hosted agent bundles");
     }
-    let _ = fs::remove_dir_all(&staging_root);
     Ok(bundle)
 }
 
@@ -3197,24 +3481,89 @@ fn local_api_base_url(config: &AppConfig) -> Option<String> {
     Some(format!("http://{host}:{port}"))
 }
 
+fn current_hosted_agent_bundle_source_fingerprint() -> Result<String> {
+    let mut hasher = Sha256::new();
+    for asset in HOSTED_AGENT_BUNDLE_ASSETS {
+        hasher.update(asset.relative_path.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(asset.contents);
+        hasher.update(b"\0");
+        hasher.update(if asset.executable { b"1" } else { b"0" });
+        hasher.update(b"\0");
+    }
+    hash_file_with_label(
+        &PathBuf::from(INSTALLED_AGENT_BINARY_PATH),
+        "installed-agent-binary",
+        &mut hasher,
+    )?;
+    if FsPath::new(INSTALLED_SCANNER_BINARY_PATH).is_file() {
+        hash_file_with_label(
+            &PathBuf::from(INSTALLED_SCANNER_BINARY_PATH),
+            "installed-scanner-binary",
+            &mut hasher,
+        )?;
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    Ok(digest)
+}
+
 fn native_hosted_agent_platform_key() -> &'static str {
     "linux-x86_64"
 }
 
 fn find_latest_hosted_agent_bundle_for_platform(
     platform_key: &str,
+    current_source_fingerprint: Option<&str>,
 ) -> Result<Option<HostedAgentBundleInfo>> {
     Ok(list_hosted_agent_bundles()?
         .into_iter()
-        .find_map(|(_, info)| (info.platform_key == platform_key).then_some(info)))
+        .find_map(|(_, info)| {
+            (info.platform_key == platform_key
+                && current_source_fingerprint.is_none_or(|fingerprint| {
+                    info.source_fingerprint.as_deref() == Some(fingerprint)
+                }))
+            .then_some(info)
+        }))
 }
 
 fn find_latest_available_hosted_agent_bundle_for_platform(
     platform_key: &str,
+    current_source_fingerprint: Option<&str>,
 ) -> Result<Option<HostedAgentBundleInfo>> {
     Ok(list_hosted_agent_bundles()?
         .into_iter()
-        .find_map(|(_, info)| (info.platform_key == platform_key && !info.leased).then_some(info)))
+        .find_map(|(_, info)| {
+            (info.platform_key == platform_key
+                && !info.leased
+                && current_source_fingerprint.is_none_or(|fingerprint| {
+                    info.source_fingerprint.as_deref() == Some(fingerprint)
+                }))
+            .then_some(info)
+        }))
+}
+
+fn enrich_worker_with_bundle_state(mut worker: WorkerRecord) -> WorkerRecord {
+    let Some(platform_key) = worker.platform.as_deref() else {
+        return worker;
+    };
+    let current_source_fingerprint = current_hosted_agent_bundle_source_fingerprint().ok();
+    let Ok(latest_bundle) = find_latest_hosted_agent_bundle_for_platform(
+        platform_key,
+        current_source_fingerprint.as_deref(),
+    ) else {
+        return worker;
+    };
+    let Some(latest_bundle) = latest_bundle else {
+        return worker;
+    };
+    worker.latest_available_bundle_name = Some(latest_bundle.bundle_name.clone());
+    worker.latest_bundle_matches_installed = worker.installed_bundle_name.as_deref().map(
+        |installed| {
+            installed == latest_bundle.bundle_name
+                || format!("{installed}.tar.gz") == latest_bundle.bundle_name
+        },
+    );
+    worker
 }
 
 fn resolve_hosted_agent_bundle_by_name(filename: &str) -> Result<HostedAgentBundleInfo> {
@@ -3232,21 +3581,97 @@ fn resolve_hosted_agent_bundle_by_name(filename: &str) -> Result<HostedAgentBund
         .ok_or_else(|| anyhow!("invalid hosted bundle platform {bundle_name}"))?;
     let bundle_path = bundle_output_dir.join(&bundle_name);
     let sha256_path = bundle_output_dir.join(&sha256_name);
+    let metadata_path = bundle_output_dir.join(hosted_bundle_metadata_name(&bundle_name));
     let lease_marker_path = bundle_output_dir.join(hosted_bundle_lease_marker_name(&bundle_name));
     if !bundle_path.is_file() || !sha256_path.is_file() {
         return Err(anyhow!(
             "hosted bundle artifact pair is incomplete for {bundle_name}"
         ));
     }
+    let source_fingerprint = load_hosted_agent_bundle_metadata(&metadata_path)
+        .ok()
+        .flatten()
+        .map(|metadata| metadata.source_fingerprint);
     Ok(HostedAgentBundleInfo {
         platform_key,
         bundle_name,
         sha256_name,
         bundle_path,
         sha256_path,
+        metadata_path,
         leased: lease_marker_path.is_file(),
         lease_marker_path,
+        source_fingerprint,
     })
+}
+
+fn hosted_bundle_metadata_name(bundle_name: &str) -> String {
+    format!("{bundle_name}.meta.json")
+}
+
+fn load_hosted_agent_bundle_metadata(
+    metadata_path: &PathBuf,
+) -> Result<Option<HostedAgentBundleMetadata>> {
+    if !metadata_path.is_file() {
+        return Ok(None);
+    }
+    let payload = fs::read_to_string(metadata_path)
+        .with_context(|| format!("failed to read {}", metadata_path.display()))?;
+    let metadata = serde_json::from_str::<HostedAgentBundleMetadata>(&payload)
+        .with_context(|| format!("failed to parse {}", metadata_path.display()))?;
+    Ok(Some(metadata))
+}
+
+fn write_hosted_agent_bundle_metadata(
+    bundle_output_dir: &PathBuf,
+    bundle_name: &str,
+    platform_key: &str,
+    source_fingerprint: &str,
+) -> Result<()> {
+    let metadata_path = bundle_output_dir.join(hosted_bundle_metadata_name(bundle_name));
+    let metadata = HostedAgentBundleMetadata {
+        platform_key: platform_key.to_string(),
+        bundle_name: bundle_name.to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        built_at: Utc::now().to_rfc3339(),
+    };
+    fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata)?)
+        .with_context(|| format!("failed to write {}", metadata_path.display()))?;
+    Ok(())
+}
+
+fn hash_file_with_label(path: &PathBuf, label: &str, hasher: &mut Sha256) -> Result<()> {
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    let contents = fs::read(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    hasher.update(&contents);
+    hasher.update(b"\0");
+    Ok(())
+}
+
+fn hash_path_recursively(path: &PathBuf, label: &str, hasher: &mut Sha256) -> Result<()> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if metadata.is_file() {
+        return hash_file_with_label(path, label, hasher);
+    }
+    if metadata.is_dir() {
+        let mut entries = fs::read_dir(path)
+            .with_context(|| format!("failed to read {}", path.display()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("failed to list {}", path.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        hasher.update(label.as_bytes());
+        hasher.update(b"/\0");
+        for entry in entries {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let child_label = format!("{label}/{}", file_name);
+            hash_path_recursively(&entry.path(), &child_label, hasher)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_hosted_agent_bundle_assets(root: &FsPath) -> Result<()> {
@@ -3311,10 +3736,15 @@ fn list_hosted_agent_bundles() -> Result<Vec<(SystemTime, HostedAgentBundleInfo)
             continue;
         };
         let sha256_path = bundle_output_dir.join(&sha256_name);
+        let metadata_path = bundle_output_dir.join(hosted_bundle_metadata_name(file_name));
         let lease_marker_path = bundle_output_dir.join(hosted_bundle_lease_marker_name(file_name));
         if !sha256_path.is_file() {
             continue;
         }
+        let source_fingerprint = load_hosted_agent_bundle_metadata(&metadata_path)
+            .ok()
+            .flatten()
+            .map(|metadata| metadata.source_fingerprint);
         let modified = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
@@ -3327,8 +3757,10 @@ fn list_hosted_agent_bundles() -> Result<Vec<(SystemTime, HostedAgentBundleInfo)
                 sha256_name,
                 bundle_path: path.clone(),
                 sha256_path,
+                metadata_path,
                 leased: lease_marker_path.is_file(),
                 lease_marker_path,
+                source_fingerprint,
             },
         ));
     }
@@ -3390,6 +3822,7 @@ fn prune_hosted_agent_bundles(keep_count: usize) -> Result<()> {
     for (_, stale_bundle) in bundles.into_iter().skip(keep_count) {
         remove_file_if_exists(&stale_bundle.bundle_path)?;
         remove_file_if_exists(&stale_bundle.sha256_path)?;
+        remove_file_if_exists(&stale_bundle.metadata_path)?;
         remove_file_if_exists(&stale_bundle.lease_marker_path)?;
     }
 
@@ -3423,6 +3856,14 @@ fn prune_orphaned_hosted_agent_bundle_files(bundle_output_dir: &FsPath) -> Resul
         }
         if file_name.starts_with("agent-bundle-") && file_name.ends_with(".sha256") {
             let bundle_name = format!("{}.tar.gz", file_name.trim_end_matches(".sha256"));
+            let bundle_path = bundle_output_dir.join(bundle_name);
+            if !bundle_path.is_file() {
+                remove_file_if_exists(&path)?;
+            }
+            continue;
+        }
+        if file_name.starts_with("agent-bundle-") && file_name.ends_with(".tar.gz.meta.json") {
+            let bundle_name = file_name.trim_end_matches(".meta.json");
             let bundle_path = bundle_output_dir.join(bundle_name);
             if !bundle_path.is_file() {
                 remove_file_if_exists(&path)?;
@@ -3839,6 +4280,10 @@ mod tests {
         assert_eq!(request.request.ports, "80,443");
         assert!(request.request.follow_on_run_policy.enabled);
         assert_eq!(request.request.follow_on_run_policy.worker_pool, None);
+        assert_eq!(
+            request.request.follow_on_run_policy.selection_mode,
+            anyscan::core::PortScanFollowOnSelectionMode::Validated
+        );
         assert!(!request.active_authorized_plugins.global_gate_enabled);
         assert!(!request.active_authorized_plugins.request_opt_in_enabled);
     }
@@ -3851,7 +4296,8 @@ mod tests {
                 "ports": "80,443",
                 "follow_on_run_policy": {
                     "enabled": false,
-                    "worker_pool": "edge-scanners"
+                    "worker_pool": "edge-scanners",
+                    "selection_mode": "both"
                 }
             }"#,
         )
@@ -3861,6 +4307,10 @@ mod tests {
         assert_eq!(
             request.request.follow_on_run_policy.worker_pool.as_deref(),
             Some("edge-scanners")
+        );
+        assert_eq!(
+            request.request.follow_on_run_policy.selection_mode,
+            anyscan::core::PortScanFollowOnSelectionMode::Both
         );
     }
 

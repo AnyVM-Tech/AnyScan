@@ -275,6 +275,10 @@
 				color: #7dd3fc;
 				background: rgba(14, 165, 233, 0.18);
 			}
+			.status.stopping {
+				color: #fbbf24;
+				background: rgba(251, 191, 36, 0.2);
+			}
 			.status.queued,
 			.status.pending {
 				color: #fcd34d;
@@ -693,6 +697,14 @@
 					<form id="scan-settings-form">
 						<div class="grid two-up">
 							<label>
+								Request engine mode
+								<select id="scan-request-engine-mode">
+									<option value="staged" selected>Staged</option>
+									<option value="probe_only">Probe only</option>
+									<option value="deep_only">Deep only</option>
+								</select>
+							</label>
+							<label>
 								Scan concurrency
 								<input
 									id="scan-concurrency"
@@ -702,9 +714,45 @@
 								/>
 							</label>
 							<label>
+								Connect timeout (seconds)
+								<input
+									id="scan-connect-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
 								Request timeout (seconds)
 								<input
 									id="scan-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe timeout (seconds)
+								<input
+									id="scan-probe-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Deep timeout (seconds)
+								<input
+									id="scan-deep-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe concurrency
+								<input
+									id="scan-probe-concurrency"
 									type="number"
 									min="1"
 									step="1"
@@ -750,6 +798,24 @@
 								Max parallel paths per target
 								<input
 									id="scan-max-parallel-paths-per-target"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe requests per host
+								<input
+									id="scan-probe-max-concurrent-requests-per-host"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Deep requests per host
+								<input
+									id="scan-deep-max-concurrent-requests-per-host"
 									type="number"
 									min="1"
 									step="1"
@@ -1159,7 +1225,7 @@
 									</select>
 								</label>
 								<label>
-									Rate limit
+									Rate limit (0 = unlimited)
 									<input
 										id="port-scan-rate-limit"
 										type="number"
@@ -1173,6 +1239,26 @@
 									<input
 										id="port-scan-worker-pool"
 										placeholder="edge-scanners"
+									/>
+								</label>
+								<label>
+									Scanner sender threads (optional)
+									<input
+										id="port-scan-sender-threads"
+										type="number"
+										min="1"
+										step="1"
+										placeholder="Use worker default"
+									/>
+								</label>
+								<label>
+									Scanner receiver threads (optional)
+									<input
+										id="port-scan-receiver-threads"
+										type="number"
+										min="1"
+										step="1"
+										placeholder="Use worker default"
 									/>
 								</label>
 								<label>
@@ -1208,6 +1294,16 @@
 											id="port-scan-follow-on-pool"
 											placeholder="edge-scanners"
 										/>
+									</label>
+									<label>
+										Follow-on target mode
+										<select id="port-scan-follow-on-selection-mode">
+											<option value="validated" selected>
+												Validated responders
+											</option>
+											<option value="raw">Raw discovered hits</option>
+											<option value="both">Both</option>
+										</select>
 									</label>
 								</div>
 							</div>
@@ -1317,7 +1413,9 @@
 						</div>
 						<p class="subtle-note">
 							Remote debug commands run as the worker service user
-							and capture recent stdout/stderr for review.
+							and capture recent stdout/stderr for review. Use the
+							health filter to isolate workers that are online but
+							not consuming queued control actions.
 						</p>
 						<label>
 							Filter by worker pool
@@ -1325,6 +1423,14 @@
 								id="workers-worker-pool-filter"
 								placeholder="edge-scanners or unassigned"
 							/>
+						</label>
+						<label>
+							Filter by worker health
+							<select id="workers-health-filter">
+								<option value="all" selected>All workers</option>
+								<option value="healthy">Healthy only</option>
+								<option value="unhealthy">Needs attention</option>
+							</select>
 						</label>
 						<ul id="workers-list" class="list"></ul>
 						<p id="workers-empty" class="empty hidden">
@@ -1975,7 +2081,9 @@
 			const state = {
 				eventSource: null,
 				refreshTimer: null,
+				liveDashboardTimer: null,
 				reconnectTimer: null,
+				dashboardLoading: false,
 				dashboardSnapshot: null,
 				findingsQuery: null,
 				visibleFindings: [],
@@ -1984,6 +2092,7 @@
 				findingPublications: [],
 				runWorkerPoolFilter: '',
 				workerPoolFilter: '',
+				workerHealthFilter: 'all',
 				authenticated: false,
 				session: null
 			};
@@ -2248,6 +2357,9 @@
 				workersRemoteUpdateAll: document.getElementById(
 					'workers-remote-update-all'
 				),
+				workersHealthFilter: document.getElementById(
+					'workers-health-filter'
+				),
 				workersWorkerPoolFilter: document.getElementById(
 					'workers-worker-pool-filter'
 				),
@@ -2298,6 +2410,7 @@
 				elements.authError.classList.add('hidden');
 				applyWorkerManagementVisibility();
 				syncActiveAuthorizedGateUi();
+				startLiveDashboardRefresh();
 			}
 
 			function setUnauthenticated(message = '') {
@@ -2314,6 +2427,7 @@
 				renderFindingPublications([]);
 				syncActiveAuthorizedGateUi();
 				closeEvents();
+				stopLiveDashboardRefresh();
 				elements.app.classList.add('hidden');
 				elements.authCard.classList.remove('hidden');
 				if (message) {
@@ -2433,7 +2547,7 @@
 					'hidden',
 					!enabled
 				);
-				['port-scan-follow-on-pool']
+				['port-scan-follow-on-pool', 'port-scan-follow-on-selection-mode']
 					.map(id => document.getElementById(id))
 					.filter(Boolean)
 					.forEach(element => {
@@ -2447,11 +2561,16 @@
 				}
 				document.getElementById('port-scan-schemes').value = 'auto';
 				document.getElementById('port-scan-rate-limit').value = '';
+				document.getElementById('port-scan-sender-threads').value = '';
+				document.getElementById('port-scan-receiver-threads').value = '';
 				document.getElementById('port-scan-worker-pool').value = '';
 				document.getElementById('port-scan-tags').value = '';
 				document.getElementById('port-scan-follow-on-enabled').checked =
 					true;
 				document.getElementById('port-scan-follow-on-pool').value = '';
+				document.getElementById(
+					'port-scan-follow-on-selection-mode'
+				).value = 'validated';
 				document.getElementById('port-scan-bootstrap-enabled').checked =
 					false;
 				document.getElementById('port-scan-bootstrap-pool').value = '';
@@ -2534,6 +2653,32 @@
 				if (state.eventSource) {
 					state.eventSource.close();
 					state.eventSource = null;
+				}
+			}
+
+			function startLiveDashboardRefresh() {
+				if (state.liveDashboardTimer) {
+					return;
+				}
+				state.liveDashboardTimer = setInterval(async () => {
+					if (!state.authenticated || state.refreshTimer) {
+						return;
+					}
+					try {
+						await loadDashboard();
+					} catch (error) {
+						handleRequestError(
+							error,
+							'Failed to refresh live worker metrics.'
+						);
+					}
+				}, 5000);
+			}
+
+			function stopLiveDashboardRefresh() {
+				if (state.liveDashboardTimer) {
+					clearInterval(state.liveDashboardTimer);
+					state.liveDashboardTimer = null;
 				}
 			}
 
@@ -2652,6 +2797,134 @@
 				}
 				parts.push(`${remainingSeconds}s`);
 				return parts.join(' ');
+			}
+
+			function deriveElapsedSeconds(startedAt, completedAt) {
+				if (!startedAt) {
+					return null;
+				}
+				const started = new Date(startedAt);
+				if (Number.isNaN(started.getTime())) {
+					return null;
+				}
+				const completed = completedAt ? new Date(completedAt) : new Date();
+				if (Number.isNaN(completed.getTime())) {
+					return null;
+				}
+				return Math.max(
+					0,
+					Math.floor((completed.getTime() - started.getTime()) / 1000)
+				);
+			}
+
+			function computeRate(totalCount, startedAt, completedAt) {
+				const elapsedSeconds = deriveElapsedSeconds(startedAt, completedAt);
+				const count = Math.max(0, Number(totalCount) || 0);
+				if (!elapsedSeconds || elapsedSeconds <= 0 || count <= 0) {
+					return null;
+				}
+				return count / elapsedSeconds;
+			}
+
+			function estimateEtaSecondsFromProgress(progressPercent, elapsedSeconds) {
+				const progress = Number(progressPercent);
+				const elapsed = Number(elapsedSeconds);
+				if (
+					!Number.isFinite(progress) ||
+					!Number.isFinite(elapsed) ||
+					progress <= 0 ||
+					progress >= 100 ||
+					elapsed <= 0
+				) {
+					return null;
+				}
+				return Math.max(
+					0,
+					Math.round((elapsed * (100 - progress)) / progress)
+				);
+			}
+
+			function estimateEtaSecondsFromCounts(completedCount, totalCount, elapsedSeconds) {
+				const completed = Math.max(0, Number(completedCount) || 0);
+				const total = Math.max(0, Number(totalCount) || 0);
+				const elapsed = Number(elapsedSeconds);
+				if (
+					!Number.isFinite(elapsed) ||
+					elapsed <= 0 ||
+					total <= 0 ||
+					completed <= 0 ||
+					completed >= total
+				) {
+					return null;
+				}
+				return Math.max(
+					0,
+					Math.round((elapsed * (total - completed)) / completed)
+				);
+			}
+
+			function formatEta(value) {
+				if (value === null || value === undefined) {
+					return '—';
+				}
+				return formatDuration(value);
+			}
+
+			function formatRate(value, unit) {
+				if (value === null || value === undefined || !Number.isFinite(value)) {
+					return '—';
+				}
+				const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+				return `${value.toFixed(precision)} ${unit}`;
+			}
+
+			function formatPortScanRateLimit(value) {
+				const numeric = Math.max(0, Number(value) || 0);
+				if (numeric === 0) {
+					return 'Unlimited';
+				}
+				return String(numeric);
+			}
+
+			function describeScannerTuning(target) {
+				if (!target) {
+					return null;
+				}
+				const parts = [];
+				if (target.max_active_tasks) {
+					parts.push(`task slots ${target.max_active_tasks}`);
+				}
+				if (target.agent_concurrency) {
+					parts.push(`scan concurrency ${target.agent_concurrency}`);
+				}
+				const senderThreads =
+					normalizePositiveInteger(target.scanner_sender_threads);
+				const receiverThreads =
+					normalizePositiveInteger(target.scanner_receiver_threads);
+				if (senderThreads || receiverThreads) {
+					parts.push(
+						`scanner threads ${senderThreads || '—'}/${receiverThreads || '—'}`
+					);
+				}
+				if (
+					target.scanner_default_rate !== null &&
+					target.scanner_default_rate !== undefined
+				) {
+					parts.push(
+						`scanner default rate ${formatPortScanRateLimit(
+							target.scanner_default_rate
+						)}`
+					);
+				}
+				return parts.length ? parts.join(' • ') : null;
+			}
+
+			function rateFromMillis(value) {
+				const numeric = Math.max(0, Number(value) || 0);
+				if (!numeric) {
+					return null;
+				}
+				return numeric / 1000;
 			}
 
 			function formatIntervalSeconds(totalSeconds) {
@@ -2838,8 +3111,18 @@
 					elements.gobusterDefaultsPills.appendChild(pill);
 				});
 
+				document.getElementById('scan-request-engine-mode').value =
+					defaults.request_engine_mode ?? 'staged';
 				document.getElementById('scan-concurrency').value =
 					defaults.concurrency ?? '';
+				document.getElementById('scan-probe-concurrency').value =
+					defaults.probe_concurrency ?? '';
+				document.getElementById('scan-connect-timeout-secs').value =
+					defaults.connect_timeout_secs ?? '';
+				document.getElementById('scan-probe-request-timeout-secs').value =
+					defaults.probe_request_timeout_secs ?? '';
+				document.getElementById('scan-deep-request-timeout-secs').value =
+					defaults.deep_request_timeout_secs ?? '';
 				document.getElementById('scan-request-timeout-secs').value =
 					defaults.request_timeout_secs ?? '';
 				document.getElementById('scan-max-response-bytes').value =
@@ -2854,6 +3137,12 @@
 				document.getElementById(
 					'scan-max-parallel-paths-per-target'
 				).value = defaults.max_parallel_paths_per_target ?? '';
+				document.getElementById(
+					'scan-probe-max-concurrent-requests-per-host'
+				).value = defaults.probe_max_concurrent_requests_per_host ?? '';
+				document.getElementById(
+					'scan-deep-max-concurrent-requests-per-host'
+				).value = defaults.deep_max_concurrent_requests_per_host ?? '';
 				document.getElementById(
 					'scan-max-concurrent-requests-per-host'
 				).value = defaults.max_concurrent_requests_per_host ?? '';
@@ -3115,6 +3404,27 @@
 					}
 				};
 				const progress = summary.progress || {};
+				const summaryElapsedSeconds =
+					progress.elapsed_seconds ??
+					deriveElapsedSeconds(
+						summary.started_at || latestRun?.started_at,
+						summary.completed_at || latestRun?.completed_at
+					);
+				const summaryEtaSeconds = estimateEtaSecondsFromCounts(
+					summary.completed_targets || 0,
+					summary.total_targets || 0,
+					summaryElapsedSeconds
+				);
+				const summaryRequestRate = computeRate(
+					summary.requests_total || 0,
+					summary.started_at || latestRun?.started_at,
+					summary.completed_at || latestRun?.completed_at
+				);
+				const summaryTargetRate = computeRate(
+					summary.completed_targets || 0,
+					summary.started_at || latestRun?.started_at,
+					summary.completed_at || latestRun?.completed_at
+				);
 
 				renderMetrics(elements.summaryMetrics, [
 					['Run ID', summary.run_id ? `#${summary.run_id}` : 'None'],
@@ -3128,6 +3438,7 @@
 					['Succeeded', `${progress.succeeded_targets || 0}`],
 					['Failed', `${progress.failed_targets || 0}`],
 					['Requests', `${summary.requests_total || 0}`],
+					['Req/s', formatRate(summaryRequestRate, 'req/s')],
 					['Findings', `${summary.findings_total || 0}`],
 					['Errors', `${summary.errors_total || 0}`],
 					[
@@ -3163,7 +3474,9 @@
 							summary.completed_at || latestRun?.completed_at
 						)
 					],
-					['Elapsed', formatDuration(progress.elapsed_seconds)],
+					['Elapsed', formatDuration(summaryElapsedSeconds)],
+					['ETA', formatEta(summaryEtaSeconds)],
+					['Targets/s', formatRate(summaryTargetRate, 'targets/s')],
 					['Notes', latestRun?.notes || '—']
 				]);
 			}
@@ -3480,6 +3793,25 @@
 				entries.forEach(run => {
 					const item = document.createElement('li');
 					item.className = 'list-item';
+					const runRequestRate = computeRate(
+						run.requests_total || 0,
+						run.started_at,
+						run.completed_at
+					);
+					const runTargetRate = computeRate(
+						run.completed_targets || 0,
+						run.started_at,
+						run.completed_at
+					);
+					const runElapsedSeconds = deriveElapsedSeconds(
+						run.started_at,
+						run.completed_at
+					);
+					const runEtaSeconds = estimateEtaSecondsFromCounts(
+						run.completed_targets || 0,
+						run.total_targets || 0,
+						runElapsedSeconds
+					);
 
 					const heading = document.createElement('strong');
 					heading.textContent = `Run #${run.id}`;
@@ -3487,7 +3819,7 @@
 
 					const body = document.createElement('p');
 					body.className = 'muted';
-					body.textContent = `${run.completed_targets}/${run.total_targets} targets • ${run.requests_total} requests • ${run.findings_total} findings • ${run.errors_total} errors`;
+					body.textContent = `${run.completed_targets}/${run.total_targets} targets • ${run.requests_total} requests • ${run.findings_total} findings • ${run.errors_total} errors • ${formatRate(runRequestRate, 'req/s')}`;
 
 					const scope = document.createElement('small');
 					scope.className = 'muted';
@@ -3495,7 +3827,7 @@
 
 					const footer = document.createElement('small');
 					footer.className = 'muted';
-					footer.textContent = `Requested by ${run.requested_by || 'system'} • Started ${formatTimestamp(run.started_at)} • Completed ${formatTimestamp(run.completed_at)}`;
+					footer.textContent = `Requested by ${run.requested_by || 'system'} • Started ${formatTimestamp(run.started_at)} • Completed ${formatTimestamp(run.completed_at)} • Elapsed ${formatDuration(runElapsedSeconds)} • ETA ${formatEta(runEtaSeconds)} • ${formatRate(runTargetRate, 'targets/s')}`;
 
 					item.append(heading, body, scope, footer);
 					const activeAuthorizedExecution =
@@ -3507,6 +3839,33 @@
 						executionDetail.textContent =
 							activeAuthorizedExecution;
 						item.appendChild(executionDetail);
+					}
+					if (
+						canManageWorkers() &&
+						['queued', 'in_progress'].includes(run.status)
+					) {
+						const actions = document.createElement('div');
+						actions.className = 'card-actions';
+						const stopButton = document.createElement('button');
+						stopButton.type = 'button';
+						stopButton.className = 'secondary';
+						stopButton.textContent = 'Stop run';
+						stopButton.addEventListener('click', async () => {
+							stopButton.disabled = true;
+							try {
+								await request(`/api/runs/${run.id}/stop`, {
+									method: 'POST'
+								});
+								prependEvent(`Stopped run #${run.id}.`);
+								await loadDashboard();
+							} catch (error) {
+								handleRequestError(error, 'Failed to stop run.');
+							} finally {
+								stopButton.disabled = false;
+							}
+						});
+						actions.appendChild(stopButton);
+						item.appendChild(actions);
 					}
 					elements.runsList.appendChild(item);
 				});
@@ -4022,6 +4381,9 @@
 				if (policy.worker_pool) {
 					parts.push(`pool ${policy.worker_pool}`);
 				}
+				if (policy.selection_mode) {
+					parts.push(`mode ${policy.selection_mode}`);
+				}
 				return parts.join(' • ');
 			}
 
@@ -4362,6 +4724,7 @@
 				const workers = Array.isArray(snapshot?.workers)
 					? snapshot.workers
 					: [];
+				const workerThroughputSummary = snapshot?.worker_throughput_summary || null;
 				const pools = Array.isArray(snapshot?.worker_pools)
 					? snapshot.worker_pools
 					: [];
@@ -4401,11 +4764,61 @@
 				const inProgressPortScans = portScans.filter(
 					scan => scan.status === 'in_progress'
 				).length;
+				const totalRequestRate = rateFromMillis(
+					workerThroughputSummary?.total_request_rate_millis
+				);
+				const averageRequestRate = rateFromMillis(
+					workerThroughputSummary?.average_request_rate_millis
+				);
+				const totalTargetRate = rateFromMillis(
+					workerThroughputSummary?.total_target_rate_millis
+				);
+				const averageTargetRate = rateFromMillis(
+					workerThroughputSummary?.average_target_rate_millis
+				);
+				const totalEndpointRate = rateFromMillis(
+					workerThroughputSummary?.total_endpoint_rate_millis
+				);
+				const averageEndpointRate = rateFromMillis(
+					workerThroughputSummary?.average_endpoint_rate_millis
+				);
+				const totalProbeRate = rateFromMillis(
+					workerThroughputSummary?.total_probe_rate_millis
+				);
+				const averageProbeRate = rateFromMillis(
+					workerThroughputSummary?.average_probe_rate_millis
+				);
+				const totalReceiveRate = rateFromMillis(
+					workerThroughputSummary?.total_receive_rate_millis
+				);
+				const averageReceiveRate = rateFromMillis(
+					workerThroughputSummary?.average_receive_rate_millis
+				);
 
 				renderMetrics(elements.workerMetrics, [
 					['Workers', `${onlineWorkers}/${workers.length} online`],
+					[
+						'Active workers',
+						`${workerThroughputSummary?.active_workers || 0}`
+					],
 					['Draining', `${drainingWorkers}`],
 					['Pools', `${pools.length}`],
+					['Fleet req/s', formatRate(totalRequestRate, 'req/s')],
+					['Avg req/s', formatRate(averageRequestRate, 'req/s')],
+					['Fleet targets/s', formatRate(totalTargetRate, 'targets/s')],
+					['Avg targets/s', formatRate(averageTargetRate, 'targets/s')],
+					[
+						'Fleet endpoints/s',
+						formatRate(totalEndpointRate, 'endpoints/s')
+					],
+					[
+						'Avg endpoints/s',
+						formatRate(averageEndpointRate, 'endpoints/s')
+					],
+					['Fleet probes/s', formatRate(totalProbeRate, 'p/s')],
+					['Avg probes/s', formatRate(averageProbeRate, 'p/s')],
+					['Fleet recv/s', formatRate(totalReceiveRate, 'p/s')],
+					['Avg recv/s', formatRate(averageReceiveRate, 'p/s')],
 					['Active tokens', `${activeTokens}`],
 					['Pending approvals', `${pendingCandidates}`],
 					['Queued bootstrap', `${queuedBootstrapJobs}`],
@@ -4432,9 +4845,73 @@
 					.sort((left, right) => left[0].localeCompare(right[0]))
 					.map(([platform, count]) => `${platform} × ${count}`)
 					.join(' • ');
-				elements.workerFleetNote.textContent = `${visibility} ${approvals}${
+				const liveSummary = workerThroughputSummary
+					? ` Live throughput updated ${formatTimestamp(
+							workerThroughputSummary.updated_at
+					  )}.`
+					: '';
+				elements.workerFleetNote.textContent = `${visibility} ${approvals}${liveSummary}${
 					platformSummary ? ` Platforms: ${platformSummary}.` : ''
 				}`;
+			}
+
+			function buildWorkerActivityMap(snapshot) {
+				const entries = Array.isArray(snapshot?.worker_activity)
+					? snapshot.worker_activity
+					: [];
+				return new Map(
+					entries
+						.filter(entry => entry && entry.worker_id)
+						.map(entry => [entry.worker_id, entry])
+				);
+			}
+
+			function summarizeWorkerActivity(activity) {
+				if (!activity || activity.kind === 'idle') {
+					return 'Idle';
+				}
+				const parts = [activity.label || formatHumanLabel(activity.kind)];
+				if (activity.active_job_count) {
+					parts.push(`${activity.active_job_count} job${activity.active_job_count === 1 ? '' : 's'}`);
+				}
+				const rates = [];
+				const requestRate = rateFromMillis(activity.request_rate_millis);
+				const targetRate = rateFromMillis(activity.target_rate_millis);
+				const endpointRate = rateFromMillis(activity.endpoint_rate_millis);
+				const probeRate = rateFromMillis(activity.probe_rate_millis);
+				const receiveRate = rateFromMillis(activity.receive_rate_millis);
+				if (requestRate) {
+					rates.push(formatRate(requestRate, 'req/s'));
+				}
+				if (targetRate) {
+					rates.push(formatRate(targetRate, 'targets/s'));
+				}
+				if (endpointRate) {
+					rates.push(formatRate(endpointRate, 'endpoints/s'));
+				}
+				if (probeRate) {
+					rates.push(formatRate(probeRate, 'p/s'));
+				}
+				if (receiveRate) {
+					rates.push(formatRate(receiveRate, 'recv/s'));
+				}
+				if (rates.length > 0) {
+					parts.push(rates.join(' • '));
+				}
+				if (activity.progress_percent !== null && activity.progress_percent !== undefined) {
+					parts.push(`${activity.progress_percent}%`);
+				}
+				const activityEtaSeconds = estimateEtaSecondsFromProgress(
+					activity.progress_percent,
+					deriveElapsedSeconds(activity.started_at, null)
+				);
+				if (activityEtaSeconds !== null) {
+					parts.push(`ETA ${formatEta(activityEtaSeconds)}`);
+				}
+				if (activity.last_activity_at) {
+					parts.push(`Last activity ${formatTimestamp(activity.last_activity_at)}`);
+				}
+				return parts.join(' • ');
 			}
 
 			function renderWorkerPools(pools) {
@@ -4514,6 +4991,26 @@
 				entries.forEach(scan => {
 					const item = document.createElement('li');
 					item.className = 'list-item';
+					const scanElapsedSeconds = deriveElapsedSeconds(
+						scan.started_at,
+						scan.completed_at
+					);
+					const scanEtaSeconds = estimateEtaSecondsFromProgress(
+						scan.current_progress_percent,
+						scanElapsedSeconds
+					);
+					const endpointRate = computeRate(
+						scan.discovered_endpoints_total || 0,
+						scan.started_at,
+						scan.completed_at
+					);
+					const importRate = computeRate(
+						scan.imported_targets_total || 0,
+						scan.started_at,
+						scan.completed_at
+					);
+					const probeRate = rateFromMillis(scan.current_probe_rate_millis);
+					const receiveRate = rateFromMillis(scan.current_receive_rate_millis);
 
 					const heading = document.createElement('div');
 					heading.className = 'finding-heading';
@@ -4531,9 +5028,24 @@
 					if (scan.follow_on_run_policy?.enabled) {
 						heading.appendChild(createPill('Follow-on scan'));
 					}
+					if ((scan.shard_total || 0) > 1) {
+						heading.appendChild(
+							createPill(`Sharded ×${scan.shard_total}`)
+						);
+					}
 					if (scan.queued_run_id) {
 						heading.appendChild(
 							createPill(`Run #${scan.queued_run_id}`)
+						);
+					}
+					if (
+						Array.isArray(scan.follow_on_run_ids) &&
+						scan.follow_on_run_ids.length > 1
+					) {
+						heading.appendChild(
+							createPill(
+								`${scan.follow_on_run_ids.length} follow-on runs`
+							)
 						);
 					}
 
@@ -4556,23 +5068,50 @@
 					detail.className = 'muted';
 					detail.textContent = [
 						`Requested by ${scan.requested_by || 'system'}`,
-						`Rate ${scan.rate_limit || 0}`,
+						`Rate ${formatPortScanRateLimit(scan.rate_limit)}`,
+						scan.scanner_sender_threads ||
+						scan.scanner_receiver_threads
+							? `Threads ${scan.scanner_sender_threads || 'worker default'}/${scan.scanner_receiver_threads || 'worker default'}`
+							: null,
 						`Tags ${formatList(scan.tags, 'none')}`,
+						scan.current_progress_percent !== null &&
+						scan.current_progress_percent !== undefined
+							? `Progress ${scan.current_progress_percent}%`
+							: null,
+						scanEtaSeconds !== null
+							? `ETA ${formatEta(scanEtaSeconds)}`
+							: null,
+						probeRate ? `Probes ${formatRate(probeRate, 'p/s')}` : null,
+						receiveRate ? `Recv ${formatRate(receiveRate, 'p/s')}` : null,
 						formatFollowOnRunPolicy(scan.follow_on_run_policy),
 						formatBootstrapPolicy(scan.bootstrap_policy)
-					].join(' • ');
+					].filter(Boolean).join(' • ');
 
 					const totals = document.createElement('small');
 					totals.className = 'muted';
 					totals.textContent = [
 						`${scan.discovered_endpoints_total || 0} endpoints`,
+						`${formatRate(endpointRate, 'endpoints/s')}`,
 						`${(scan.protocol_findings || []).length} protocol matches`,
 						`${scan.imported_targets_total || 0} imported targets`,
+						`${formatRate(importRate, 'targets/s')}`,
 						`${scan.bootstrap_candidates_total || 0} bootstrap candidates`,
-						`Completed ${formatTimestamp(scan.completed_at)}`
+						`Completed ${formatTimestamp(scan.completed_at)}`,
+						`Elapsed ${formatDuration(scanElapsedSeconds)}`
 					].join(' • ');
 
 					item.append(heading, target, detail, totals);
+					if (
+						Array.isArray(scan.follow_on_run_ids) &&
+						scan.follow_on_run_ids.length
+					) {
+						const followOnRuns = document.createElement('small');
+						followOnRuns.className = 'muted';
+						followOnRuns.textContent = `Follow-on runs: ${scan.follow_on_run_ids
+							.map(runId => `#${runId}`)
+							.join(', ')}`;
+						item.appendChild(followOnRuns);
+					}
 					const activeAuthorizedExecution =
 						describeActiveAuthorizedExecution(scan);
 					if (activeAuthorizedExecution) {
@@ -4607,6 +5146,36 @@
 						notes.className = 'muted';
 						notes.textContent = scan.notes;
 						item.appendChild(notes);
+					}
+					if (
+						canManageWorkers() &&
+						['queued', 'in_progress'].includes(scan.status)
+					) {
+						const actions = document.createElement('div');
+						actions.className = 'card-actions';
+						const stopButton = document.createElement('button');
+						stopButton.type = 'button';
+						stopButton.className = 'secondary';
+						stopButton.textContent = 'Stop scan';
+						stopButton.addEventListener('click', async () => {
+							stopButton.disabled = true;
+							try {
+								await request(`/api/port-scans/${scan.id}/stop`, {
+									method: 'POST'
+								});
+								prependEvent(`Stopped port scan #${scan.id}.`);
+								await loadDashboard();
+							} catch (error) {
+								handleRequestError(
+									error,
+									'Failed to stop port scan.'
+								);
+							} finally {
+								stopButton.disabled = false;
+							}
+						});
+						actions.appendChild(stopButton);
+						item.appendChild(actions);
 					}
 					elements.portScansList.appendChild(item);
 				});
@@ -4673,6 +5242,9 @@
 
 			function renderWorkers(workers) {
 				elements.workersList.replaceChildren();
+				const workerActivityById = buildWorkerActivityMap(
+					state.dashboardSnapshot
+				);
 				const entries = (Array.isArray(workers) ? workers : [])
 					.filter(Boolean)
 					.filter(worker =>
@@ -4680,7 +5252,17 @@
 							worker?.worker_pool || null,
 							state.workerPoolFilter
 						)
-					);
+					)
+					.filter(worker => {
+						const mode = state.workerHealthFilter || 'all';
+						if (mode === 'healthy') {
+							return isWorkerControlPlaneHealthy(worker);
+						}
+						if (mode === 'unhealthy') {
+							return !isWorkerControlPlaneHealthy(worker);
+						}
+						return true;
+					});
 				const eligibleRemoteUpdateWorkers = entries.filter(
 					worker =>
 						worker &&
@@ -4697,9 +5279,10 @@
 				const hasWorkers = entries.length > 0;
 				elements.workersEmpty.classList.toggle('hidden', hasWorkers);
 				if (!hasWorkers) {
-					elements.workersEmpty.textContent = state.workerPoolFilter
-						? 'No workers matched the current worker-pool filter.'
-						: 'No workers have registered yet.';
+					elements.workersEmpty.textContent =
+						state.workerPoolFilter || state.workerHealthFilter !== 'all'
+							? 'No workers matched the current filters.'
+							: 'No workers have registered yet.';
 					return;
 				}
 
@@ -4758,6 +5341,21 @@
 						if (worker.remote_update_requested_at) {
 							heading.appendChild(createPill('Update queued'));
 						}
+						if (worker.latest_bundle_matches_installed === true) {
+							heading.appendChild(createPill('Latest'));
+						} else if (
+							worker.latest_available_bundle_name &&
+							worker.installed_bundle_name &&
+							worker.latest_available_bundle_name !==
+								worker.installed_bundle_name
+						) {
+							heading.appendChild(
+								createPill('Update available')
+							);
+						}
+						if (worker.control_plane_health_message) {
+							heading.appendChild(createPill('Needs attention'));
+						}
 
 						const identity = document.createElement('p');
 						identity.className = 'muted';
@@ -4803,10 +5401,49 @@
 							network,
 							timing
 						);
+						if (
+							worker.installed_bundle_name ||
+							worker.latest_available_bundle_name
+						) {
+							const buildInfo = document.createElement('small');
+							buildInfo.className = 'muted';
+							buildInfo.textContent = `Installed build: ${
+								worker.installed_bundle_name || 'unknown'
+							} • Latest build: ${
+								worker.latest_available_bundle_name || 'unknown'
+							}`;
+							item.appendChild(buildInfo);
+						}
+						const workerActivity = workerActivityById.get(
+							worker.worker_id
+						);
+						const activity = document.createElement('small');
+						activity.className = 'muted';
+						activity.textContent = `Live summary: ${summarizeWorkerActivity(
+							workerActivity
+						)}`;
+						item.appendChild(activity);
+						const tuningSummary = describeScannerTuning(worker);
+						if (tuningSummary) {
+							const tuning = document.createElement('small');
+							tuning.className = 'muted';
+							tuning.textContent = `Worker tuning: ${tuningSummary}`;
+							item.appendChild(tuning);
+						}
+						if (worker.control_plane_health_message) {
+							const health = document.createElement('small');
+							health.className = 'error';
+							health.textContent = worker.control_plane_health_message;
+							item.appendChild(health);
+						}
 						if (worker.remote_update_requested_at) {
 							const remoteUpdate = document.createElement('small');
 							remoteUpdate.className = 'muted';
-							remoteUpdate.textContent = `Remote update requested ${formatTimestamp(worker.remote_update_requested_at)}`;
+							remoteUpdate.textContent = `Remote update requested ${formatTimestamp(worker.remote_update_requested_at)}${
+								worker.latest_available_bundle_name
+									? ` • target ${worker.latest_available_bundle_name}`
+									: ''
+							}`;
 							item.appendChild(remoteUpdate);
 						}
 						if (worker.remote_update_status) {
@@ -4978,6 +5615,10 @@
 
 						elements.workersList.appendChild(item);
 					});
+			}
+
+			function isWorkerControlPlaneHealthy(worker) {
+				return !worker?.control_plane_health_message;
 			}
 
 			function formatWorkerPlatform(worker) {
@@ -5350,6 +5991,8 @@
 					}
 					case 'port_scan_failed':
 						return `Port scan #${event.port_scan.id} failed: ${event.error}`;
+					case 'port_scan_stopped':
+						return `Port scan #${event.port_scan.id} stopped by operator`;
 					case 'worker_state_changed':
 						return `Worker ${event.worker.display_name || event.worker.worker_id} is now ${formatHumanLabel(event.worker.lifecycle_state)}`;
 					case 'worker_remote_update_requested':
@@ -5407,48 +6050,56 @@
 			}
 
 			async function loadDashboard() {
-				const snapshot = await request('/api/dashboard');
-				state.dashboardSnapshot = snapshot;
-				syncBootstrapProvisionerOptions(snapshot);
-				applyWorkerManagementVisibility();
-				renderSummary(snapshot.latest_run, snapshot.latest_summary);
-				renderWorkerMetrics(snapshot);
-				renderWorkerPools(snapshot.worker_pools || []);
-				renderPortScans(snapshot.recent_port_scans || []);
-				renderWorkers(snapshot.workers || []);
-				renderWorkerRemoteCommands(
-					snapshot.recent_worker_remote_commands || []
-				);
-				renderWorkerEnrollmentTokens(
-					snapshot.worker_enrollment_tokens || []
-				);
-				renderBootstrapCandidates(snapshot.bootstrap_candidates || []);
-				renderBootstrapJobs(snapshot.bootstrap_jobs || []);
-				syncBootstrapCandidateOptions(
-					snapshot.bootstrap_candidates || []
-				);
-				renderTargets(snapshot.targets || []);
-				renderRepositories(
-					snapshot.repositories || [],
-					snapshot.targets || []
-				);
-				renderRuns(snapshot.recent_runs || []);
-				renderSchedules(snapshot.schedules || []);
-				renderFailedTargets(snapshot.latest_failed_targets || []);
-				renderDetectorDistribution(
-					snapshot.latest_detector_distribution || []
-				);
-				renderCoverageSources(
-					snapshot.latest_summary?.coverage_sources || []
-				);
-				renderGobusterDefaults(snapshot.scan_defaults || {});
-				renderBinDatasetStatus(snapshot.bin_dataset_status || null);
-				renderArchiveStatus(snapshot.archive_status || null);
-				await loadFindings();
-				await loadPluginCatalog();
-				syncActiveAuthorizedGateUi();
-				elements.connectionState.textContent =
-					'Dashboard updated successfully.';
+				if (state.dashboardLoading) {
+					return;
+				}
+				state.dashboardLoading = true;
+				try {
+					const snapshot = await request('/api/dashboard');
+					state.dashboardSnapshot = snapshot;
+					syncBootstrapProvisionerOptions(snapshot);
+					applyWorkerManagementVisibility();
+					renderSummary(snapshot.latest_run, snapshot.latest_summary);
+					renderWorkerMetrics(snapshot);
+					renderWorkerPools(snapshot.worker_pools || []);
+					renderPortScans(snapshot.recent_port_scans || []);
+					renderWorkers(snapshot.workers || []);
+					renderWorkerRemoteCommands(
+						snapshot.recent_worker_remote_commands || []
+					);
+					renderWorkerEnrollmentTokens(
+						snapshot.worker_enrollment_tokens || []
+					);
+					renderBootstrapCandidates(snapshot.bootstrap_candidates || []);
+					renderBootstrapJobs(snapshot.bootstrap_jobs || []);
+					syncBootstrapCandidateOptions(
+						snapshot.bootstrap_candidates || []
+					);
+					renderTargets(snapshot.targets || []);
+					renderRepositories(
+						snapshot.repositories || [],
+						snapshot.targets || []
+					);
+					renderRuns(snapshot.recent_runs || []);
+					renderSchedules(snapshot.schedules || []);
+					renderFailedTargets(snapshot.latest_failed_targets || []);
+					renderDetectorDistribution(
+						snapshot.latest_detector_distribution || []
+					);
+					renderCoverageSources(
+						snapshot.latest_summary?.coverage_sources || []
+					);
+					renderGobusterDefaults(snapshot.scan_defaults || {});
+					renderBinDatasetStatus(snapshot.bin_dataset_status || null);
+					renderArchiveStatus(snapshot.archive_status || null);
+					await loadFindings();
+					await loadPluginCatalog();
+					syncActiveAuthorizedGateUi();
+					elements.connectionState.textContent =
+						'Dashboard updated successfully.';
+				} finally {
+					state.dashboardLoading = false;
+				}
 			}
 
 			async function ensureSession() {
@@ -6266,6 +6917,16 @@
 								.getElementById('port-scan-rate-limit')
 								.value.trim()
 						) || 0,
+					scanner_sender_threads: normalizePositiveInteger(
+						document
+							.getElementById('port-scan-sender-threads')
+							.value.trim()
+					),
+					scanner_receiver_threads: normalizePositiveInteger(
+						document
+							.getElementById('port-scan-receiver-threads')
+							.value.trim()
+					),
 					worker_pool: normalizeOptionalText(
 						document.getElementById('port-scan-worker-pool').value
 					),
@@ -6277,7 +6938,11 @@
 										'port-scan-follow-on-pool'
 									).value
 								)
-							: null
+							: null,
+						selection_mode:
+							document.getElementById(
+								'port-scan-follow-on-selection-mode'
+							).value || 'validated'
 					},
 					bootstrap_policy: {
 						enabled: bootstrapEnabled,
@@ -6317,10 +6982,41 @@
 						.value.trim()
 				);
 				return {
+					request_engine_mode:
+						document.getElementById('scan-request-engine-mode').value ||
+						'staged',
 					concurrency:
 						normalizePositiveInteger(
 							document
 								.getElementById('scan-concurrency')
+								.value.trim()
+						) || 0,
+					probe_concurrency:
+						normalizePositiveInteger(
+							document
+								.getElementById('scan-probe-concurrency')
+								.value.trim()
+						) || 0,
+					connect_timeout_secs:
+						normalizePositiveInteger(
+							document
+								.getElementById('scan-connect-timeout-secs')
+								.value.trim()
+						) || 0,
+					probe_request_timeout_secs:
+						normalizePositiveInteger(
+							document
+								.getElementById(
+									'scan-probe-request-timeout-secs'
+								)
+								.value.trim()
+						) || 0,
+					deep_request_timeout_secs:
+						normalizePositiveInteger(
+							document
+								.getElementById(
+									'scan-deep-request-timeout-secs'
+								)
 								.value.trim()
 						) || 0,
 					request_timeout_secs:
@@ -6346,6 +7042,22 @@
 							document
 								.getElementById(
 									'scan-max-parallel-paths-per-target'
+								)
+								.value.trim()
+						) || 0,
+					probe_max_concurrent_requests_per_host:
+						normalizePositiveInteger(
+							document
+								.getElementById(
+									'scan-probe-max-concurrent-requests-per-host'
+								)
+								.value.trim()
+						) || 0,
+					deep_max_concurrent_requests_per_host:
+						normalizePositiveInteger(
+							document
+								.getElementById(
+									'scan-deep-max-concurrent-requests-per-host'
 								)
 								.value.trim()
 						) || 0,
@@ -6611,6 +7323,12 @@
 			elements.workersWorkerPoolFilter.addEventListener('input', () => {
 				state.workerPoolFilter =
 					elements.workersWorkerPoolFilter.value || '';
+				renderWorkers(state.dashboardSnapshot?.workers || []);
+			});
+
+			elements.workersHealthFilter?.addEventListener('change', () => {
+				state.workerHealthFilter =
+					elements.workersHealthFilter.value || 'all';
 				renderWorkers(state.dashboardSnapshot?.workers || []);
 			});
 

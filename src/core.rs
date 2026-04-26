@@ -91,6 +91,7 @@ impl std::str::FromStr for FindingConfidence {
 pub enum RunStatus {
     Queued,
     InProgress,
+    Stopping,
     Completed,
     Failed,
 }
@@ -100,6 +101,7 @@ impl RunStatus {
         match self {
             RunStatus::Queued => "queued",
             RunStatus::InProgress => "in_progress",
+            RunStatus::Stopping => "stopping",
             RunStatus::Completed => "completed",
             RunStatus::Failed => "failed",
         }
@@ -119,6 +121,7 @@ impl std::str::FromStr for RunStatus {
         match value {
             "queued" => Ok(Self::Queued),
             "in_progress" => Ok(Self::InProgress),
+            "stopping" => Ok(Self::Stopping),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             other => Err(format!("unknown run status: {other}")),
@@ -917,6 +920,18 @@ pub struct WorkerRegistration {
     #[serde(default)]
     pub remote_update_status_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub installed_bundle_name: Option<String>,
+    #[serde(default)]
+    pub max_active_tasks: Option<u64>,
+    #[serde(default)]
+    pub agent_concurrency: Option<u64>,
+    #[serde(default)]
+    pub scanner_default_rate: Option<u64>,
+    #[serde(default)]
+    pub scanner_sender_threads: Option<u64>,
+    #[serde(default)]
+    pub scanner_receiver_threads: Option<u64>,
+    #[serde(default)]
     pub enrollment_token: Option<String>,
 }
 
@@ -962,14 +977,118 @@ pub struct WorkerRecord {
     #[serde(default)]
     pub remote_update_status_updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
+    pub installed_bundle_name: Option<String>,
+    #[serde(default)]
+    pub max_active_tasks: Option<u64>,
+    #[serde(default)]
+    pub agent_concurrency: Option<u64>,
+    #[serde(default)]
+    pub scanner_default_rate: Option<u64>,
+    #[serde(default)]
+    pub scanner_sender_threads: Option<u64>,
+    #[serde(default)]
+    pub scanner_receiver_threads: Option<u64>,
+    #[serde(default)]
+    pub latest_available_bundle_name: Option<String>,
+    #[serde(default)]
+    pub latest_bundle_matches_installed: Option<bool>,
+    #[serde(default)]
     pub lifecycle_state: WorkerLifecycleState,
     #[serde(default)]
     pub remote_update_requested_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub control_plane_health_message: Option<String>,
     #[serde(default)]
     pub enrollment_token_id: Option<i64>,
     pub registered_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerActivityKind {
+    #[default]
+    Idle,
+    Run,
+    PortScan,
+    BootstrapJob,
+    RunCoordinator,
+}
+
+impl WorkerActivityKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkerActivityKind::Idle => "idle",
+            WorkerActivityKind::Run => "run",
+            WorkerActivityKind::PortScan => "port_scan",
+            WorkerActivityKind::BootstrapJob => "bootstrap_job",
+            WorkerActivityKind::RunCoordinator => "run_coordinator",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerActivitySnapshot {
+    pub worker_id: String,
+    #[serde(default)]
+    pub kind: WorkerActivityKind,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<i64>,
+    #[serde(default)]
+    pub port_scan_id: Option<i64>,
+    #[serde(default)]
+    pub bootstrap_job_id: Option<i64>,
+    #[serde(default)]
+    pub active_job_count: u64,
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_activity_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub request_rate_millis: u64,
+    #[serde(default)]
+    pub target_rate_millis: u64,
+    #[serde(default)]
+    pub endpoint_rate_millis: u64,
+    #[serde(default)]
+    pub probe_rate_millis: u64,
+    #[serde(default)]
+    pub receive_rate_millis: u64,
+    #[serde(default)]
+    pub progress_percent: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerThroughputSummary {
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub online_workers: u64,
+    #[serde(default)]
+    pub active_workers: u64,
+    #[serde(default)]
+    pub total_request_rate_millis: u64,
+    #[serde(default)]
+    pub average_request_rate_millis: u64,
+    #[serde(default)]
+    pub total_target_rate_millis: u64,
+    #[serde(default)]
+    pub average_target_rate_millis: u64,
+    #[serde(default)]
+    pub total_endpoint_rate_millis: u64,
+    #[serde(default)]
+    pub average_endpoint_rate_millis: u64,
+    #[serde(default)]
+    pub total_probe_rate_millis: u64,
+    #[serde(default)]
+    pub average_probe_rate_millis: u64,
+    #[serde(default)]
+    pub total_receive_rate_millis: u64,
+    #[serde(default)]
+    pub average_receive_rate_millis: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1255,6 +1374,7 @@ pub struct WorkerRemoteUpdateRequest {}
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerRemoteUpdateStatus {
+    Queued,
     Running,
     Success,
     Failed,
@@ -1265,6 +1385,7 @@ pub enum WorkerRemoteUpdateStatus {
 impl WorkerRemoteUpdateStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            WorkerRemoteUpdateStatus::Queued => "queued",
             WorkerRemoteUpdateStatus::Running => "running",
             WorkerRemoteUpdateStatus::Success => "success",
             WorkerRemoteUpdateStatus::Failed => "failed",
@@ -1729,12 +1850,42 @@ impl WorkerBootstrapPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PortScanFollowOnSelectionMode {
+    Raw,
+    Validated,
+    Both,
+}
+
+impl Default for PortScanFollowOnSelectionMode {
+    fn default() -> Self {
+        Self::Validated
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestEngineMode {
+    DeepOnly,
+    ProbeOnly,
+    Staged,
+}
+
+impl Default for RequestEngineMode {
+    fn default() -> Self {
+        Self::Staged
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortScanFollowOnRunPolicy {
     #[serde(default = "default_port_scan_follow_on_run_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub worker_pool: Option<String>,
+    #[serde(default)]
+    pub selection_mode: PortScanFollowOnSelectionMode,
 }
 
 impl Default for PortScanFollowOnRunPolicy {
@@ -1742,6 +1893,7 @@ impl Default for PortScanFollowOnRunPolicy {
         Self {
             enabled: default_port_scan_follow_on_run_enabled(),
             worker_pool: None,
+            selection_mode: PortScanFollowOnSelectionMode::default(),
         }
     }
 }
@@ -1767,6 +1919,10 @@ pub struct PortScanRequest {
     #[serde(default)]
     pub rate_limit: u64,
     #[serde(default)]
+    pub scanner_sender_threads: Option<u64>,
+    #[serde(default)]
+    pub scanner_receiver_threads: Option<u64>,
+    #[serde(default)]
     pub worker_pool: Option<String>,
     #[serde(default)]
     pub bootstrap_policy: WorkerBootstrapPolicy,
@@ -1787,9 +1943,27 @@ pub struct PortScanProtocolFindingRecord {
     pub plugin_metadata: FindingPluginMetadata,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PortScanResumeStateRecord {
+    #[serde(default)]
+    pub checkpoint_data: Option<String>,
+    #[serde(default)]
+    pub output_snapshot: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PortScanRecord {
     pub id: i64,
+    #[serde(default)]
+    pub shard_group_id: Option<i64>,
+    #[serde(default)]
+    pub aggregate_target_range: Option<String>,
+    #[serde(default)]
+    pub shard_index: Option<u32>,
+    #[serde(default)]
+    pub shard_total: Option<u32>,
     pub requested_by: Option<String>,
     pub target_range: String,
     pub ports: String,
@@ -1799,6 +1973,10 @@ pub struct PortScanRecord {
     pub tags: Vec<String>,
     #[serde(default)]
     pub rate_limit: u64,
+    #[serde(default)]
+    pub scanner_sender_threads: Option<u64>,
+    #[serde(default)]
+    pub scanner_receiver_threads: Option<u64>,
     #[serde(default)]
     pub worker_pool: Option<String>,
     #[serde(default)]
@@ -1819,7 +1997,15 @@ pub struct PortScanRecord {
     #[serde(default)]
     pub queued_run_id: Option<i64>,
     #[serde(default)]
+    pub follow_on_run_ids: Vec<i64>,
+    #[serde(default)]
     pub protocol_findings: Vec<PortScanProtocolFindingRecord>,
+    #[serde(default)]
+    pub current_probe_rate_millis: u64,
+    #[serde(default)]
+    pub current_receive_rate_millis: u64,
+    #[serde(default)]
+    pub current_progress_percent: Option<u64>,
     pub notes: Option<String>,
 }
 
@@ -2138,6 +2324,9 @@ pub enum ApiEvent {
         port_scan: PortScanRecord,
         error: String,
     },
+    PortScanStopped {
+        port_scan: PortScanRecord,
+    },
     PublicWorkflowRecorded {
         workflow: PublicWorkflowKind,
         record_id: i64,
@@ -2241,6 +2430,10 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub workers: Vec<WorkerRecord>,
     #[serde(default)]
+    pub worker_activity: Vec<WorkerActivitySnapshot>,
+    #[serde(default)]
+    pub worker_throughput_summary: Option<WorkerThroughputSummary>,
+    #[serde(default)]
     pub worker_pools: Vec<WorkerPoolRecord>,
     #[serde(default)]
     pub recent_worker_remote_commands: Vec<WorkerRemoteCommandRecord>,
@@ -2267,7 +2460,17 @@ pub struct DashboardSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScanDefaultsSummary {
     #[serde(default)]
+    pub request_engine_mode: RequestEngineMode,
+    #[serde(default)]
     pub concurrency: usize,
+    #[serde(default)]
+    pub probe_concurrency: usize,
+    #[serde(default)]
+    pub connect_timeout_secs: u64,
+    #[serde(default)]
+    pub probe_request_timeout_secs: u64,
+    #[serde(default)]
+    pub deep_request_timeout_secs: u64,
     #[serde(default)]
     pub request_timeout_secs: u64,
     #[serde(default)]
@@ -2276,6 +2479,10 @@ pub struct ScanDefaultsSummary {
     pub max_paths_per_target: usize,
     #[serde(default)]
     pub max_parallel_paths_per_target: usize,
+    #[serde(default)]
+    pub probe_max_concurrent_requests_per_host: usize,
+    #[serde(default)]
+    pub deep_max_concurrent_requests_per_host: usize,
     #[serde(default)]
     pub max_concurrent_requests_per_host: usize,
     #[serde(default)]

@@ -16,12 +16,15 @@ BUNDLED_ENV_SOURCE_FILE="${BUNDLED_ENV_SOURCE_FILE:-$BUNDLE_ROOT/env/runtime.env
 BUNDLED_ENV_INSTALLED_FILE="${BUNDLED_ENV_INSTALLED_FILE:-$CONFIG_DIR/runtime.env.bundle}"
 SYSTEMD_UNIT_SOURCE_FILE="${SYSTEMD_UNIT_SOURCE_FILE:-$BUNDLE_ROOT/systemd/agentd.service}"
 SYSTEMD_UNIT_DEST_FILE="${SYSTEMD_UNIT_DEST_FILE:-/etc/systemd/system/agentd.service}"
+AGENT_SERVICE_NAME="${AGENT_SERVICE_NAME:-$(basename "$SYSTEMD_UNIT_DEST_FILE")}"
 TOR_SYSTEMD_UNIT_SOURCE_FILE="${TOR_SYSTEMD_UNIT_SOURCE_FILE:-$BUNDLE_ROOT/systemd/agentd-tunnel.service}"
 TOR_SYSTEMD_UNIT_DEST_FILE="${TOR_SYSTEMD_UNIT_DEST_FILE:-/etc/systemd/system/agentd-tunnel.service}"
+TOR_SERVICE_NAME="${TOR_SERVICE_NAME:-$(basename "$TOR_SYSTEMD_UNIT_DEST_FILE")}"
 REMOTE_UPDATE_SYSTEMD_UNIT_SOURCE_FILE="${REMOTE_UPDATE_SYSTEMD_UNIT_SOURCE_FILE:-$BUNDLE_ROOT/systemd/agentd-remote-update.service}"
 REMOTE_UPDATE_SYSTEMD_UNIT_DEST_FILE="${REMOTE_UPDATE_SYSTEMD_UNIT_DEST_FILE:-/etc/systemd/system/agentd-remote-update.service}"
 REMOTE_UPDATE_PATH_SOURCE_FILE="${REMOTE_UPDATE_PATH_SOURCE_FILE:-$BUNDLE_ROOT/systemd/agentd-remote-update.path}"
 REMOTE_UPDATE_PATH_DEST_FILE="${REMOTE_UPDATE_PATH_DEST_FILE:-/etc/systemd/system/agentd-remote-update.path}"
+REMOTE_UPDATE_PATH_UNIT_NAME="${REMOTE_UPDATE_PATH_UNIT_NAME:-$(basename "$REMOTE_UPDATE_PATH_DEST_FILE")}"
 SERVICE_USER="${SERVICE_USER:-agentd}"
 SERVICE_GROUP="${SERVICE_GROUP:-agentd}"
 TOR_RUNTIME_SOURCE_DIR="${TOR_RUNTIME_SOURCE_DIR:-$BUNDLE_ROOT/tor}"
@@ -52,6 +55,10 @@ AGENT_BINARY_DEST_FILE="${AGENT_BINARY_DEST_FILE:-$BIN_DIR/agentd}"
 REMOTE_UPDATE_HELPER_SOURCE_FILE="${REMOTE_UPDATE_HELPER_SOURCE_FILE:-$BUNDLE_ROOT/bin/agentd-remote-update.sh}"
 REMOTE_UPDATE_HELPER_DEST_FILE="${REMOTE_UPDATE_HELPER_DEST_FILE:-$BIN_DIR/agentd-remote-update.sh}"
 DEFAULT_REMOTE_UPDATE_INSTALLER_URL="${DEFAULT_REMOTE_UPDATE_INSTALLER_URL:-}"
+INSTALL_CONTROL_URL_OVERRIDE="${INSTALL_CONTROL_URL_OVERRIDE:-}"
+INSTALL_MANAGEMENT_URL_OVERRIDE="${INSTALL_MANAGEMENT_URL_OVERRIDE:-}"
+INSTALL_CONTROL_PROXY_URL_OVERRIDE_SET="${INSTALL_CONTROL_PROXY_URL_OVERRIDE+set}"
+INSTALL_CONTROL_PROXY_URL_OVERRIDE="${INSTALL_CONTROL_PROXY_URL_OVERRIDE:-}"
 
 print_banner() {
     printf '═══════════════════════════════════════════════════════════\n'
@@ -95,6 +102,150 @@ env_value() {
     local file="$2"
     [ -f "$file" ] || return 1
     awk -F= -v key="$key" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$file"
+}
+
+detect_host_cpu_threads() {
+    local value
+    if command_exists nproc; then
+        value="$(nproc 2>/dev/null || true)"
+    elif command_exists getconf; then
+        value="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+    elif command_exists sysctl; then
+        value="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+    else
+        value=""
+    fi
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+        printf '%s\n' "$value"
+    else
+        printf '1\n'
+    fi
+}
+
+detect_host_default_interface() {
+    local value
+    if command_exists ip; then
+        value="$(ip route show default 2>/dev/null | awk 'NF { for (i=1; i<=NF; i++) if ($i == "dev" && (i+1) <= NF) { print $(i+1); exit } }' || true)"
+    fi
+    if [ -z "${value:-}" ] && [ -r /proc/net/route ]; then
+        value="$(awk 'NR > 1 && $2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null || true)"
+    fi
+    value="$(printf '%s' "${value:-}" | tr -d '[:space:]')"
+    if [ -n "$value" ]; then
+        printf '%s\n' "$value"
+    fi
+}
+
+resolve_preferred_scanner_bin() {
+    local existing_value bundled_value
+    existing_value="$(env_value "SCANNER_BIN" "$RUNTIME_ENV_FILE" || true)"
+    bundled_value="$VULNSCANNER_BIN_DEST"
+
+    if [ -n "$existing_value" ] && [ "$existing_value" != "$bundled_value" ] && [ -x "$existing_value" ]; then
+        printf '%s\n' "$existing_value"
+        return
+    fi
+
+    if [ -x /usr/bin/scanner ]; then
+        printf '/usr/bin/scanner\n'
+        return
+    fi
+
+    if [ -x "$bundled_value" ]; then
+        printf '%s\n' "$bundled_value"
+        return
+    fi
+}
+
+apply_host_resource_defaults() {
+    local cpu_threads="$1"
+    local default_interface preferred_scanner_bin
+
+    default_interface="$(detect_host_default_interface || true)"
+    preferred_scanner_bin="$(resolve_preferred_scanner_bin || true)"
+
+    if [ -z "$(env_value "AGENT_MAX_ACTIVE_TASKS" "$RUNTIME_ENV_FILE" || true)" ]; then
+        upsert_env_value "AGENT_MAX_ACTIVE_TASKS" "$cpu_threads" "$RUNTIME_ENV_FILE"
+    fi
+
+    if [ -z "$(env_value "AGENT_CONCURRENCY" "$RUNTIME_ENV_FILE" || true)" ]; then
+        upsert_env_value "AGENT_CONCURRENCY" "$cpu_threads" "$RUNTIME_ENV_FILE"
+    fi
+
+    if [ -x "$VULNSCANNER_BIN_DEST" ]; then
+        if [ -z "$(env_value "SCANNER_DEFAULT_RATE" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "SCANNER_DEFAULT_RATE" "0" "$RUNTIME_ENV_FILE"
+        fi
+        if [ -z "$(env_value "SCANNER_SENDER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "SCANNER_SENDER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
+        fi
+        if [ -z "$(env_value "SCANNER_RECEIVER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "SCANNER_RECEIVER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
+        fi
+        if [ -n "$preferred_scanner_bin" ]; then
+            upsert_env_value "SCANNER_BIN" "$preferred_scanner_bin" "$RUNTIME_ENV_FILE"
+        fi
+        if [ -z "$(env_value "SCANNER_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
+            upsert_env_value "SCANNER_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
+        fi
+    fi
+}
+
+detect_existing_install() {
+    [ -x "$AGENT_BINARY_DEST_FILE" ] \
+        || [ -f "$RUNTIME_ENV_FILE" ] \
+        || [ -f "$AGENT_STATE_FILE" ] \
+        || [ -f "$SYSTEMD_UNIT_DEST_FILE" ]
+}
+
+preserve_existing_identity() {
+    local existing_agent_id existing_agent_name existing_agent_token
+    existing_agent_id="$(env_value "AGENT_ID" "$RUNTIME_ENV_FILE" || true)"
+    existing_agent_name="$(env_value "AGENT_NAME" "$RUNTIME_ENV_FILE" || true)"
+    existing_agent_token="$(env_value "AGENT_TOKEN" "$AGENT_STATE_FILE" || true)"
+
+    if [ -n "$existing_agent_id" ]; then
+        upsert_env_value "AGENT_ID" "$existing_agent_id" "$RUNTIME_ENV_FILE"
+    fi
+    if [ -n "$existing_agent_name" ]; then
+        upsert_env_value "AGENT_NAME" "$existing_agent_name" "$RUNTIME_ENV_FILE"
+    fi
+
+    if [ -n "$existing_agent_token" ]; then
+        remove_env_value "AGENT_BOOTSTRAP_CODE" "$RUNTIME_ENV_FILE"
+        remove_env_value "AGENT_BOOTSTRAP_CODE_OBFUSCATED" "$RUNTIME_ENV_FILE"
+        remove_env_value "AGENT_BOOTSTRAP_CODE_OBFUSCATION" "$RUNTIME_ENV_FILE"
+    fi
+}
+
+restart_managed_services() {
+    local existing_install="$1"
+
+    if [ "$AUTO_ENABLE_SERVICES" != "true" ]; then
+        return 0
+    fi
+
+    if runtime_env_requires_tor && [ -f "$TOR_SYSTEMD_UNIT_DEST_FILE" ]; then
+        printf '[*] %s bundled network proxy...\n' "$([ "$existing_install" = "true" ] && printf 'Restarting' || printf 'Enabling and starting')"
+        systemctl enable --now "$TOR_SERVICE_NAME"
+        systemctl restart "$TOR_SERVICE_NAME"
+    fi
+
+    if [ -f "$REMOTE_UPDATE_PATH_DEST_FILE" ]; then
+        printf '[*] %s %s for remote self-updates...\n' \
+            "$([ "$existing_install" = "true" ] && printf 'Restarting' || printf 'Enabling and starting')" \
+            "$REMOTE_UPDATE_PATH_UNIT_NAME"
+        systemctl enable --now "$REMOTE_UPDATE_PATH_UNIT_NAME"
+        systemctl restart "$REMOTE_UPDATE_PATH_UNIT_NAME" || true
+    fi
+
+    if [ -f "$SYSTEMD_UNIT_DEST_FILE" ]; then
+        printf '[*] %s %s...\n' \
+            "$([ "$existing_install" = "true" ] && printf 'Restarting' || printf 'Enabling and starting')" \
+            "$AGENT_SERVICE_NAME"
+        systemctl enable --now "$AGENT_SERVICE_NAME"
+        systemctl restart "$AGENT_SERVICE_NAME"
+    fi
 }
 
 materialize_runtime_env() {
@@ -234,6 +385,7 @@ enable_bundled_tor_service() {
 
 main() {
     print_banner
+    local existing_install="false"
 
     if [ "$EUID" -ne 0 ]; then
         printf '[!] Please run as root.\n' >&2
@@ -243,6 +395,11 @@ main() {
     if [ ! -f "$AGENT_BINARY_SOURCE_FILE" ]; then
         printf '[!] Missing agent binary at %s\n' "$AGENT_BINARY_SOURCE_FILE" >&2
         exit 1
+    fi
+
+    if detect_existing_install; then
+        existing_install="true"
+        printf '[*] Existing agent installation detected; applying in-place update.\n'
     fi
 
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -305,16 +462,36 @@ main() {
     fi
 
     printf '[*] Updating agent runtime env defaults in %s...\n' "$RUNTIME_ENV_FILE"
+    local bundled_bundle_name
+    local cpu_threads
+    cpu_threads="$(detect_host_cpu_threads)"
+    bundled_bundle_name="$(env_value "AGENT_BUNDLE_NAME" "$BUNDLED_ENV_SOURCE_FILE" || true)"
     upsert_env_value "EXTENSION_MANIFEST_PATHS" "$extension_manifests" "$RUNTIME_ENV_FILE"
     upsert_env_value "ARTIFACT_DIR" "$BOOTSTRAP_ARTIFACT_DIR" "$RUNTIME_ENV_FILE"
     upsert_env_value "AGENT_STATE_FILE" "$AGENT_STATE_FILE" "$RUNTIME_ENV_FILE"
+    if [ -n "$bundled_bundle_name" ]; then
+        upsert_env_value "AGENT_BUNDLE_NAME" "$bundled_bundle_name" "$RUNTIME_ENV_FILE"
+    fi
+    if [ -n "$INSTALL_CONTROL_URL_OVERRIDE" ]; then
+        upsert_env_value "CONTROL_URL" "$INSTALL_CONTROL_URL_OVERRIDE" "$RUNTIME_ENV_FILE"
+    fi
     local management_url
-    management_url="$(env_value "AGENT_MANAGEMENT_URL" "$RUNTIME_ENV_FILE" || true)"
+    management_url="$INSTALL_MANAGEMENT_URL_OVERRIDE"
+    if [ -z "$management_url" ]; then
+        management_url="$(env_value "AGENT_MANAGEMENT_URL" "$RUNTIME_ENV_FILE" || true)"
+    fi
     if [ -z "$management_url" ]; then
         management_url="$(env_value "CONTROL_URL" "$RUNTIME_ENV_FILE" || true)"
     fi
     if [ -n "$management_url" ]; then
         upsert_env_value "AGENT_MANAGEMENT_URL" "$management_url" "$RUNTIME_ENV_FILE"
+    fi
+    if [ -n "$INSTALL_CONTROL_PROXY_URL_OVERRIDE_SET" ]; then
+        if [ -n "$INSTALL_CONTROL_PROXY_URL_OVERRIDE" ]; then
+            upsert_env_value "CONTROL_PROXY_URL" "$INSTALL_CONTROL_PROXY_URL_OVERRIDE" "$RUNTIME_ENV_FILE"
+        else
+            remove_env_value "CONTROL_PROXY_URL" "$RUNTIME_ENV_FILE"
+        fi
     fi
     upsert_env_value "AGENT_REMOTE_UPDATE_ENABLED" "true" "$RUNTIME_ENV_FILE"
     upsert_env_value "AGENT_REMOTE_UPDATE_REQUEST_FILE" "$REMOTE_UPDATE_REQUEST_FILE" "$RUNTIME_ENV_FILE"
@@ -337,6 +514,12 @@ main() {
             exit 1
         fi
         upsert_env_value "CONTROL_PROXY_URL" "$TOR_SOCKS_PROXY_URL" "$RUNTIME_ENV_FILE"
+    fi
+
+    apply_host_resource_defaults "$cpu_threads"
+
+    if [ "$existing_install" = "true" ]; then
+        preserve_existing_identity
     fi
 
     chown root:"$SERVICE_GROUP" "$CONFIG_DIR" "$RUNTIME_ENV_FILE" "$RUNTIME_ENV_TEMPLATE_FILE"
@@ -372,13 +555,7 @@ main() {
     if [ -f "$SYSTEMD_UNIT_DEST_FILE" ] || [ -f "$TOR_SYSTEMD_UNIT_DEST_FILE" ] || [ -f "$REMOTE_UPDATE_SYSTEMD_UNIT_DEST_FILE" ] || [ -f "$REMOTE_UPDATE_PATH_DEST_FILE" ]; then
         systemctl daemon-reload
     fi
-    if [ "$AUTO_ENABLE_SERVICES" = "true" ] && runtime_env_requires_tor; then
-        enable_bundled_tor_service
-    fi
-    if [ "$AUTO_ENABLE_SERVICES" = "true" ] && [ -f "$REMOTE_UPDATE_PATH_DEST_FILE" ]; then
-        printf '[*] Enabling %s for remote self-updates...\n' "$(basename "$REMOTE_UPDATE_PATH_DEST_FILE")"
-        systemctl enable --now "$(basename "$REMOTE_UPDATE_PATH_DEST_FILE")"
-    fi
+    restart_managed_services "$existing_install"
 
     printf '\nInstall complete.\n\n'
     printf 'Installed files:\n'
@@ -410,12 +587,19 @@ main() {
     if [ -f "$REMOTE_UPDATE_PATH_DEST_FILE" ]; then
         printf '  update path unit: %s\n' "$REMOTE_UPDATE_PATH_DEST_FILE"
     fi
-    printf '\nNext steps:\n'
-    printf '  1. Start manually for validation:\n'
-    printf '       set -a && source %s && set +a && %s daemon\n' "$RUNTIME_ENV_FILE" "$AGENT_BINARY_DEST_FILE"
-    printf '  2. Or run it as a service:\n'
-    printf '       systemctl enable --now %s\n' "$(basename "$SYSTEMD_UNIT_DEST_FILE")"
-    printf '  3. Review %s only if you want to override the preset control URL, agent id, pool, tags, or proxy.\n' "$RUNTIME_ENV_FILE"
+    if [ "$existing_install" = "true" ]; then
+        printf '\nUpdate summary:\n'
+        printf '  Existing worker identity and persisted token were preserved when present.\n'
+        printf '  Managed services were reloaded/restarted in place.\n'
+        printf '  Review %s only if you want to override the current control URL, agent id, pool, tags, or proxy.\n' "$RUNTIME_ENV_FILE"
+    else
+        printf '\nNext steps:\n'
+        printf '  1. Start manually for validation:\n'
+        printf '       set -a && source %s && set +a && %s daemon\n' "$RUNTIME_ENV_FILE" "$AGENT_BINARY_DEST_FILE"
+        printf '  2. Or run it as a service:\n'
+        printf '       systemctl enable --now %s\n' "$AGENT_SERVICE_NAME"
+        printf '  3. Review %s only if you want to override the preset control URL, agent id, pool, tags, or proxy.\n' "$RUNTIME_ENV_FILE"
+    fi
 }
 
 main "$@"

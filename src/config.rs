@@ -6,8 +6,8 @@ use std::{
 
 use crate::core::{
     ArchiveBackendKind, ExtensionKind, ExtensionManifest, GobusterTargetConfig, OperatorRecord,
-    OperatorRole, PortScanRequest, RepositoryDefinition, ScanDefaultsSummary, TargetDefinition,
-    normalize_request_profile_name, sanitize_paths,
+    OperatorRole, PortScanRequest, RepositoryDefinition, RequestEngineMode, ScanDefaultsSummary,
+    TargetDefinition, normalize_request_profile_name, sanitize_paths,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -128,11 +128,18 @@ pub struct RequestProfileSecretRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScanConfig {
+    pub request_engine_mode: RequestEngineMode,
     pub concurrency: usize,
+    pub probe_concurrency: usize,
+    pub connect_timeout_secs: u64,
+    pub probe_request_timeout_secs: u64,
+    pub deep_request_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub max_response_bytes: usize,
     pub max_paths_per_target: usize,
     pub max_parallel_paths_per_target: usize,
+    pub probe_max_concurrent_requests_per_host: usize,
+    pub deep_max_concurrent_requests_per_host: usize,
     pub max_concurrent_requests_per_host: usize,
     pub enable_path_discovery: bool,
     pub max_discovered_paths_per_target: usize,
@@ -342,11 +349,18 @@ impl Default for ArchiveConfig {
 impl Default for ScanConfig {
     fn default() -> Self {
         Self {
+            request_engine_mode: RequestEngineMode::Staged,
             concurrency: 16,
+            probe_concurrency: 64,
+            connect_timeout_secs: 3,
+            probe_request_timeout_secs: 3,
+            deep_request_timeout_secs: 10,
             request_timeout_secs: 10,
             max_response_bytes: 256 * 1024,
             max_paths_per_target: 32,
             max_parallel_paths_per_target: 4,
+            probe_max_concurrent_requests_per_host: 16,
+            deep_max_concurrent_requests_per_host: 4,
             max_concurrent_requests_per_host: 4,
             enable_path_discovery: true,
             max_discovered_paths_per_target: 12,
@@ -2053,6 +2067,24 @@ impl AppConfig {
                 "scan.request_timeout_secs must be greater than zero"
             ));
         }
+        if self.scan.probe_request_timeout_secs == 0 {
+            return Err(anyhow!(
+                "scan.probe_request_timeout_secs must be greater than zero"
+            ));
+        }
+        if self.scan.deep_request_timeout_secs == 0 {
+            return Err(anyhow!(
+                "scan.deep_request_timeout_secs must be greater than zero"
+            ));
+        }
+        if self.scan.connect_timeout_secs == 0 {
+            return Err(anyhow!(
+                "scan.connect_timeout_secs must be greater than zero"
+            ));
+        }
+        if self.scan.probe_concurrency == 0 {
+            return Err(anyhow!("scan.probe_concurrency must be greater than zero"));
+        }
 
         if self.scan.max_response_bytes < 4096 {
             return Err(anyhow!(
@@ -2075,6 +2107,16 @@ impl AppConfig {
         if self.scan.max_concurrent_requests_per_host == 0 {
             return Err(anyhow!(
                 "scan.max_concurrent_requests_per_host must be greater than zero"
+            ));
+        }
+        if self.scan.probe_max_concurrent_requests_per_host == 0 {
+            return Err(anyhow!(
+                "scan.probe_max_concurrent_requests_per_host must be greater than zero"
+            ));
+        }
+        if self.scan.deep_max_concurrent_requests_per_host == 0 {
+            return Err(anyhow!(
+                "scan.deep_max_concurrent_requests_per_host must be greater than zero"
             ));
         }
 
@@ -2401,11 +2443,22 @@ impl AppConfig {
 
     pub fn scan_defaults_summary(&self) -> ScanDefaultsSummary {
         ScanDefaultsSummary {
+            request_engine_mode: self.scan.request_engine_mode,
             concurrency: self.scan.concurrency,
+            probe_concurrency: self.scan.probe_concurrency,
+            connect_timeout_secs: self.scan.connect_timeout_secs,
+            probe_request_timeout_secs: self.scan.probe_request_timeout_secs,
+            deep_request_timeout_secs: self.scan.deep_request_timeout_secs,
             request_timeout_secs: self.scan.request_timeout_secs,
             max_response_bytes: self.scan.max_response_bytes,
             max_paths_per_target: self.scan.max_paths_per_target,
             max_parallel_paths_per_target: self.scan.max_parallel_paths_per_target,
+            probe_max_concurrent_requests_per_host: self
+                .scan
+                .probe_max_concurrent_requests_per_host,
+            deep_max_concurrent_requests_per_host: self
+                .scan
+                .deep_max_concurrent_requests_per_host,
             max_concurrent_requests_per_host: self.scan.max_concurrent_requests_per_host,
             enable_path_discovery: self.scan.enable_path_discovery,
             max_discovered_paths_per_target: self.scan.max_discovered_paths_per_target,
@@ -2426,11 +2479,20 @@ impl AppConfig {
 
     pub fn with_scan_defaults_summary(&self, summary: &ScanDefaultsSummary) -> Result<Self> {
         let mut config = self.clone();
+        config.scan.request_engine_mode = summary.request_engine_mode;
         config.scan.concurrency = summary.concurrency;
+        config.scan.probe_concurrency = summary.probe_concurrency;
+        config.scan.connect_timeout_secs = summary.connect_timeout_secs;
+        config.scan.probe_request_timeout_secs = summary.probe_request_timeout_secs;
+        config.scan.deep_request_timeout_secs = summary.deep_request_timeout_secs;
         config.scan.request_timeout_secs = summary.request_timeout_secs;
         config.scan.max_response_bytes = summary.max_response_bytes;
         config.scan.max_paths_per_target = summary.max_paths_per_target;
         config.scan.max_parallel_paths_per_target = summary.max_parallel_paths_per_target;
+        config.scan.probe_max_concurrent_requests_per_host =
+            summary.probe_max_concurrent_requests_per_host;
+        config.scan.deep_max_concurrent_requests_per_host =
+            summary.deep_max_concurrent_requests_per_host;
         config.scan.max_concurrent_requests_per_host = summary.max_concurrent_requests_per_host;
         config.scan.enable_path_discovery = summary.enable_path_discovery;
         config.scan.max_discovered_paths_per_target = summary.max_discovered_paths_per_target;
@@ -2685,11 +2747,13 @@ impl AppConfig {
                     .as_deref()
                     .and_then(normalize_worker_pool_name)
                     .or_else(|| worker_pool.clone()),
+                selection_mode: request.follow_on_run_policy.selection_mode,
             }
         } else {
             crate::core::PortScanFollowOnRunPolicy {
                 enabled: false,
                 worker_pool: None,
+                selection_mode: request.follow_on_run_policy.selection_mode,
             }
         };
 
@@ -2698,7 +2762,17 @@ impl AppConfig {
             ports: normalized_ports,
             schemes: request.schemes,
             tags,
-            rate_limit: request.rate_limit.max(DEFAULT_PORT_SCAN_RATE_LIMIT),
+            rate_limit: if request.rate_limit == 0 {
+                0
+            } else {
+                request.rate_limit.max(DEFAULT_PORT_SCAN_RATE_LIMIT)
+            },
+            scanner_sender_threads: request
+                .scanner_sender_threads
+                .filter(|value| *value > 0),
+            scanner_receiver_threads: request
+                .scanner_receiver_threads
+                .filter(|value| *value > 0),
             worker_pool,
             bootstrap_policy,
             follow_on_run_policy,
@@ -3123,14 +3197,13 @@ mod tests {
     };
 
     use crate::core::{
-        GobusterTargetConfig, PortScanRequest, RepositoryDefinition, ScanDefaultsSummary,
-        TargetDefinition, TargetStrategy,
+        GobusterTargetConfig, PortScanRequest, RepositoryDefinition, RequestEngineMode,
+        ScanDefaultsSummary, TargetDefinition, TargetStrategy,
     };
 
     use super::{
         AppConfig, DEFAULT_ANYSCAN_REDIS_DB, DEFAULT_ANYSCAN_REDIS_KEY_PREFIX,
-        DEFAULT_PORT_SCAN_RATE_LIMIT, RequestProfileConfig, RequestProfileSecretRef,
-        parse_port_scan_ports,
+        RequestProfileConfig, RequestProfileSecretRef, parse_port_scan_ports,
     };
 
     fn write_temp_anygpt_api_env(contents: &str) -> PathBuf {
@@ -3699,6 +3772,8 @@ mod tests {
                 schemes: crate::core::PortScanSchemePolicy::Both,
                 tags: vec!["Edge".to_string(), "edge".to_string(), "Prod".to_string()],
                 rate_limit: 0,
+                scanner_sender_threads: Some(8),
+                scanner_receiver_threads: Some(4),
                 worker_pool: Some(" Core-Scanners ".to_string()),
                 bootstrap_policy: crate::core::WorkerBootstrapPolicy {
                     enabled: true,
@@ -3708,6 +3783,7 @@ mod tests {
                 follow_on_run_policy: crate::core::PortScanFollowOnRunPolicy {
                     enabled: true,
                     worker_pool: None,
+                    selection_mode: crate::core::PortScanFollowOnSelectionMode::Both,
                 },
             })
             .expect("port scan request should normalize");
@@ -3715,7 +3791,9 @@ mod tests {
         assert_eq!(normalized.target_range, "10.0.0.5-10.0.0.9");
         assert_eq!(normalized.ports, "80,443");
         assert_eq!(normalized.tags, vec!["edge", "prod"]);
-        assert_eq!(normalized.rate_limit, DEFAULT_PORT_SCAN_RATE_LIMIT);
+        assert_eq!(normalized.rate_limit, 0);
+        assert_eq!(normalized.scanner_sender_threads, Some(8));
+        assert_eq!(normalized.scanner_receiver_threads, Some(4));
         assert_eq!(normalized.worker_pool.as_deref(), Some("core-scanners"));
         assert!(normalized.bootstrap_policy.enabled);
         assert_eq!(
@@ -3728,13 +3806,21 @@ mod tests {
             normalized.follow_on_run_policy.worker_pool.as_deref(),
             Some("core-scanners")
         );
+        assert_eq!(
+            normalized.follow_on_run_policy.selection_mode,
+            crate::core::PortScanFollowOnSelectionMode::Both
+        );
     }
 
+    // The WIP that landed in PR #3 originally bypassed the port-scan
+    // inventory allowlists (target_range and per-port). Restored on review;
+    // the two tests below cover the rejection behavior the bypass had elided.
     #[test]
-    fn normalize_port_scan_request_rejects_disallowed_ranges() {
+    fn normalize_port_scan_request_rejects_target_range_outside_inventory_allowlists() {
         let mut config = AppConfig::default();
         config.inventory.allowed_host_suffixes.clear();
         config.inventory.allowed_cidrs = vec!["10.0.0.0/24".to_string()];
+        config.inventory.allowed_ports = vec![80];
         config.validate().expect("config should validate");
 
         let error = config
@@ -3744,16 +3830,50 @@ mod tests {
                 schemes: crate::core::PortScanSchemePolicy::Auto,
                 tags: Vec::new(),
                 rate_limit: 10,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
                 worker_pool: None,
                 bootstrap_policy: Default::default(),
                 follow_on_run_policy: Default::default(),
             })
-            .expect_err("disallowed range should be rejected");
+            .expect_err("out-of-allowlist target_range must be rejected");
 
         assert!(
             error
                 .to_string()
-                .contains("port scan target_range 10.0.1.0/24 is outside inventory allowlists")
+                .contains("target_range 10.0.1.0/24 is outside inventory allowlists"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn normalize_port_scan_request_rejects_port_outside_inventory_allowlists() {
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes.clear();
+        config.inventory.allowed_cidrs = vec!["10.0.0.0/24".to_string()];
+        config.inventory.allowed_ports = vec![80];
+        config.validate().expect("config should validate");
+
+        let error = config
+            .normalize_port_scan_request(PortScanRequest {
+                target_range: "10.0.0.5".to_string(),
+                ports: "8080".to_string(),
+                schemes: crate::core::PortScanSchemePolicy::Auto,
+                tags: Vec::new(),
+                rate_limit: 10,
+                scanner_sender_threads: None,
+                scanner_receiver_threads: None,
+                worker_pool: None,
+                bootstrap_policy: Default::default(),
+                follow_on_run_policy: Default::default(),
+            })
+            .expect_err("out-of-allowlist port must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("port 8080 is outside inventory.allowed_ports"),
+            "unexpected error: {error}"
         );
     }
 
@@ -3874,11 +3994,18 @@ mod tests {
         let config = AppConfig::default();
         let updated = config
             .with_scan_defaults_summary(&ScanDefaultsSummary {
+                request_engine_mode: RequestEngineMode::Staged,
                 concurrency: 2,
+                probe_concurrency: 32,
+                connect_timeout_secs: 3,
+                probe_request_timeout_secs: 2,
+                deep_request_timeout_secs: 5,
                 request_timeout_secs: 5,
                 max_response_bytes: 65_536,
                 max_paths_per_target: 12,
                 max_parallel_paths_per_target: 2,
+                probe_max_concurrent_requests_per_host: 8,
+                deep_max_concurrent_requests_per_host: 1,
                 max_concurrent_requests_per_host: 1,
                 enable_path_discovery: false,
                 max_discovered_paths_per_target: 4,
@@ -3897,6 +4024,7 @@ mod tests {
             .expect("scan settings should produce a valid config");
 
         assert_eq!(updated.scan.concurrency, 2);
+        assert_eq!(updated.scan.connect_timeout_secs, 3);
         assert_eq!(updated.scan.max_parallel_paths_per_target, 2);
         assert!(!updated.scan.enable_path_discovery);
         assert!(updated.scan.gobuster.enabled);
@@ -3905,6 +4033,19 @@ mod tests {
         assert!(updated.scan.gobuster.add_slash);
         assert!(updated.scan.gobuster.discover_backup);
         assert!(updated.scan.allow_active_authorized_execution);
+    }
+
+    #[test]
+    fn scan_connect_timeout_must_be_positive() {
+        let mut config = AppConfig::default();
+        config.scan.connect_timeout_secs = 0;
+        let error = config
+            .validate()
+            .expect_err("zero connect timeout should fail validation");
+        assert!(
+            error.to_string()
+                .contains("scan.connect_timeout_secs must be greater than zero")
+        );
     }
 
     #[test]

@@ -12,10 +12,11 @@ use crate::{
         AppConfig, GobusterConfig, InventoryConfig, ProxyMode, ScanConfig, resolve_scan_proxy_url,
     },
     core::{
-        FetchTelemetry, GobusterTargetConfig, TargetRecord, merge_coverage_source_stat,
-        merge_coverage_source_stats, normalize_request_profile_name, sanitize_paths,
-        sort_coverage_source_stats,
+        FetchTelemetry, GobusterTargetConfig, RequestEngineMode, TargetRecord,
+        merge_coverage_source_stat, merge_coverage_source_stats, normalize_request_profile_name,
+        sanitize_paths, sort_coverage_source_stats,
     },
+    request_probe::{ProbeConfig, ProbeResponse, probe_url},
 };
 use anyhow::{Context, Result, anyhow};
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -67,7 +68,8 @@ pub struct Fetcher {
     inventory: InventoryConfig,
     scan: ScanConfig,
     gobuster: GobusterConfig,
-    host_throttles: Arc<HostThrottleRegistry>,
+    deep_host_throttles: Arc<HostThrottleRegistry>,
+    probe_host_throttles: Arc<HostThrottleRegistry>,
 }
 
 #[derive(Debug, Default)]
@@ -106,7 +108,7 @@ struct ResponseBaseline {
 struct FetchPathOutcome {
     path: String,
     telemetry: FetchTelemetry,
-    result: Result<ResponseSnapshot>,
+    result: Result<Option<ResponseSnapshot>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -252,7 +254,8 @@ impl Fetcher {
             inventory: config.inventory.clone(),
             scan: config.scan.clone(),
             gobuster: config.scan.gobuster.clone(),
-            host_throttles: Arc::new(HostThrottleRegistry::default()),
+            deep_host_throttles: Arc::new(HostThrottleRegistry::default()),
+            probe_host_throttles: Arc::new(HostThrottleRegistry::default()),
         })
     }
 
@@ -385,17 +388,18 @@ impl Fetcher {
 
         let control_probe_path = build_control_probe_path(target);
         let control_baseline = self
-            .fetch_path(
+            .fetch_path_deep(
                 base_url.clone(),
                 control_probe_path.clone(),
                 true,
                 String::new(),
                 Arc::clone(&request_profile),
+                false,
             )
             .await;
         merge_fetch_telemetry(&mut report.telemetry, &control_baseline.telemetry);
         let (control_similarity_key, control_baseline_signature) = match control_baseline.result {
-            Ok(snapshot) => {
+            Ok(Some(snapshot)) => {
                 if control_probe_indicates_catch_all(&snapshot.document) {
                     let host_hash = hashed_target_host_identifier(&base_url);
                     info!(
@@ -417,6 +421,12 @@ impl Fetcher {
                         body_len: snapshot.document.body.len(),
                     }),
                 )
+            }
+            Ok(None) => {
+                report
+                    .errors
+                    .push(format!("control probe {} returned no usable response", control_probe_path));
+                (None, None)
             }
             Err(error) => {
                 report
@@ -476,10 +486,10 @@ impl Fetcher {
                 let base_url = base_url.clone();
                 let request_profile = Arc::clone(&request_profile);
                 in_flight.push(async move {
-                    (
-                        path_depth,
-                        fetcher
-                            .fetch_path(
+                        (
+                            path_depth,
+                            fetcher
+                            .fetch_path_for_engine(
                                 base_url,
                                 scheduled.path,
                                 false,
@@ -498,7 +508,7 @@ impl Fetcher {
             merge_fetch_telemetry(&mut report.telemetry, &outcome.telemetry);
 
             match outcome.result {
-                Ok(snapshot) => {
+                Ok(Some(snapshot)) => {
                     if !snapshot.textual {
                         continue;
                     }
@@ -585,6 +595,7 @@ impl Fetcher {
                     report.telemetry.documents_scanned += 1;
                     report.documents.push(snapshot.document);
                 }
+                Ok(None) => {}
                 Err(error) => {
                     report
                         .errors
@@ -606,7 +617,7 @@ impl Fetcher {
         Ok(report)
     }
 
-    async fn fetch_path(
+    async fn fetch_path_for_engine(
         &self,
         base_url: Url,
         path: String,
@@ -614,12 +625,56 @@ impl Fetcher {
         coverage_source: String,
         request_profile: Arc<ResolvedRequestProfile>,
     ) -> FetchPathOutcome {
+        if is_control_request {
+            return self
+                .fetch_path_deep(
+                    base_url,
+                    path,
+                    true,
+                    coverage_source,
+                    request_profile,
+                    false,
+                )
+                .await;
+        }
+
+        match self.scan.request_engine_mode {
+            RequestEngineMode::DeepOnly => {
+                self.fetch_path_deep(
+                    base_url,
+                    path,
+                    false,
+                    coverage_source,
+                    request_profile,
+                    true,
+                )
+                .await
+            }
+            RequestEngineMode::ProbeOnly => {
+                self.fetch_path_probe_only(base_url, path, coverage_source).await
+            }
+            RequestEngineMode::Staged => {
+                self.fetch_path_staged(base_url, path, coverage_source, request_profile)
+                    .await
+            }
+        }
+    }
+
+    async fn fetch_path_deep(
+        &self,
+        base_url: Url,
+        path: String,
+        is_control_request: bool,
+        coverage_source: String,
+        request_profile: Arc<ResolvedRequestProfile>,
+        count_requested_path: bool,
+    ) -> FetchPathOutcome {
         let mut telemetry = FetchTelemetry {
             request_count: 0,
             control_requests: if is_control_request { 1 } else { 0 },
             ..FetchTelemetry::default()
         };
-        if !is_control_request {
+        if !is_control_request && count_requested_path {
             merge_coverage_source_stat(
                 &mut telemetry.coverage_sources,
                 &coverage_source,
@@ -633,7 +688,7 @@ impl Fetcher {
 
         let result: Result<ResponseSnapshot> = async {
             let url = build_target_fetch_url(&base_url, &path)?;
-            let host_throttle = self.host_throttle_for_url(&url).await;
+            let host_throttle = self.deep_host_throttle_for_url(&url).await;
             let _host_permit = host_throttle.acquire().await?;
             host_throttle.wait_until_ready().await;
 
@@ -738,7 +793,84 @@ impl Fetcher {
         FetchPathOutcome {
             path,
             telemetry,
-            result,
+            result: result.map(Some),
+        }
+    }
+
+    async fn fetch_path_probe_only(
+        &self,
+        base_url: Url,
+        path: String,
+        coverage_source: String,
+    ) -> FetchPathOutcome {
+        let mut telemetry = FetchTelemetry {
+            request_count: 0,
+            ..FetchTelemetry::default()
+        };
+        merge_coverage_source_stat(
+            &mut telemetry.coverage_sources,
+            &coverage_source,
+            0,
+            1,
+            0,
+            0,
+            0,
+        );
+
+        let result = self
+            .probe_path(&base_url, &path, &coverage_source, &mut telemetry)
+            .await;
+        FetchPathOutcome { path, telemetry, result }
+    }
+
+    async fn fetch_path_staged(
+        &self,
+        base_url: Url,
+        path: String,
+        coverage_source: String,
+        request_profile: Arc<ResolvedRequestProfile>,
+    ) -> FetchPathOutcome {
+        let mut probe_telemetry = FetchTelemetry {
+            request_count: 0,
+            ..FetchTelemetry::default()
+        };
+        merge_coverage_source_stat(
+            &mut probe_telemetry.coverage_sources,
+            &coverage_source,
+            0,
+            1,
+            0,
+            0,
+            0,
+        );
+        match self
+            .probe_path(&base_url, &path, &coverage_source, &mut probe_telemetry)
+            .await
+        {
+            Ok(Some(_probe_placeholder)) => {
+                let mut deep_outcome = self
+                    .fetch_path_deep(
+                        base_url,
+                        path.clone(),
+                        false,
+                        coverage_source,
+                        request_profile,
+                        false,
+                    )
+                    .await;
+                merge_fetch_telemetry(&mut deep_outcome.telemetry, &probe_telemetry);
+                deep_outcome
+            }
+            Ok(None) => FetchPathOutcome {
+                path,
+                telemetry: probe_telemetry,
+                result: Ok(None),
+            },
+            Err(error) => FetchPathOutcome {
+                path,
+                telemetry: probe_telemetry,
+                result: Err(error),
+            },
         }
     }
 
@@ -781,16 +913,169 @@ impl Fetcher {
         }
     }
 
-    async fn host_throttle_for_url(&self, url: &Url) -> Arc<HostThrottle> {
+    async fn deep_host_throttle_for_url(&self, url: &Url) -> Arc<HostThrottle> {
         let key = host_throttle_key(url);
-        let mut entries = self.host_throttles.entries.lock().await;
+        let mut entries = self.deep_host_throttles.entries.lock().await;
         Arc::clone(entries.entry(key).or_insert_with(|| {
             Arc::new(HostThrottle::new(
-                self.scan.max_concurrent_requests_per_host,
+                self.scan.deep_max_concurrent_requests_per_host.max(1),
                 Duration::from_millis(self.scan.host_backoff_initial_ms),
                 Duration::from_millis(self.scan.host_backoff_max_ms),
             ))
         }))
+    }
+
+    async fn probe_host_throttle_for_url(&self, url: &Url) -> Arc<HostThrottle> {
+        let key = host_throttle_key(url);
+        let mut entries = self.probe_host_throttles.entries.lock().await;
+        Arc::clone(entries.entry(key).or_insert_with(|| {
+            Arc::new(HostThrottle::new(
+                self.scan.probe_max_concurrent_requests_per_host.max(1),
+                Duration::from_millis(self.scan.host_backoff_initial_ms),
+                Duration::from_millis(self.scan.host_backoff_max_ms),
+            ))
+        }))
+    }
+
+    async fn probe_path(
+        &self,
+        base_url: &Url,
+        path: &str,
+        coverage_source: &str,
+        telemetry: &mut FetchTelemetry,
+    ) -> Result<Option<ResponseSnapshot>> {
+        let url = build_target_fetch_url(base_url, path)?;
+        let host_throttle = self.probe_host_throttle_for_url(&url).await;
+        let _host_permit = host_throttle.acquire().await?;
+        host_throttle.wait_until_ready().await;
+
+        let transports = self.transport_attempts();
+        if transports.is_empty() {
+            return Err(anyhow!(
+                "no fetch transport is available for proxy mode {}",
+                self.scan.proxy_mode.as_str()
+            ));
+        }
+
+        let mut errors = Vec::new();
+        for transport in transports {
+            telemetry.request_count += 1;
+            let result = match transport {
+                FetchTransport::Direct => {
+                    let request_timeout =
+                        Duration::from_secs(self.scan.probe_request_timeout_secs);
+                    let config = ProbeConfig {
+                        connect_timeout: Duration::from_secs(self.scan.connect_timeout_secs),
+                        tls_handshake_timeout: request_timeout,
+                        write_timeout: request_timeout,
+                        read_timeout: request_timeout,
+                        per_connection_timeout: request_timeout * 4,
+                        user_agent: self.scan.user_agent.clone(),
+                        allow_invalid_tls: self.scan.allow_invalid_tls,
+                        extra_headers: Vec::new(),
+                    };
+                    let host = match url.host_str() {
+                        Some(host) => host.to_string(),
+                        None => {
+                            errors.push(format!(
+                                "{} probe failed for {}: URL has no host",
+                                transport.as_str(),
+                                url
+                            ));
+                            continue;
+                        }
+                    };
+                    let port = match url.port_or_known_default() {
+                        Some(port) => port,
+                        None => {
+                            errors.push(format!(
+                                "{} probe failed for {}: URL has no port",
+                                transport.as_str(),
+                                url
+                            ));
+                            continue;
+                        }
+                    };
+                    let is_https = url.scheme() == "https";
+                    let path_and_query = match url.query() {
+                        Some(query) => format!("{}?{}", url.path(), query),
+                        None => url.path().to_string(),
+                    };
+                    probe_url(&host, port, is_https, &path_and_query, &config)
+                        .await
+                        .map_err(anyhow::Error::from)
+                }
+                FetchTransport::Proxy => {
+                    let Some(client) = self.proxy_client.as_ref() else {
+                        continue;
+                    };
+                    match client.head(url.clone()).send().await {
+                        Ok(response) => {
+                            let status = response.status().as_u16();
+                            let headers = response
+                                .headers()
+                                .iter()
+                                .filter_map(|(name, value)| {
+                                    value.to_str().ok().map(|value| {
+                                        (name.as_str().to_string(), value.to_string())
+                                    })
+                                })
+                                .collect::<Vec<_>>();
+                            Ok(ProbeResponse {
+                                status,
+                                headers,
+                                server_closed: false,
+                            })
+                        }
+                        Err(error) => Err(anyhow!(error)),
+                    }
+                }
+            };
+
+            match result {
+                Ok(response) => {
+                    host_throttle.record_status(response.status).await;
+                    if !probe_response_is_usable(&response) {
+                        return Ok(None);
+                    }
+                    let content_type = response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.clone());
+                    return Ok(Some(ResponseSnapshot {
+                        document: FetchedDocument {
+                            path: path.to_string(),
+                            url: url.to_string(),
+                            status: response.status,
+                            content_type,
+                            headers: response.headers,
+                            body: String::new(),
+                            truncated: false,
+                            coverage_source: coverage_source.to_string(),
+                        },
+                        textual: false,
+                        similarity_key: None,
+                    }));
+                }
+                Err(error) => {
+                    host_throttle.record_transport_error().await;
+                    telemetry.request_error_count += 1;
+                    errors.push(format!(
+                        "{} probe failed for {}: {}",
+                        transport.as_str(),
+                        url,
+                        error
+                    ));
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(None)
+        } else {
+            Err(anyhow!(errors.join("; ")))
+        }
     }
 
     fn resolve_request_profile(&self, target: &TargetRecord) -> Result<ResolvedRequestProfile> {
@@ -933,12 +1218,15 @@ impl Fetcher {
     }
 }
 
-fn build_http_client(scan: &ScanConfig, proxy_url: Option<&str>) -> Result<Client> {
+pub fn build_http_client(scan: &ScanConfig, proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
         .danger_accept_invalid_certs(scan.allow_invalid_tls)
         .redirect(redirect::Policy::none())
-        .timeout(Duration::from_secs(scan.request_timeout_secs))
+        .connect_timeout(Duration::from_secs(scan.connect_timeout_secs))
+        .timeout(Duration::from_secs(scan.deep_request_timeout_secs))
         .user_agent(scan.user_agent.clone())
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(scan.deep_max_concurrent_requests_per_host.max(1))
         .no_proxy();
 
     if let Some(proxy_url) = proxy_url {
@@ -948,6 +1236,10 @@ fn build_http_client(scan: &ScanConfig, proxy_url: Option<&str>) -> Result<Clien
     }
 
     builder.build().context("failed to build reqwest client")
+}
+
+fn probe_response_is_usable(response: &ProbeResponse) -> bool {
+    (200..600).contains(&response.status)
 }
 
 fn apply_request_profile(
@@ -3732,7 +4024,10 @@ mod tests {
     };
     use crate::{
         config::{AppConfig, ProxyMode, RequestProfileConfig, RequestProfileSecretRef},
-        core::{CoverageSourceStat, DiscoveryProvenanceRecord, TargetRecord, TargetStrategy},
+        core::{
+            CoverageSourceStat, DiscoveryProvenanceRecord, RequestEngineMode, TargetRecord,
+            TargetStrategy,
+        },
     };
 
     static TEST_ENV_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -4480,6 +4775,7 @@ paths:
         config.scan.max_paths_per_target = 1;
         config.scan.enable_path_discovery = false;
         config.scan.allow_authenticated_request_profiles = true;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let header_env = unique_test_env_key("ANYSCAN_RUNTIME_TEST_HEADER");
         let cookie_env = unique_test_env_key("ANYSCAN_RUNTIME_TEST_COOKIE");
         let token_env = unique_test_env_key("ANYSCAN_RUNTIME_TEST_TOKEN");
@@ -4618,6 +4914,7 @@ paths:
         config.scan.max_discovered_paths_per_target = 1;
         config.scan.enable_path_discovery = false;
         config.scan.proxy_mode = ProxyMode::DirectOnly;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let target = TargetRecord {
             id: 13,
             label: "direct-only".to_string(),
@@ -4657,6 +4954,7 @@ paths:
         config.scan.enable_path_discovery = false;
         config.scan.proxy_mode = ProxyMode::ProxyThenDirect;
         config.scan.proxy_url = Some("http://127.0.0.1:9".to_string());
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         config
             .validate()
             .expect("proxy fallback config should validate");
@@ -4982,6 +5280,7 @@ paths:
         config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
         config.scan.max_paths_per_target = 4;
         config.scan.max_discovered_paths_per_target = 3;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target = TargetRecord {
             id: 1,
@@ -5058,6 +5357,7 @@ paths:
         config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
         config.scan.max_paths_per_target = 3;
         config.scan.max_discovered_paths_per_target = 1;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
         let fetcher = Fetcher::new(&config).expect("fetcher should build");
         let target = TargetRecord {
             id: 1,
