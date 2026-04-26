@@ -1845,6 +1845,27 @@ async fn worker_control(
                 )
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         },
+        WorkerControlRequest::AppendPortScanFollowOnRunId {
+            port_scan_id,
+            run_id,
+        } => WorkerControlResponse::OptionalPortScan {
+            port_scan: state
+                .store
+                .append_port_scan_follow_on_run_id_if_owned(
+                    port_scan_id,
+                    &envelope.worker_id,
+                    run_id,
+                )
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+        },
+        WorkerControlRequest::CountActiveJobsForRuns { run_ids } => {
+            WorkerControlResponse::ActiveJobCount {
+                active_jobs: state
+                    .store
+                    .count_active_jobs_for_runs(&run_ids)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+            }
+        }
         WorkerControlRequest::FailPortScanIfOwned {
             port_scan_id,
             notes,

@@ -194,6 +194,13 @@ pub enum WorkerControlRequest {
         queued_run_id: Option<i64>,
         notes: Option<String>,
     },
+    AppendPortScanFollowOnRunId {
+        port_scan_id: i64,
+        run_id: i64,
+    },
+    CountActiveJobsForRuns {
+        run_ids: Vec<i64>,
+    },
     FailPortScanIfOwned {
         port_scan_id: i64,
         notes: Option<String>,
@@ -320,6 +327,9 @@ pub enum WorkerControlResponse {
     },
     OptionalRemoteCommand {
         command: Option<WorkerRemoteCommandRecord>,
+    },
+    ActiveJobCount {
+        active_jobs: u64,
     },
 }
 
@@ -674,6 +684,29 @@ impl AnyScanWorkerApiClient {
         })? {
             WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
             other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn append_port_scan_follow_on_run_id_if_owned(
+        &self,
+        port_scan_id: i64,
+        run_id: i64,
+    ) -> Result<Option<PortScanRecord>> {
+        match self.request(WorkerControlRequest::AppendPortScanFollowOnRunId {
+            port_scan_id,
+            run_id,
+        })? {
+            WorkerControlResponse::OptionalPortScan { port_scan } => Ok(port_scan),
+            other => Err(unexpected_worker_response("optional port scan", &other)),
+        }
+    }
+
+    pub fn count_active_jobs_for_runs(&self, run_ids: &[i64]) -> Result<u64> {
+        match self.request(WorkerControlRequest::CountActiveJobsForRuns {
+            run_ids: run_ids.to_vec(),
+        })? {
+            WorkerControlResponse::ActiveJobCount { active_jobs } => Ok(active_jobs),
+            other => Err(unexpected_worker_response("active job count", &other)),
         }
     }
 

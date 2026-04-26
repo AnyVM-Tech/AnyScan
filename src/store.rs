@@ -424,6 +424,16 @@ impl AnyScanStore {
         )
     }
 
+    pub fn append_port_scan_follow_on_run_id_if_owned(
+        &self,
+        port_scan_id: i64,
+        worker_id: &str,
+        run_id: i64,
+    ) -> Result<Option<PortScanRecord>> {
+        self.inner
+            .append_port_scan_follow_on_run_id_if_owned(port_scan_id, worker_id, run_id)
+    }
+
     pub fn fail_port_scan_if_owned(
         &self,
         port_scan_id: i64,
@@ -598,6 +608,10 @@ impl AnyScanStore {
 
     pub fn list_pending_jobs(&self, run_id: i64) -> Result<Vec<ScanJobRecord>> {
         self.inner.list_pending_jobs(run_id)
+    }
+
+    pub fn count_active_jobs_for_runs(&self, run_ids: &[i64]) -> Result<u64> {
+        self.inner.count_active_jobs_for_runs(run_ids)
     }
 
     pub fn record_finding(&self, finding: &NewFinding) -> Result<FindingRecord> {
