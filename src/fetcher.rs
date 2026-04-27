@@ -6669,4 +6669,78 @@ paths:
 
         server.abort();
     }
+
+    async fn spawn_modern_js_tech_fingerprint_test_server() -> (JoinHandle<()>, String) {
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Html(
+                    "<html><script id=\"__NEXT_DATA__\">{}</script>\
+                     <script src=\"/_next/static/chunks/main.js\"></script></html>",
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should stay available")
+        });
+
+        (handle, format!("http://{}", address))
+    }
+
+    #[tokio::test]
+    async fn modern_js_tech_fingerprint_emits_nextjs_paths_through_fetcher() {
+        let (server, base_url) = spawn_modern_js_tech_fingerprint_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        // Default for `enable_path_discovery` is true; set explicitly so the
+        // intent of this test is obvious to future readers.
+        config.scan.enable_path_discovery = true;
+        // Generous budget — the Next.js fingerprint emits 8 paths and each is
+        // also expanded into VCS-leak variants (`/_next/data/.git/HEAD` etc.)
+        // which sort ahead of the originals. We need enough headroom for the
+        // raw tech-nextjs candidates to survive the per-target cap.
+        config.scan.max_paths_per_target = 512;
+        config.scan.max_discovered_paths_per_target = 512;
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 99,
+            label: "modern-js-tech-fingerprint".to_string(),
+            base_url,
+            paths: vec!["/".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("modern-js fingerprint fetch should succeed");
+
+        assert!(
+            report
+                .discovered_paths
+                .iter()
+                .any(|candidate| candidate.path.starts_with("/_next/")
+                    && candidate.source == "tech-nextjs"),
+            "tech-nextjs follow-on should emit at least one /_next/... candidate; got {:?}",
+            report.discovered_paths,
+        );
+
+        server.abort();
+    }
 }

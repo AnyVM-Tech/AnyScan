@@ -59,6 +59,12 @@ pub enum TechFingerprint {
     Streamlit,
     Gradio,
     Airflow,
+    NextJs,
+    NuxtJs,
+    SvelteKit,
+    Astro,
+    Remix,
+    Vite,
 }
 
 impl TechFingerprint {
@@ -100,6 +106,12 @@ impl TechFingerprint {
             Self::Streamlit => "streamlit",
             Self::Gradio => "gradio",
             Self::Airflow => "airflow",
+            Self::NextJs => "nextjs",
+            Self::NuxtJs => "nuxtjs",
+            Self::SvelteKit => "sveltekit",
+            Self::Astro => "astro",
+            Self::Remix => "remix",
+            Self::Vite => "vite",
         }
     }
 
@@ -141,6 +153,12 @@ impl TechFingerprint {
             Self::Streamlit => "tech-streamlit",
             Self::Gradio => "tech-gradio",
             Self::Airflow => "tech-airflow",
+            Self::NextJs => "tech-nextjs",
+            Self::NuxtJs => "tech-nuxtjs",
+            Self::SvelteKit => "tech-sveltekit",
+            Self::Astro => "tech-astro",
+            Self::Remix => "tech-remix",
+            Self::Vite => "tech-vite",
         }
     }
 }
@@ -531,6 +549,56 @@ pub fn detect_tech_fingerprints(
         push_unique(&mut fingerprints, TechFingerprint::Airflow);
     }
 
+    // Next.js (React meta-framework). The `__NEXT_DATA__` script tag is
+    // emitted on every SSR/SSG page; `_next/static/chunks/` is the canonical
+    // bundler output prefix.
+    if lowered_body.contains("<script id=\"__next_data__\"")
+        || lowered_body.contains("_next/static/chunks/")
+        || lowered_path.starts_with("/_next/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::NextJs);
+    }
+
+    // Nuxt.js (Vue meta-framework).
+    if lowered_body.contains("window.__nuxt__=")
+        || lowered_body.contains("/_nuxt/entry.")
+        || lowered_path.starts_with("/_nuxt/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::NuxtJs);
+    }
+
+    // SvelteKit.
+    if lowered_body.contains("data-sveltekit-")
+        || lowered_body.contains("/_app/immutable/chunks/")
+        || lowered_path.starts_with("/_app/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::SvelteKit);
+    }
+
+    // Astro.
+    if lowered_body.contains("<astro-island")
+        || lowered_body.contains("/_astro/")
+        || lowered_path.starts_with("/_astro/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Astro);
+    }
+
+    // Remix.
+    if lowered_body.contains("window.__remixcontext=")
+        || lowered_body.contains("/build/manifest-")
+        || lowered_path.starts_with("/__remix/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Remix);
+    }
+
+    // Vite (dev server / build tool).
+    if lowered_body.contains("<script type=\"module\" src=\"/@vite/client")
+        || lowered_body.contains("__vite__")
+        || lowered_path.starts_with("/@vite/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Vite);
+    }
+
     fingerprints
 }
 
@@ -650,6 +718,12 @@ fn paths_for_fingerprint(fingerprint: TechFingerprint) -> &'static [TechPathEntr
         TechFingerprint::Streamlit => STREAMLIT_PATHS,
         TechFingerprint::Gradio => GRADIO_PATHS,
         TechFingerprint::Airflow => AIRFLOW_PATHS,
+        TechFingerprint::NextJs => NEXTJS_PATHS,
+        TechFingerprint::NuxtJs => NUXTJS_PATHS,
+        TechFingerprint::SvelteKit => SVELTEKIT_PATHS,
+        TechFingerprint::Astro => ASTRO_PATHS,
+        TechFingerprint::Remix => REMIX_PATHS,
+        TechFingerprint::Vite => VITE_PATHS,
     }
 }
 
@@ -1287,6 +1361,55 @@ const AIRFLOW_PATHS: &[TechPathEntry] = &[
     entry("/api/v1/users", 880),
 ];
 
+// Modern JS framework wordlists. These are bundler-output prefixes and
+// build-time manifests that frequently leak route maps, server payloads,
+// and source-mapped server bundles when shipped to production unstripped.
+const NEXTJS_PATHS: &[TechPathEntry] = &[
+    entry("/_next/data/", 860),
+    entry("/_next/image", 830),
+    entry("/_next/static/", 850),
+    entry("/_next/server/", 880),
+    entry("/_buildManifest.js", 870),
+    entry("/_ssgManifest.js", 870),
+    entry("/api/auth/session", 870),
+    entry("/_next/webpack-hmr", 840),
+];
+
+const NUXTJS_PATHS: &[TechPathEntry] = &[
+    entry("/_nuxt/", 850),
+    entry("/__nuxt_error", 870),
+    entry("/.nuxt/dist/client/manifest.json", 880),
+    entry("/api/_content/", 840),
+    entry("/api/_nuxt_island/", 830),
+];
+
+const SVELTEKIT_PATHS: &[TechPathEntry] = &[
+    entry("/.svelte-kit/", 880),
+    entry("/_app/version.json", 850),
+    entry("/_app/immutable/", 840),
+    entry("/__data.json", 870),
+];
+
+const ASTRO_PATHS: &[TechPathEntry] = &[
+    entry("/_astro/", 850),
+    entry("/_astro/page.", 830),
+    entry("/_image?href=", 830),
+];
+
+const REMIX_PATHS: &[TechPathEntry] = &[
+    entry("/__remix/", 860),
+    entry("/__manifest", 870),
+    entry("/build/", 840),
+    entry("/build/manifest-*.js", 850),
+];
+
+const VITE_PATHS: &[TechPathEntry] = &[
+    entry("/@vite/client", 880),
+    entry("/@vite/env", 870),
+    entry("/__vite_ping", 850),
+    entry("/.vite/manifest.json", 880),
+];
+
 // =====================================================================
 // Sensitive backup / VCS leakage variant generator (path -> variants).
 //
@@ -1625,6 +1748,48 @@ mod tests {
     fn empty_inputs_produce_no_fingerprints() {
         let fps = detect_tech_fingerprints("/", None, &[], "");
         assert!(fps.is_empty());
+    }
+
+    #[test]
+    fn detects_nextjs_from_next_data_script_tag() {
+        let body = r#"<html><script id="__NEXT_DATA__" type="application/json">{}</script></html>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::NextJs));
+    }
+
+    #[test]
+    fn detects_nuxtjs_from_window_nuxt_assignment() {
+        let body = r#"<script>window.__NUXT__={config:{}}</script>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::NuxtJs));
+    }
+
+    #[test]
+    fn detects_sveltekit_from_data_attributes() {
+        let body = r#"<body data-sveltekit-preload-data="hover"></body>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::SvelteKit));
+    }
+
+    #[test]
+    fn detects_astro_from_island_element() {
+        let body = r#"<astro-island uid="abc"></astro-island>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Astro));
+    }
+
+    #[test]
+    fn detects_remix_from_remix_context_assignment() {
+        let body = r#"<script>window.__remixContext={state:{loaderData:{}}}</script>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Remix));
+    }
+
+    #[test]
+    fn detects_vite_from_client_module_script() {
+        let body = r#"<script type="module" src="/@vite/client"></script>"#;
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Vite));
     }
 
     #[test]
