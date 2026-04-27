@@ -13,6 +13,11 @@ EnvironmentFile=-/etc/anyscan/runtime.env
 # reserve-control-bandwidth.sh for the qdisc/iptables design. The `+` prefix
 # runs the helper as root regardless of User=. The script fails-open.
 ExecStartPre=+/opt/anyscan/bin/reserve-control-bandwidth.sh apply
+# Bump kernel queues + NIC txqueuelen so the scanner is not throttled by
+# default sysctl values. Companion to the bandwidth reservation above; the
+# helper is idempotent and fails open. `+` runs as root so sysctl writes
+# bypass ProtectKernelTunables=true on this unit.
+ExecStartPre=+/opt/anyscan/bin/tune-scanner-host.sh apply
 ExecStopPost=+/opt/anyscan/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/anyscan/bin/anyscan-worker daemon
 Restart=always
