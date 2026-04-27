@@ -446,6 +446,9 @@
 			}
 
 			function resetWorkerTokenFormDefaults() {
+				if (!elements.workerTokenForm) {
+					return;
+				}
 				document.getElementById('worker-token-allow-runs').checked =
 					true;
 				document.getElementById(
@@ -459,6 +462,9 @@
 			}
 
 			function resetBootstrapApprovalFormDefaults() {
+				if (!elements.bootstrapApprovalForm) {
+					return;
+				}
 				document.getElementById('bootstrap-label').value = '';
 				document.getElementById('bootstrap-pool').value = '';
 				document.getElementById('bootstrap-tags').value = '';
@@ -470,12 +476,22 @@
 					false;
 				document.getElementById('bootstrap-single-use').checked = true;
 				document.getElementById('bootstrap-notes').value = '';
-				elements.bootstrapDispatchEnabled.checked = true;
-				elements.bootstrapDispatchProvisioner.value =
-					defaultBootstrapProvisionerName();
-				elements.bootstrapDispatchExecutorPool.value = '';
-				elements.bootstrapDispatchExecutorTags.value = '';
-				elements.bootstrapDispatchNotes.value = '';
+				if (elements.bootstrapDispatchEnabled) {
+					elements.bootstrapDispatchEnabled.checked = true;
+				}
+				if (elements.bootstrapDispatchProvisioner) {
+					elements.bootstrapDispatchProvisioner.value =
+						defaultBootstrapProvisionerName();
+				}
+				if (elements.bootstrapDispatchExecutorPool) {
+					elements.bootstrapDispatchExecutorPool.value = '';
+				}
+				if (elements.bootstrapDispatchExecutorTags) {
+					elements.bootstrapDispatchExecutorTags.value = '';
+				}
+				if (elements.bootstrapDispatchNotes) {
+					elements.bootstrapDispatchNotes.value = '';
+				}
 				syncBootstrapDispatchVisibility();
 			}
 
@@ -544,6 +560,9 @@
 				defaultTitle,
 				valueElement
 			) {
+				if (!panel || !titleElement || !valueElement) {
+					return;
+				}
 				panel.classList.add('hidden');
 				titleElement.textContent = defaultTitle;
 				valueElement.textContent = '';
@@ -556,6 +575,9 @@
 				valueElement,
 				secret
 			) {
+				if (!panel || !titleElement || !valueElement) {
+					return;
+				}
 				titleElement.textContent = title;
 				valueElement.textContent = secret || '';
 				panel.classList.toggle('hidden', !secret);
