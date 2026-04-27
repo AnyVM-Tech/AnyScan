@@ -334,6 +334,7 @@
     "detector": "log4j_opportunistic_marker",
     "body_regex": "(?i)\\$\\{(?:jndi:(?:ldap|ldaps|rmi|dns|nis|iiop|corba|nds|http|https):|(?:lower|upper|env|sys|date|java):[^}]+\\}\\s*\\$\\{jndi:)",
     "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "Log4JOpportunistic"
   },
   {
@@ -386,6 +387,7 @@
     "detector": "malware_http_indicator",
     "body_regex": "(?i)(?:<\\?php\\s+(?:eval|assert|system|passthru|shell_exec|base64_decode)\\s*\\(|c99shell|r57shell|wso\\s*shell|b374k\\s*shell|/cgi-bin/.*\\?cmd=|coinhive|cryptonight|stratum\\+tcp://)",
     "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "MalwareHttpPlugin"
   },
   {

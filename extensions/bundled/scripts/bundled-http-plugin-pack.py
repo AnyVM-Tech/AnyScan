@@ -183,7 +183,11 @@ def score_value(rule: dict[str, object], field: str, default: int = 1) -> int:
         return default
 
 
-DEFAULT_STATUS_IN: tuple[int, ...] = (200, 201, 202, 203, 204, 206)
+# Full 2xx range. RFC 9110 + WebDAV (RFC 4918) + IM Used (RFC 3229).
+# Includes 205 (Reset Content), 207 (Multi-Status), 208 (Already Reported),
+# 226 (IM Used) so rules without explicit status_in do not miss valid
+# successful responses on path/body matches.
+DEFAULT_STATUS_IN: tuple[int, ...] = (200, 201, 202, 203, 204, 205, 206, 207, 208, 226)
 DEFAULT_MIN_BODY_BYTES = 50
 
 
