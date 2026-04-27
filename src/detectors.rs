@@ -7636,6 +7636,51 @@ mod tests {
         );
     }
 
+    /// PHP exploit-marker rules must opt out of the default 2xx filter via
+    /// `status_in: []` — the markers commonly surface in 4xx/5xx error
+    /// responses (a misconfigured CGI returning 500 with `php-cgi` in the
+    /// body, or a 400 echoing back a `php://input` payload).
+    #[test]
+    fn bundled_php_exploit_rules_match_on_non_2xx_responses() {
+        let manifest = http_pack_manifest();
+
+        let php_cgi_500 = super::run_external_detector_pack(
+            &document_with_status("/cgi-bin/test.php", "php-cgi", 500),
+            &manifest,
+        )
+        .expect("php cgi 500 run");
+        assert!(
+            php_cgi_500
+                .iter()
+                .any(|finding| finding.detector == "php_cgi_rce_best_effort"),
+            "PhpCgiRcePlugin must fire on a 500 response with `php-cgi` body: {:?}",
+            php_cgi_500
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let php_stdin_400 = super::run_external_detector_pack(
+            &document_with_status(
+                "/upload.php",
+                "Error: php://input restricted",
+                400,
+            ),
+            &manifest,
+        )
+        .expect("php stdin 400 run");
+        assert!(
+            php_stdin_400
+                .iter()
+                .any(|finding| finding.detector == "php_stdin_best_effort"),
+            "PhpStdinPlugin must fire on a 400 response with php://input echo: {:?}",
+            php_stdin_400
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Plugins whose entire signature *is* a short JSON body must opt out of
     /// the 50-byte default floor with `min_body_bytes: 0`. A 28-byte GraphQL
     /// error envelope and a 25-byte WordPress user enum response are both

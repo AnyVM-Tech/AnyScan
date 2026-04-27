@@ -530,6 +530,7 @@
       "/cgi-bin/",
       ".php"
     ],
+    "status_in": [],
     "min_body_bytes": 0,
     "product_name": "PhpCgiRcePlugin"
   },
@@ -550,6 +551,7 @@
     "aliases": [],
     "detector": "php_stdin_best_effort",
     "body_regex": "(?i)(?:php://input|stdin|auto_prepend_file)",
+    "status_in": [],
     "min_body_bytes": 0,
     "product_name": "PhpStdinPlugin"
   },
