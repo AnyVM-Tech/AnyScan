@@ -73,6 +73,10 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+mod operator_pages {
+    include!("../operator_pages.rs");
+}
+
 const SESSION_COOKIE: &str = "anyscan_session";
 const HOSTED_AGENT_BUNDLE_OUTPUT_DIR: &str = "/var/lib/anyscan/agent-bundles";
 const HOSTED_AGENT_BUNDLE_BUILD_ROOT: &str = "/var/lib/anyscan/agent-bundle-build";
@@ -412,6 +416,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/", get(public_index))
         .route("/app", get(operator_app))
+        .route("/app/overview", get(operator_pages::operator_overview))
         .route("/scanning-policy", get(public_page))
         .route("/scanner-identity", get(public_page))
         .route("/opt-out", get(public_page))

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>AnyScan Operator</title>
+		<style>
+{shared_css}
+		</style>
+	</head>
+	<body>
+		<a class="skip-link" href="#main-content">Skip to main content</a>
+		<div class="shell">
+			<header class="hero">
+				<h1>AnyScan Control Plane</h1>
+				<p>
+					Private operator surface for owned-assets exposure auditing,
+					redacted findings, authenticated status streaming, and
+					resumable run history.
+				</p>
+			</header>
+
+			<section id="auth-card" class="card auth-card">
+				<h2>Sign in</h2>
+				<form id="login-form">
+					<label>
+						Username
+						<input
+							id="username"
+							name="username"
+							autocomplete="username"
+							required
+						/>
+					</label>
+					<label>
+						Password
+						<input
+							id="password"
+							name="password"
+							type="password"
+							autocomplete="current-password"
+							required
+						/>
+					</label>
+					<button type="submit" class="primary">Start session</button>
+					<p id="auth-error" class="error hidden"></p>
+				</form>
+			</section>
+
+			<main id="app" class="hidden">
+				<header class="appbar" id="appbar">
+					<div class="appbar__inner">
+						<a class="appbar__brand" href="#main-content" aria-label="AnyScan dashboard top">
+							<span class="appbar__brand-mark" aria-hidden="true">AS</span>
+							<span>
+								<span class="appbar__title">AnyScan</span>
+								<span class="appbar__subtitle">Control plane</span>
+							</span>
+						</a>
+						<button
+							id="appbar-nav-toggle"
+							class="nav-toggle"
+							type="button"
+							aria-expanded="false"
+							aria-controls="appbar-nav"
+						>
+							Sections
+						</button>
+						<nav
+							id="appbar-nav"
+							class="appbar__nav"
+							aria-label="Dashboard sections"
+						>
+{nav}
+						</nav>
+						<div class="appbar__status">
+							<div class="appbar__session">
+								<strong id="session-user">Authenticated</strong>
+								<span
+									id="connection-state"
+									role="status"
+									aria-live="polite"
+									>Waiting for dashboard data.</span
+								>
+							</div>
+							<div class="appbar__actions actions">
+								<button id="refresh-button" type="button">
+									Refresh
+								</button>
+								<button
+									id="queue-button"
+									type="button"
+									class="primary"
+								>
+									Queue run
+								</button>
+								<button
+									id="logout-button"
+									type="button"
+									class="danger"
+								>
+									Logout
+								</button>
+							</div>
+						</div>
+					</div>
+				</header>
+
+				<div id="main-content" tabindex="-1"></div>
+
+{body}
+			</main>
+		</div>
+		<script>
+{shared_js}
+{page_js}
+		</script>
+	</body>
+</html>
