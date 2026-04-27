@@ -186,6 +186,11 @@ const HOSTED_AGENT_BUNDLE_ASSETS: &[EmbeddedBundleAsset] = &[
         executable: true,
     },
     EmbeddedBundleAsset {
+        relative_path: "anyscan_rate_controller.py",
+        contents: include_bytes!("../../anyscan_rate_controller.py"),
+        executable: false,
+    },
+    EmbeddedBundleAsset {
         relative_path: "extensions/bundled/manifests/bundled-http-plugin-pack.json",
         contents: include_bytes!(
             "../../extensions/bundled/manifests/bundled-http-plugin-pack.json"
