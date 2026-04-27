@@ -126,6 +126,11 @@ const HOSTED_AGENT_BUNDLE_ASSETS: &[EmbeddedBundleAsset] = &[
         executable: true,
     },
     EmbeddedBundleAsset {
+        relative_path: "reserve-control-bandwidth.sh",
+        contents: include_bytes!("../../reserve-control-bandwidth.sh"),
+        executable: true,
+    },
+    EmbeddedBundleAsset {
         relative_path: "runtime.worker.env.template",
         contents: include_bytes!("../../runtime.worker.env.template"),
         executable: false,
