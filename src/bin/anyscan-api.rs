@@ -1727,11 +1727,23 @@ async fn worker_control(
         WorkerControlRequest::QueueRunWithEvent {
             requested_by,
             scope,
+            active_authorized_plugins,
         } => {
-            let run = state
-                .store
-                .queue_run(Some(&requested_by), scope.as_ref())
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
+            // Honor the explicit policy when the caller passed one (follow-on
+            // Runs synthesized from a parent port scan must inherit operator
+            // opt-in). When omitted, fall through to the safe default — the
+            // existing fail-closed behavior for ad-hoc queue paths.
+            let run = match active_authorized_plugins {
+                Some(policy) => state.store.queue_run_with_active_authorized_plugins(
+                    Some(&requested_by),
+                    scope.as_ref(),
+                    &policy,
+                ),
+                None => state
+                    .store
+                    .queue_run(Some(&requested_by), scope.as_ref()),
+            }
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
             let summary = state
                 .store
                 .summary(run.id)

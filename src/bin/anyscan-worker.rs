@@ -17,10 +17,10 @@ use anyhow::{Context, Result, anyhow};
 use anyscan::{
     config::{AppConfig, ProxyMode, parse_port_scan_ports, resolve_scan_proxy_url},
     core::{
-        ApiEvent, DiscoveryProvenanceRecord, ExtensionManifest, FetchTelemetry, NewFinding,
-        PortScanFollowOnSelectionMode, PortScanProtocolFindingRecord, PortScanRecord,
-        PortScanResumeStateRecord, PortScanSchemePolicy, RunScope, RunStatus, RunSummary,
-        ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
+        ActiveAuthorizedPluginExecution, ApiEvent, DiscoveryProvenanceRecord, ExtensionManifest,
+        FetchTelemetry, NewFinding, PortScanFollowOnSelectionMode, PortScanProtocolFindingRecord,
+        PortScanRecord, PortScanResumeStateRecord, PortScanSchemePolicy, RunScope, RunStatus,
+        RunSummary, ScanJobRecord, ScanRunRecord, Severity, TargetDefinition,
         WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord, WorkerBootstrapJobClaim,
         WorkerBootstrapJobRecord, WorkerRegistration, WorkerRemoteCommandRecord,
         WorkerRemoteUpdateStatus, merge_coverage_source_stat, normalize_run_scope,
@@ -389,7 +389,10 @@ async fn main() -> Result<()> {
                 worker_pool: None,
                 failed_only,
             }));
-            queue_run_with_event(&store, &requested_by, scope.as_ref())?;
+            // Ad-hoc operator queue path: no parent policy to inherit, so we
+            // pass None and the API handler falls back to the safe default
+            // (active_authorized fail-closed).
+            queue_run_with_event(&store, &requested_by, scope.as_ref(), None)?;
             info!(requested_by = %requested_by, has_scope = scope.is_some(), "queued run");
         }
         Command::Once => {
@@ -824,7 +827,8 @@ async fn run_once(
                     );
                     return Ok(());
                 }
-                queue_run_with_event(&store, "worker-once", None)?;
+                // worker-once path: no parent policy; default safe behavior.
+                queue_run_with_event(&store, "worker-once", None, None)?;
                 store
                     .claim_next_runnable_run(config.storage.redis_run_lease_seconds)?
                     .map(|run| run.id)
@@ -3836,9 +3840,25 @@ fn queue_follow_on_run_for_targets(
         worker_pool: port_scan.follow_on_run_policy.worker_pool.clone(),
         failed_only: false,
     }));
-    let run = queue_run_with_event(store, requested_by, scope.as_ref())?;
+    // Inherit the parent's authorization policy. Without this, the worker
+    // would queue the follow-on Run with the safe Default (false/false) and
+    // every active_authorized plugin would silently drop on hosts the
+    // operator already opted in to scanning. See follow_on_active_authorized_plugins.
+    let policy = follow_on_active_authorized_plugins(port_scan);
+    let run = queue_run_with_event(store, requested_by, scope.as_ref(), Some(&policy))?;
     let summary = store.summary(run.id)?;
     Ok(Some(QueuedFollowOnRun { run, summary }))
+}
+
+/// Returns the `ActiveAuthorizedPluginExecution` policy that a follow-on
+/// Run synthesized from `port_scan` should carry. Follow-on Runs cover
+/// hosts the operator already authorized via the parent port scan, so they
+/// inherit the parent's policy verbatim (rather than falling back to the
+/// fail-closed default that ad-hoc Runs use).
+fn follow_on_active_authorized_plugins(
+    port_scan: &PortScanRecord,
+) -> ActiveAuthorizedPluginExecution {
+    port_scan.active_authorized_plugins.clone()
 }
 
 fn join_notes(notes: &[String]) -> Option<String> {
@@ -5713,8 +5733,11 @@ fn queue_run_with_event(
     store: &AnyScanStore,
     requested_by: &str,
     scope: Option<&RunScope>,
+    active_authorized_plugins: Option<&ActiveAuthorizedPluginExecution>,
 ) -> Result<ScanRunRecord> {
-    Ok(store.queue_run_with_event(requested_by, scope)?.run)
+    Ok(store
+        .queue_run_with_event(requested_by, scope, active_authorized_plugins)?
+        .run)
 }
 
 fn load_effective_runtime_config(
@@ -5774,14 +5797,16 @@ mod tests {
         ScannerOutputCounter, WORKER_REGISTRATION_TTL_MULTIPLIER,
         apply_follow_on_selection_mode_to_targets, apply_inventory_policy_snapshot_to_config,
         derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
-        filter_endpoints_excluding_streamed, normalize_platform_architecture,
-        normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
-        parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
+        filter_endpoints_excluding_streamed, follow_on_active_authorized_plugins,
+        normalize_platform_architecture, normalize_platform_operating_system,
+        parse_endpoint_token, parse_ip_addr_show_output, parse_json_endpoint_lines,
+        scanner_target_range_for_adapter, should_push_resume_state,
         streaming_followon_should_flush, validated_target_tag,
         worker_registration_refresh_interval, worker_registration_ttl_seconds,
     };
     use anyscan::config::AppConfig;
-    use anyscan::core::TargetDefinition;
+    use anyscan::core::{ActiveAuthorizedPluginExecution, PortScanRecord, RunStatus, TargetDefinition};
+    use chrono::Utc;
     use std::collections::HashSet;
     use std::fs;
     use std::io::Write;
@@ -6541,6 +6566,93 @@ mod tests {
             interval,
             false
         ));
+    }
+
+    fn sample_port_scan_with_policy(policy: ActiveAuthorizedPluginExecution) -> PortScanRecord {
+        let now = Utc::now();
+        PortScanRecord {
+            id: 21,
+            shard_group_id: None,
+            aggregate_target_range: None,
+            shard_index: None,
+            shard_total: None,
+            requested_by: Some("operator".to_string()),
+            target_range: "10.0.0.0/24".to_string(),
+            ports: "80,443".to_string(),
+            schemes: Default::default(),
+            tags: Vec::new(),
+            rate_limit: 0,
+            scanner_sender_threads: None,
+            scanner_receiver_threads: None,
+            worker_pool: None,
+            bootstrap_policy: Default::default(),
+            follow_on_run_policy: Default::default(),
+            active_authorized_plugins: policy,
+            status: RunStatus::InProgress,
+            started_at: now,
+            completed_at: None,
+            discovered_endpoints_total: 0,
+            imported_targets_total: 0,
+            bootstrap_candidates_total: 0,
+            queued_run_id: None,
+            follow_on_run_ids: Vec::new(),
+            protocol_findings: Vec::new(),
+            current_probe_rate_millis: 0,
+            current_receive_rate_millis: 0,
+            current_progress_percent: None,
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn follow_on_active_authorized_plugins_inherits_parent_opt_in() {
+        // Regression for the streaming follow-on policy inversion: a parent
+        // port scan with operator-enabled active_authorized must propagate
+        // its policy to every Run synthesized from it. Without this, the 29
+        // active_authorized plugins (Geoserver RCE, Magento XXE, Log4J, etc.)
+        // silently drop on every host even though the operator opted in.
+        let parent = sample_port_scan_with_policy(ActiveAuthorizedPluginExecution {
+            global_gate_enabled: true,
+            request_opt_in_enabled: true,
+        });
+
+        let propagated = follow_on_active_authorized_plugins(&parent);
+
+        assert!(propagated.global_gate_enabled);
+        assert!(propagated.request_opt_in_enabled);
+        assert!(propagated.is_enabled());
+        assert_eq!(propagated, parent.active_authorized_plugins);
+    }
+
+    #[test]
+    fn follow_on_active_authorized_plugins_preserves_disabled_parent_policy() {
+        // Defense-in-depth: a parent that did NOT opt in must not
+        // accidentally start opting in via the follow-on path. The helper
+        // simply mirrors the parent — no upgrade, no downgrade.
+        let parent = sample_port_scan_with_policy(ActiveAuthorizedPluginExecution::default());
+
+        let propagated = follow_on_active_authorized_plugins(&parent);
+
+        assert!(!propagated.global_gate_enabled);
+        assert!(!propagated.request_opt_in_enabled);
+        assert!(!propagated.is_enabled());
+    }
+
+    #[test]
+    fn follow_on_active_authorized_plugins_preserves_partial_opt_in() {
+        // Partial opt-in (one flag set, the other not) must round-trip
+        // verbatim — both flags are required for `is_enabled()`, and the
+        // store records the exact pair the operator configured.
+        let parent = sample_port_scan_with_policy(ActiveAuthorizedPluginExecution {
+            global_gate_enabled: true,
+            request_opt_in_enabled: false,
+        });
+
+        let propagated = follow_on_active_authorized_plugins(&parent);
+
+        assert!(propagated.global_gate_enabled);
+        assert!(!propagated.request_opt_in_enabled);
+        assert!(!propagated.is_enabled());
     }
 
     #[test]
