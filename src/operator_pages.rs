@@ -1,0 +1,96 @@
+// Operator-console page rendering scaffolding.
+//
+// Pilot scope: ships the shared shell + the Overview page. Follower PRs will
+// add Targets/Runs/Workers/Findings/Catalog/Coverage by reusing `render_page`
+// and providing their own body/page_js partials.
+//
+// Templating uses plain `String::replace` rather than handlebars/tera —
+// `format!` is a poor fit because the embedded CSS and JS contain literal
+// `{`/`}` braces that would otherwise need escaping.
+
+use axum::response::Html;
+
+/// Render an operator page by injecting the shared CSS, nav, body partial,
+/// shared JS and page-specific JS into the shell template.
+pub fn render_page(active_nav: &str, body_partial: &str, page_js: &str) -> Html<String> {
+    let nav = render_nav(active_nav);
+    let html = include_str!("../templates/operator/shell.html")
+        .replace("{shared_css}", include_str!("../templates/operator/shared.css"))
+        .replace("{nav}", &nav)
+        .replace("{body}", body_partial)
+        .replace("{shared_js}", include_str!("../templates/operator/shared.js"))
+        .replace("{page_js}", page_js);
+    Html(html)
+}
+
+/// Render the appbar nav, marking the link whose `data-nav` matches `active`
+/// with `aria-current="page"`.
+fn render_nav(active: &str) -> String {
+    let template = include_str!("../templates/operator/nav.html");
+    let needle = format!("data-nav=\"{}\"", active);
+    template.replace(&needle, &format!("{} aria-current=\"page\"", needle))
+}
+
+pub async fn operator_overview() -> Html<String> {
+    render_page(
+        "overview",
+        include_str!("../templates/operator/overview.html"),
+        include_str!("../templates/operator/overview.js"),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::routing::get;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn operator_overview_serves_shell_and_overview_ids() {
+        let app = Router::new().route("/app/overview", get(operator_overview));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator overview test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator overview test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator overview test server should stay available");
+        });
+
+        let url = format!("http://{}/app/overview", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/overview should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator overview body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("id=\"summary-metrics\""),
+            "rendered body should contain the overview summary-metrics container"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn render_nav_marks_active_link() {
+        let nav = render_nav("overview");
+        assert!(nav.contains("data-nav=\"overview\" aria-current=\"page\""));
+        assert!(!nav.contains("data-nav=\"targets\" aria-current=\"page\""));
+    }
+}

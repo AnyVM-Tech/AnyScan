@@ -1,0 +1,307 @@
+				<h2 class="section-group-heading" id="section-overview">
+					<span>Overview</span>
+					<span class="section-group-hint">Latest run snapshot, timing breakdown, archive status, and probing defaults.</span>
+				</h2>
+
+				<section class="grid three-up">
+					<article class="card wide-card">
+						<h2>Latest run</h2>
+						<div class="metrics" id="summary-metrics"></div>
+					</article>
+					<article class="card wide-card">
+						<h2>Run timings</h2>
+						<div class="metrics" id="timing-metrics"></div>
+					</article>
+					<article class="card wide-card">
+						<h2>Add target</h2>
+						<form id="target-form">
+							<label>
+								Label
+								<input
+									id="target-label"
+									required
+									placeholder="Production API"
+								/>
+							</label>
+							<label>
+								Base URL
+								<input
+									id="target-base-url"
+									type="url"
+									required
+									placeholder="https://api.localhost:3000"
+								/>
+							</label>
+							<label>
+								Strategy
+								<select id="target-strategy">
+									<option value="hybrid" selected>
+										Hybrid
+									</option>
+									<option value="manual">Manual</option>
+									<option value="auto">Auto</option>
+								</select>
+							</label>
+							<label>
+								Paths (comma separated)
+								<input
+									id="target-paths"
+									placeholder="/.env, /config.json"
+								/>
+							</label>
+							<label>
+								Tags (comma separated)
+								<input
+									id="target-tags"
+									placeholder="prod, internal"
+								/>
+							</label>
+							<label>
+								Request profile (optional)
+								<input
+									id="target-request-profile"
+									placeholder="staging-cookie-auth"
+								/>
+							</label>
+							<div class="subtle-note">
+								Authenticated request profiles are disabled by
+								default for the public measurement surface. Only
+								enable them for explicitly authorized private
+								workflows.
+							</div>
+							<button type="submit">Save target</button>
+							<p id="target-error" class="error hidden"></p>
+						</form>
+					</article>
+				</section>
+
+				<section class="card wide-card">
+					<h2>Archive status</h2>
+					<div class="metrics" id="archive-metrics"></div>
+					<p id="archive-note" class="subtle-note">
+						Cold archive status will appear after the first dashboard
+						refresh.
+					</p>
+				</section>
+
+				<section class="card wide-card">
+					<h2>Directory probing defaults</h2>
+					<div id="gobuster-defaults-pills" class="pill-row"></div>
+					<p id="gobuster-defaults-note" class="subtle-note"></p>
+					<form id="scan-settings-form">
+						<div class="grid two-up">
+							<label>
+								Request engine mode
+								<select id="scan-request-engine-mode">
+									<option value="staged" selected>Staged</option>
+									<option value="probe_only">Probe only</option>
+									<option value="deep_only">Deep only</option>
+								</select>
+							</label>
+							<label>
+								Scan concurrency
+								<input
+									id="scan-concurrency"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Connect timeout (seconds)
+								<input
+									id="scan-connect-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Request timeout (seconds)
+								<input
+									id="scan-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe timeout (seconds)
+								<input
+									id="scan-probe-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Deep timeout (seconds)
+								<input
+									id="scan-deep-request-timeout-secs"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe concurrency
+								<input
+									id="scan-probe-concurrency"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Max response bytes
+								<input
+									id="scan-max-response-bytes"
+									type="number"
+									min="4096"
+									step="1024"
+								/>
+							</label>
+							<label>
+								Poll interval (seconds)
+								<input
+									id="scan-poll-interval-seconds"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Max paths per target
+								<input
+									id="scan-max-paths-per-target"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Max discovered paths per target
+								<input
+									id="scan-max-discovered-paths-per-target"
+									type="number"
+									min="0"
+									step="1"
+								/>
+							</label>
+							<label>
+								Max parallel paths per target
+								<input
+									id="scan-max-parallel-paths-per-target"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Probe requests per host
+								<input
+									id="scan-probe-max-concurrent-requests-per-host"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Deep requests per host
+								<input
+									id="scan-deep-max-concurrent-requests-per-host"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Max concurrent requests per host
+								<input
+									id="scan-max-concurrent-requests-per-host"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Host backoff initial (ms)
+								<input
+									id="scan-host-backoff-initial-ms"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+							<label>
+								Host backoff max (ms)
+								<input
+									id="scan-host-backoff-max-ms"
+									type="number"
+									min="1"
+									step="1"
+								/>
+							</label>
+						</div>
+						<div class="grid two-up">
+							<label class="toggle">
+								<input
+									id="scan-enable-path-discovery"
+									type="checkbox"
+								/>
+								Enable live path discovery
+							</label>
+							<label class="toggle">
+								<input
+									id="scan-allow-invalid-tls"
+									type="checkbox"
+								/>
+								Allow invalid TLS
+							</label>
+						</div>
+						<div class="subform">
+							<h3>Global directory probing</h3>
+							<label class="toggle">
+								<input
+									id="scan-directory-probing-enabled"
+									type="checkbox"
+								/>
+								Enable directory probing across all hosts
+							</label>
+							<label>
+								Global wordlist (comma separated)
+								<textarea
+									id="scan-directory-probing-wordlist"
+									placeholder="admin, api, debug"
+								></textarea>
+							</label>
+							<label>
+								Global extensions (comma separated)
+								<input
+									id="scan-directory-probing-extensions"
+									placeholder="php, json, js"
+								/>
+							</label>
+							<div class="grid two-up">
+								<label class="toggle">
+									<input
+										id="scan-directory-probing-add-slash"
+										type="checkbox"
+									/>
+									Add trailing slash variants
+								</label>
+								<label class="toggle">
+									<input
+										id="scan-directory-probing-discover-backup"
+										type="checkbox"
+									/>
+									Discover backup-style variants
+								</label>
+							</div>
+						</div>
+						<div class="actions">
+							<button type="submit">Save scan settings</button>
+						</div>
+						<p id="scan-settings-error" class="error hidden"></p>
+					</form>
+				</section>
