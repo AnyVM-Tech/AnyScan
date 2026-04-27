@@ -6373,4 +6373,119 @@ paths:
 
         server.abort();
     }
+
+    #[derive(Clone, Default)]
+    struct MobileArtifactsCapture {
+        hits: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_mobile_artifacts_test_server() -> (JoinHandle<()>, String, MobileArtifactsCapture)
+    {
+        async fn record_and_serve(
+            State(capture): State<MobileArtifactsCapture>,
+            path: &'static str,
+            body: &'static str,
+        ) -> ([(header::HeaderName, &'static str); 1], &'static str) {
+            capture.hits.lock().await.push(path.to_string());
+            ([(CONTENT_TYPE, "application/json")], body)
+        }
+
+        let capture = MobileArtifactsCapture::default();
+        let app = Router::new()
+            .route(
+                "/.well-known/apple-app-site-association",
+                get(|state| record_and_serve(
+                    state,
+                    "/.well-known/apple-app-site-association",
+                    "{\"applinks\":{\"apps\":[],\"details\":[{\"appID\":\"ABCD1234.com.example.app\",\"paths\":[\"*\"]}]}}",
+                )),
+            )
+            .route(
+                "/.well-known/assetlinks.json",
+                get(|state| record_and_serve(
+                    state,
+                    "/.well-known/assetlinks.json",
+                    "[{\"relation\":[\"delegate_permission/common.handle_all_urls\"],\"target\":{\"namespace\":\"android_app\",\"package_name\":\"com.example.app\"}}]",
+                )),
+            )
+            .route(
+                "/google-services.json",
+                get(|state| record_and_serve(
+                    state,
+                    "/google-services.json",
+                    "{\"project_info\":{\"project_id\":\"sample-12345\",\"project_number\":\"123\"}}",
+                )),
+            )
+            .with_state(capture.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mobile-artifacts listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("mobile-artifacts listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mobile-artifacts server should stay available")
+        });
+
+        (handle, format!("http://{}", address), capture)
+    }
+
+    #[tokio::test]
+    async fn mobile_artifacts_profile_fetches_aasa_and_assetlinks_through_fetcher() {
+        let (server, base_url, capture) = spawn_mobile_artifacts_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.inventory.default_paths.clear();
+        config.inventory.path_profiles = vec!["mobile-artifacts".to_string()];
+        config
+            .validate()
+            .expect("mobile-artifacts profile should validate");
+
+        config.scan.max_paths_per_target = 64;
+        config.scan.max_discovered_paths_per_target = 0;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 1,
+            label: "mobile-artifacts".to_string(),
+            base_url,
+            paths: Vec::new(),
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        fetcher
+            .fetch_target(&target)
+            .await
+            .expect("mobile-artifacts profile fetch should succeed");
+
+        let hits = capture.hits.lock().await;
+        assert!(
+            hits.iter()
+                .any(|path| path == "/.well-known/apple-app-site-association"),
+            "expected AASA hit, captured: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|path| path == "/.well-known/assetlinks.json"),
+            "expected assetlinks hit, captured: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|path| path == "/google-services.json"),
+            "expected google-services hit, captured: {hits:?}"
+        );
+
+        server.abort();
+    }
 }
