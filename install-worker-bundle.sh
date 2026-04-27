@@ -42,6 +42,7 @@ LOCAL_BOOTSTRAP_MANIFEST_DEST="$EXTENSIONS_DIR/bootstrap-provisioner.json"
 LOCAL_BOOTSTRAP_SCRIPT_DEST="$EXTENSIONS_DIR/bootstrap-provisioner.py"
 VULNSCANNER_MANIFEST_DEST="$EXTENSIONS_DIR/portscan-adapter.json"
 VULNSCANNER_SCRIPT_DEST="$EXTENSIONS_DIR/portscan-adapter.py"
+VULNSCANNER_RATE_CONTROLLER_DEST="$EXTENSIONS_DIR/anyscan_rate_controller.py"
 VULNSCANNER_BIN_DEST="$BIN_DIR/scanner"
 AGENT_STATE_FILE="$STATE_DIR/agent.env"
 REMOTE_UPDATE_REQUEST_FILE="${REMOTE_UPDATE_REQUEST_FILE:-$STATE_DIR/remote-update.request}"
@@ -184,17 +185,31 @@ apply_host_resource_defaults() {
         # for invocations from the worker, `rate_limit=0` means "no --rate
         # flag, scanner runs at its natural ceiling". The worker also reports
         # this value to the control plane as registration metadata so the
-        # control plane can pick a reasonable per-scan rate. 500k pps ×
-        # ~64-byte SYN ≈ 256 Mbit/s, well under the 1 Gbit ceiling that
-        # PR #28's reserve-control-bandwidth.sh sets for the bulk class —
-        # the tc reservation is the primary safety net for control-plane
-        # heartbeats, not this value. Bench on c6in.xlarge (4 vCPU) shows
-        # the bundled scanner sustains ~1.7M pps with sender_threads=4
-        # receivers=1 against an unreachable /24; operators can raise
-        # SCANNER_DEFAULT_RATE further if they have measured headroom. Set
-        # to 0 to disable the fallback (--rate flag omitted).
+        # control plane can pick a reasonable per-scan rate.
+        #
+        # With ANYSCAN_DYNAMIC_RATE_ENABLED=true (the installer default
+        # below) the adapter treats this as the AIMD seed rate when no
+        # calibration has been learned yet, ramping each worker toward its
+        # natural pps ceiling and persisting the learned value to
+        # /var/lib/agentd/rate-calibration.json so subsequent scans skip
+        # relearn. 500k pps × ~64-byte SYN ≈ 256 Mbit/s, well under the
+        # 1 Gbit ceiling that PR #28's reserve-control-bandwidth.sh sets
+        # for the bulk class — the tc reservation is the primary safety
+        # net for control-plane heartbeats, not this value. Bench on
+        # c6in.xlarge (4 vCPU) shows the bundled scanner sustains ~1.7M
+        # pps with sender_threads=4 receivers=1 against an unreachable
+        # /24; AIMD converges there from 500k in 3-4 windows. Operators
+        # can raise SCANNER_DEFAULT_RATE further if they have measured
+        # headroom. Set to 0 to disable the fallback (--rate flag omitted).
         if [ -z "$(env_value "SCANNER_DEFAULT_RATE" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "SCANNER_DEFAULT_RATE" "500000" "$RUNTIME_ENV_FILE"
+        fi
+        # AIMD dynamic rate adjustment is on by default. The static 500k
+        # above is well below the measured 1.76M pps ceiling on c6in.xlarge,
+        # so without AIMD new scans would leave most of the NIC unused;
+        # AIMD converges to the natural ceiling within a handful of windows.
+        if [ -z "$(env_value "ANYSCAN_DYNAMIC_RATE_ENABLED" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "ANYSCAN_DYNAMIC_RATE_ENABLED" "true" "$RUNTIME_ENV_FILE"
         fi
         if [ -z "$(env_value "SCANNER_SENDER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "SCANNER_SENDER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
@@ -496,6 +511,9 @@ main() {
     install -m 0755 "$BUNDLE_ROOT/extensions/bootstrap-provisioner.py" "$LOCAL_BOOTSTRAP_SCRIPT_DEST"
     install -m 0644 "$BUNDLE_ROOT/extensions/portscan-adapter.json" "$VULNSCANNER_MANIFEST_DEST"
     install -m 0755 "$BUNDLE_ROOT/extensions/portscan-adapter.py" "$VULNSCANNER_SCRIPT_DEST"
+    if [ -f "$BUNDLE_ROOT/extensions/anyscan_rate_controller.py" ]; then
+        install -m 0644 "$BUNDLE_ROOT/extensions/anyscan_rate_controller.py" "$VULNSCANNER_RATE_CONTROLLER_DEST"
+    fi
     cp -R "$BUNDLE_ROOT/extensions/bundled/manifests/." "$EXTENSIONS_DIR/bundled/manifests/"
     cp -R "$BUNDLE_ROOT/extensions/bundled/rules/." "$EXTENSIONS_DIR/bundled/rules/"
     cp -R "$BUNDLE_ROOT/extensions/bundled/scripts/." "$EXTENSIONS_DIR/bundled/scripts/"

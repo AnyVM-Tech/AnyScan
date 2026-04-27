@@ -14,6 +14,15 @@ import tempfile
 import threading
 from pathlib import Path
 
+# AIMD dynamic-rate controller. Imported lazily so the legacy single-spawn
+# code path keeps working in environments where the controller module is
+# missing (e.g. older bundles deployed before this change).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    import anyscan_rate_controller as rate_controller  # type: ignore  # noqa: E402
+except ImportError:  # pragma: no cover - bundle missing the module
+    rate_controller = None  # type: ignore[assignment]
+
 HOST_CPU_THREADS = max(1, os.cpu_count() or 1)
 # Last-resort fallback when neither the per-scan invocation nor the
 # SCANNER_DEFAULT_RATE env var supplies a rate. install-worker-bundle.sh
@@ -128,7 +137,20 @@ def resolve_scanner_binary() -> Path:
     )
 
 
-def build_command(invocation: dict[str, object], output_path: Path) -> list[str]:
+def resolve_rate_limit(invocation: dict[str, object]) -> int:
+    rate_limit = invocation.get("rate_limit")
+    if not isinstance(rate_limit, int):
+        rate_limit = max(1, env_int("SCANNER_DEFAULT_RATE", DEFAULT_RATE_LIMIT))
+    return rate_limit
+
+
+def build_command(
+    invocation: dict[str, object],
+    output_path: Path,
+    *,
+    rate_override: int | None = None,
+    resume_override: bool | None = None,
+) -> list[str]:
     scanner_binary = resolve_scanner_binary()
     target_range = normalize_target_range_for_scanner(
         require_string(invocation, "target_range")
@@ -137,9 +159,7 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
     probe_module = env_string("SCANNER_PROBE_MODULE") or "tcp"
     cooldown = max(0, env_int("SCANNER_COOLDOWN_SECONDS", DEFAULT_COOLDOWN_SECONDS))
 
-    rate_limit = invocation.get("rate_limit")
-    if not isinstance(rate_limit, int):
-        rate_limit = max(1, env_int("SCANNER_DEFAULT_RATE", DEFAULT_RATE_LIMIT))
+    rate_limit = rate_override if rate_override is not None else resolve_rate_limit(invocation)
     sender_threads = invocation.get("sender_threads")
     if not isinstance(sender_threads, int) or sender_threads <= 0:
         sender_threads = max(1, env_int("SCANNER_SENDER_THREADS", DEFAULT_SENDER_THREADS))
@@ -167,7 +187,8 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
     checkpoint_path = invocation.get("checkpoint_path")
     if isinstance(checkpoint_path, str) and checkpoint_path.strip():
         command.extend(["--checkpoint-file", checkpoint_path.strip()])
-    if bool(invocation.get("resume")):
+    resume = resume_override if resume_override is not None else bool(invocation.get("resume"))
+    if resume:
         command.append("--resume")
     if rate_limit > 0:
         command.extend(["--rate", str(rate_limit)])
@@ -194,6 +215,24 @@ def build_command(invocation: dict[str, object], output_path: Path) -> list[str]
         command.extend(shlex.split(extra_args))
 
     return command
+
+
+def detect_default_interface() -> str | None:
+    explicit = env_string("SCANNER_INTERFACE")
+    if explicit:
+        return explicit
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as handle:
+            for line in handle.readlines()[1:]:
+                fields = line.split()
+                if len(fields) < 11:
+                    continue
+                # Destination==00000000 means the default route entry.
+                if fields[1] == "00000000" and (int(fields[3], 16) & 0x2):
+                    return fields[0]
+    except OSError:
+        return None
+    return None
 
 
 def progress_path_for_output(output_path: Path) -> Path:
@@ -376,6 +415,174 @@ def handle_termination(signum: int, _frame: object) -> "None":
     raise SystemExit(128 + signum)
 
 
+def _set_current_child(child: subprocess.Popen[bytes] | None) -> None:
+    global CURRENT_CHILD
+    CURRENT_CHILD = child
+
+
+def run_static_scanner(
+    invocation: dict[str, object],
+    output_path: Path,
+    progress_path: Path,
+) -> tuple[int, str, str]:
+    """Original single-spawn flow used when dynamic rate adjustment is off."""
+
+    command = build_command(invocation, output_path)
+    child = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        bufsize=0,
+        start_new_session=True,
+    )
+    _set_current_child(child)
+    stderr_buffer = bytearray()
+    stderr_thread = threading.Thread(
+        target=stream_stderr,
+        args=(child, progress_path, stderr_buffer),
+        daemon=True,
+    )
+    stderr_thread.start()
+    assert child.stdout is not None
+    stdout = child.stdout.read().decode("utf-8", errors="replace")
+    return_code = child.wait()
+    stderr_thread.join(timeout=5)
+    stderr = stderr_buffer.decode("utf-8", errors="replace")
+    _set_current_child(None)
+    return return_code, stdout, stderr
+
+
+def run_dynamic_scanner(
+    invocation: dict[str, object],
+    output_path: Path,
+    progress_path: Path,
+) -> tuple[int, str, str]:
+    """AIMD-driven controller: respawns the scanner per window with a learned rate.
+
+    Each window the scanner runs against its full target range with
+    ``--checkpoint-file`` + (after window 1) ``--resume``. Per-window kernel
+    NIC counters drive the AIMD math; the scheduler-jitter probe acts as a
+    proxy for control-plane heartbeat slip — when zmap saturates the host
+    the agentd heartbeat slips for the same reason this thread can't get
+    CPU. Convergence settles within a handful of windows, after which the
+    learned rate is persisted per-interface so future scans skip relearn.
+    """
+
+    if rate_controller is None:
+        # Defensive fallback: bundle missing the controller module.
+        return run_static_scanner(invocation, output_path, progress_path)
+
+    env = os.environ
+    policy = rate_controller.policy_from_env(env)
+    interface = detect_default_interface()
+    nic_reader = (
+        rate_controller.NicStatsReader(interface) if interface is not None else None
+    )
+    fallback_rate = resolve_rate_limit(invocation)
+    calibration_path = env_string("ANYSCAN_RATE_CALIBRATION_PATH") or str(
+        rate_controller.DEFAULT_CALIBRATION_PATH
+    )
+    calibration = rate_controller.RateCalibrationStore(calibration_path)
+    starting_rate = rate_controller.resolve_starting_rate(
+        policy=policy,
+        interface=interface,
+        calibration=calibration,
+        fallback_rate=fallback_rate,
+    )
+
+    rate_controller.emit_metric(
+        "controller_started",
+        {
+            "interface": interface,
+            "starting_rate": starting_rate,
+            "fallback_rate": fallback_rate,
+            "policy_floor": policy.floor,
+            "policy_ceiling": policy.ceiling,
+            "additive_step": policy.additive_step,
+            "multiplicative_factor": policy.multiplicative_factor,
+            "window_seconds": policy.window_seconds,
+            "heartbeat_threshold_ms": policy.heartbeat_latency_threshold_ms,
+            "calibration_path": str(calibration.path),
+        },
+    )
+
+    last_stderr_buffer = bytearray()
+    stderr_thread_holder: dict[str, threading.Thread] = {}
+
+    def spawn(command: list[str]) -> subprocess.Popen[bytes]:
+        nonlocal last_stderr_buffer
+        last_stderr_buffer = bytearray()
+        child = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=False,
+            bufsize=0,
+            start_new_session=True,
+        )
+        stderr_thread = threading.Thread(
+            target=stream_stderr,
+            args=(child, progress_path, last_stderr_buffer),
+            daemon=True,
+        )
+        stderr_thread.start()
+        stderr_thread_holder["thread"] = stderr_thread
+        return child
+
+    def on_child(child: subprocess.Popen[bytes] | None) -> None:
+        _set_current_child(child)
+        if child is None:
+            thread = stderr_thread_holder.pop("thread", None)
+            if thread is not None:
+                thread.join(timeout=5)
+
+    def command_for_rate(rate: int, is_first_window: bool) -> list[str]:
+        # First window: respect the upstream invocation's resume flag (the
+        # worker may have already set it from the persisted store). Later
+        # windows: always resume from the checkpoint we just wrote.
+        resume_override = None if is_first_window else True
+        return build_command(
+            invocation,
+            output_path,
+            rate_override=rate,
+            resume_override=resume_override,
+        )
+
+    jitter_monitor = rate_controller.JitterMonitor()
+    jitter_monitor.start()
+    return_code = 0
+    try:
+        runner = rate_controller.SubprocessWindowRunner(
+            command_for_rate=command_for_rate,
+            nic_reader=nic_reader,
+            jitter_monitor=jitter_monitor,
+            terminate_grace_seconds=rate_controller.DEFAULT_TERMINATE_GRACE_SECONDS,
+            spawn=spawn,
+            on_child=on_child,
+        )
+        controller = rate_controller.RateController(
+            options=rate_controller.ControllerOptions(
+                policy=policy,
+                window_seconds=float(policy.window_seconds),
+                interface=interface,
+                starting_rate=starting_rate,
+                calibration=calibration,
+            ),
+            runner=runner,
+        )
+        try:
+            controller.run()
+        except rate_controller.ScannerWindowError as error:
+            return_code = error.exit_code if error.exit_code != 0 else 1
+    finally:
+        jitter_monitor.stop()
+        on_child(None)
+
+    stderr_text = last_stderr_buffer.decode("utf-8", errors="replace")
+    return return_code, "", stderr_text
+
+
 def main() -> int:
     try:
         invocation = json.load(sys.stdin)
@@ -399,36 +606,26 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
 
+    dynamic_enabled = env_flag("ANYSCAN_DYNAMIC_RATE_ENABLED", default=True) and (
+        rate_controller is not None
+    )
+
     try:
-        command = build_command(invocation, output_path)
-        global CURRENT_CHILD
-        CURRENT_CHILD = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            bufsize=0,
-            start_new_session=True,
-        )
-        stderr_buffer = bytearray()
-        stderr_thread = threading.Thread(
-            target=stream_stderr,
-            args=(CURRENT_CHILD, progress_path, stderr_buffer),
-            daemon=True,
-        )
-        stderr_thread.start()
-        assert CURRENT_CHILD.stdout is not None
-        stdout = CURRENT_CHILD.stdout.read().decode("utf-8", errors="replace")
-        completed_returncode = CURRENT_CHILD.wait()
-        stderr_thread.join(timeout=5)
-        stderr = stderr_buffer.decode("utf-8", errors="replace")
-        CURRENT_CHILD = None
-        if completed_returncode != 0:
+        if dynamic_enabled:
+            return_code, stdout, stderr = run_dynamic_scanner(
+                invocation, output_path, progress_path
+            )
+        else:
+            return_code, stdout, stderr = run_static_scanner(
+                invocation, output_path, progress_path
+            )
+
+        if return_code != 0:
             stderr = stderr.strip()
             stdout = stdout.strip()
             detail = stderr or stdout or "unknown scanner failure"
             print(detail, file=sys.stderr)
-            return completed_returncode
+            return return_code
 
         raw_output = output_path.read_text() if output_path.exists() else stdout
         emit_endpoints(
