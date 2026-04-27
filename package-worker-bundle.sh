@@ -540,6 +540,7 @@ main() {
     install -m 0755 "$SCRIPT_DIR/local-bootstrap-provisioner.py" "$bundle_root/extensions/bootstrap-provisioner.py"
     install -m 0644 "$SCRIPT_DIR/vulnscanner-zmap-adapter.json" "$bundle_root/extensions/portscan-adapter.json"
     install -m 0755 "$SCRIPT_DIR/vulnscanner-zmap-adapter.py" "$bundle_root/extensions/portscan-adapter.py"
+    install -m 0644 "$SCRIPT_DIR/anyscan_rate_controller.py" "$bundle_root/extensions/anyscan_rate_controller.py"
     copy_tree "$SCRIPT_DIR/extensions/bundled/manifests" "$bundle_root/extensions/bundled/manifests"
     copy_tree "$SCRIPT_DIR/extensions/bundled/rules" "$bundle_root/extensions/bundled/rules"
     copy_tree "$SCRIPT_DIR/extensions/bundled/scripts" "$bundle_root/extensions/bundled/scripts"
