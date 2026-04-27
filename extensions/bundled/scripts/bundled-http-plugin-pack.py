@@ -228,7 +228,12 @@ def match_rule(document: dict[str, object], rule: dict[str, object]) -> bool:
     if min_body_bytes is None:
         min_body_bytes = DEFAULT_MIN_BODY_BYTES
     try:
-        if len(raw_body) < int(min_body_bytes):
+        # Encoded byte length, not str-len (which counts Unicode code points).
+        # The rule field is documented in bytes; counting code points wrongly
+        # rejected non-ASCII bodies (a 17-character CJK body is 51 UTF-8 bytes
+        # but len() == 17). Mirrors the Rust SwaggerUI matcher's `body.len()`,
+        # which is byte length on `String`.
+        if len(raw_body.encode("utf-8", errors="replace")) < int(min_body_bytes):
             return False
     except (TypeError, ValueError):
         pass

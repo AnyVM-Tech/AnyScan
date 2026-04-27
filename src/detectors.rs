@@ -7636,6 +7636,39 @@ mod tests {
         );
     }
 
+    /// `min_body_bytes` is documented in bytes, not Unicode code points. A
+    /// non-ASCII Node-RED admin body that is 33 characters but 55 UTF-8 bytes
+    /// must clear the 50-byte default floor — measuring it by `len()` would
+    /// wrongly reject CJK/emoji-heavy responses.
+    #[test]
+    fn bundled_http_rules_count_body_bytes_not_code_points() {
+        let manifest = http_pack_manifest();
+
+        // node-red banner + CJK filler:
+        //   "<title>node-red</title>" (23 ASCII bytes / 23 code points)
+        // + 4 × "テスト" (12 CJK code points × 3 UTF-8 bytes = 36 bytes)
+        // = 35 code points / 59 UTF-8 bytes.
+        // Under the buggy len()-based floor (35 < 50), the body would be
+        // rejected; under the correct UTF-8-byte floor (59 >= 50), it matches.
+        let cjk_body = "<title>node-red</title>テストテストテストテスト";
+        assert!(cjk_body.chars().count() < 50, "fixture must be <50 chars");
+        assert!(
+            cjk_body.len() >= 50,
+            "fixture must be >=50 UTF-8 bytes to exercise the bytes-vs-codepoints distinction"
+        );
+
+        let cjk = super::run_external_detector_pack(
+            &document("/red/", cjk_body),
+            &manifest,
+        )
+        .expect("cjk body run");
+        assert!(
+            fired_plugins(&cjk).contains("NodeREDPlugin"),
+            "NodeREDPlugin must fire on a 59-byte CJK body that is 35 code points: {:?}",
+            fired_plugins(&cjk)
+        );
+    }
+
     #[test]
     fn detector_engine_best_effort_version_rules_respect_negative_path_filters() {
         let config = crate::config::AppConfig::default();
