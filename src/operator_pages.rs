@@ -47,6 +47,14 @@ pub async fn operator_targets() -> Html<String> {
     )
 }
 
+pub async fn operator_runs() -> Html<String> {
+    render_page(
+        "runs",
+        include_str!("../templates/operator/runs.html"),
+        include_str!("../templates/operator/runs.js"),
+    )
+}
+
 pub async fn operator_workers() -> Html<String> {
     render_page(
         "workers",
@@ -86,6 +94,7 @@ pub async fn operator_catalog() -> Html<String> {
 pub(crate) const OPERATOR_NAV_SLUGS: &[&str] = &[
     "overview", "targets", "runs", "workers", "findings", "catalog", "coverage",
 ];
+
 
 #[cfg(test)]
 mod tests {
@@ -284,6 +293,40 @@ mod tests {
         let nav = render_nav("overview");
         assert!(nav.contains("data-nav=\"overview\" aria-current=\"page\""));
         assert!(!nav.contains("data-nav=\"targets\" aria-current=\"page\""));
+    }
+
+    #[tokio::test]
+    async fn operator_runs_serves_shell_and_runs_ids() {
+        let app = Router::new().route("/app/runs", get(operator_runs));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator runs test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator runs test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator runs test server should stay available");
+        });
+
+        let url = format!("http://{}/app/runs", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/runs should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator runs body should be utf-8");
+
+        assert!(body.contains("id=\"appbar-nav\""));
+        assert!(body.contains("data-nav=\"runs\" aria-current=\"page\""));
+        assert!(body.contains("id=\"run-form\""));
+        assert!(body.contains("id=\"schedules-list\""));
+        assert!(body.contains("id=\"port-scan-form\""));
+
+        server.abort();
     }
 
     #[tokio::test]

@@ -424,6 +424,7 @@ async fn main() -> Result<()> {
         .route("/app", get(operator_app))
         .route("/app/overview", get(operator_pages::operator_overview))
         .route("/app/targets", get(operator_pages::operator_targets))
+        .route("/app/runs", get(operator_pages::operator_runs))
         .route("/app/workers", get(operator_pages::operator_workers))
         .route("/app/findings", get(operator_pages::operator_findings))
         .route("/app/coverage", get(operator_pages::operator_coverage))

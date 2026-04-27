@@ -1,0 +1,406 @@
+				<section id="page-runs">
+					<h2 class="section-group-heading" id="section-runs">
+						<span>Runs</span>
+						<span class="section-group-hint">Queue scoped runs, manage recurring schedules, and dispatch port scans.</span>
+					</h2>
+
+					<nav
+						class="page-subtabs"
+						role="tablist"
+						aria-label="Runs sub-sections"
+					>
+						<button
+							type="button"
+							role="tab"
+							data-subtab="active"
+							aria-selected="true"
+							aria-controls="runs-pane-active"
+							id="runs-tab-active"
+						>
+							Active
+						</button>
+						<button
+							type="button"
+							role="tab"
+							data-subtab="schedules"
+							aria-selected="false"
+							aria-controls="runs-pane-schedules"
+							id="runs-tab-schedules"
+						>
+							Schedules
+						</button>
+						<button
+							type="button"
+							role="tab"
+							data-subtab="port-scans"
+							aria-selected="false"
+							aria-controls="runs-pane-port-scans"
+							id="runs-tab-port-scans"
+						>
+							Port-scans
+						</button>
+					</nav>
+
+					<div
+						id="runs-pane-active"
+						class="page-subtab-pane"
+						role="tabpanel"
+						aria-labelledby="runs-tab-active"
+						data-subtab-pane="active"
+					>
+						<section class="grid">
+							<article class="card wide-card">
+								<h2>Queue scoped run</h2>
+								<form id="run-form">
+									<label>
+										Target IDs (comma separated)
+										<input
+											id="run-target-ids"
+											placeholder="12, 44"
+										/>
+									</label>
+									<label>
+										Tags (comma separated)
+										<input
+											id="run-tags"
+											placeholder="prod, internal"
+										/>
+									</label>
+									<label>
+										Worker pool
+										<input
+											id="run-worker-pool"
+											placeholder="edge-scanners"
+										/>
+									</label>
+									<label>
+										<input id="run-failed-only" type="checkbox" />
+										Failed targets only
+									</label>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Active-authorized plugins</h3>
+											<span
+												id="run-active-authorized-gate"
+												class="subtle-note"
+												>Gate pending</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="run-active-authorized-enabled"
+												type="checkbox"
+											/>
+											Allow active-authorized plugins for this run
+										</label>
+										<p
+											id="run-active-authorized-note"
+											class="subtle-note"
+										>
+											Disabled by default. This opt-in only takes
+											effect when the server-side active-authorized
+											gate is enabled.
+										</p>
+									</div>
+									<button type="submit" class="primary">
+										Queue scoped run
+									</button>
+									<p id="run-error" class="error hidden"></p>
+								</form>
+							</article>
+						</section>
+					</div>
+
+					<div
+						id="runs-pane-schedules"
+						class="page-subtab-pane hidden"
+						role="tabpanel"
+						aria-labelledby="runs-tab-schedules"
+						data-subtab-pane="schedules"
+					>
+						<section class="grid two-up">
+							<article class="card wide-card">
+								<h2>Recurring schedules</h2>
+								<ul id="schedules-list" class="list"></ul>
+								<p id="schedules-empty" class="empty hidden">
+									No recurring schedules configured yet.
+								</p>
+							</article>
+							<article class="card wide-card">
+								<h2>Add or update schedule</h2>
+								<form id="schedule-form">
+									<label>
+										Label
+										<input
+											id="schedule-label"
+											required
+											placeholder="hourly-owned-assets"
+										/>
+									</label>
+									<label>
+										Interval (minutes)
+										<input
+											id="schedule-interval-minutes"
+											type="number"
+											min="1"
+											step="1"
+											required
+											placeholder="60"
+										/>
+									</label>
+									<label>
+										State
+										<select id="schedule-enabled">
+											<option value="true" selected>
+												Enabled
+											</option>
+											<option value="false">Paused</option>
+										</select>
+									</label>
+									<label>
+										Scope target IDs (comma separated)
+										<input
+											id="schedule-target-ids"
+											placeholder="12, 44"
+										/>
+									</label>
+									<label>
+										Scope tags (comma separated)
+										<input
+											id="schedule-tags"
+											placeholder="prod, internal"
+										/>
+									</label>
+									<label>
+										Worker pool
+										<input
+											id="schedule-worker-pool"
+											placeholder="edge-scanners"
+										/>
+									</label>
+									<label>
+										<input
+											id="schedule-failed-only"
+											type="checkbox"
+										/>
+										Retry failed targets only
+									</label>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Active-authorized plugins</h3>
+											<span
+												id="schedule-active-authorized-gate"
+												class="subtle-note"
+												>Gate pending</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="schedule-active-authorized-enabled"
+												type="checkbox"
+											/>
+											Allow active-authorized plugins for scheduled runs
+										</label>
+										<p
+											id="schedule-active-authorized-note"
+											class="subtle-note"
+										>
+											Disabled by default. Scheduled runs only execute
+											active-authorized plugins when this opt-in is
+											checked and the global gate is enabled.
+										</p>
+									</div>
+									<button type="submit">Save schedule</button>
+									<p id="schedule-error" class="error hidden"></p>
+								</form>
+							</article>
+						</section>
+					</div>
+
+					<div
+						id="runs-pane-port-scans"
+						class="page-subtab-pane hidden"
+						role="tabpanel"
+						aria-labelledby="runs-tab-port-scans"
+						data-subtab-pane="port-scans"
+					>
+						<section class="grid">
+							<article class="card wide-card">
+								<h2>Queue port scan</h2>
+								<form id="port-scan-form">
+									<div class="grid two-up">
+										<label>
+											Target range
+											<input
+												id="port-scan-target-range"
+												required
+												placeholder="10.0.0.0/24"
+											/>
+										</label>
+										<label>
+											Ports
+											<input
+												id="port-scan-ports"
+												required
+												placeholder="80,443,8080-8090"
+											/>
+										</label>
+										<label>
+											Schemes
+											<select id="port-scan-schemes">
+												<option value="auto" selected>Auto</option>
+												<option value="http">HTTP</option>
+												<option value="https">HTTPS</option>
+												<option value="both">Both</option>
+											</select>
+										</label>
+										<label>
+											Rate limit (0 = unlimited)
+											<input
+												id="port-scan-rate-limit"
+												type="number"
+												min="0"
+												step="1"
+												placeholder="0"
+											/>
+										</label>
+										<label>
+											Worker pool (optional)
+											<input
+												id="port-scan-worker-pool"
+												placeholder="edge-scanners"
+											/>
+										</label>
+										<label>
+											Scanner sender threads (optional)
+											<input
+												id="port-scan-sender-threads"
+												type="number"
+												min="1"
+												step="1"
+												placeholder="Use worker default"
+											/>
+										</label>
+										<label>
+											Scanner receiver threads (optional)
+											<input
+												id="port-scan-receiver-threads"
+												type="number"
+												min="1"
+												step="1"
+												placeholder="Use worker default"
+											/>
+										</label>
+										<label>
+											Tags (comma separated)
+											<input
+												id="port-scan-tags"
+												placeholder="external, quarterly"
+											/>
+										</label>
+									</div>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Follow-on scanning</h3>
+											<span class="subtle-note"
+												>Queue a scan run for imported hosts</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="port-scan-follow-on-enabled"
+												type="checkbox"
+												checked
+											/>
+											Scan discovered hosts after the port scan completes
+										</label>
+										<div
+											id="port-scan-follow-on-fields"
+											class="grid two-up"
+										>
+											<label>
+												Follow-on worker pool (optional)
+												<input
+													id="port-scan-follow-on-pool"
+													placeholder="edge-scanners"
+												/>
+											</label>
+											<label>
+												Follow-on target mode
+												<select id="port-scan-follow-on-selection-mode">
+													<option value="validated" selected>
+														Validated responders
+													</option>
+													<option value="raw">Raw discovered hits</option>
+													<option value="both">Both</option>
+												</select>
+											</label>
+										</div>
+									</div>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Bootstrap candidates</h3>
+											<span class="subtle-note"
+												>Optional follow-on worker enrollment</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="port-scan-bootstrap-enabled"
+												type="checkbox"
+											/>
+											Create bootstrap candidates from discovered
+											endpoints
+										</label>
+										<div
+											id="port-scan-bootstrap-fields"
+											class="grid two-up hidden"
+										>
+											<label>
+												Bootstrap worker pool (optional)
+												<input
+													id="port-scan-bootstrap-pool"
+													placeholder="branch-office"
+												/>
+											</label>
+											<label>
+												Bootstrap tags (comma separated)
+												<input
+													id="port-scan-bootstrap-tags"
+													placeholder="bootstrap, linux"
+												/>
+											</label>
+										</div>
+									</div>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Active-authorized plugins</h3>
+											<span
+												id="port-scan-active-authorized-gate"
+												class="subtle-note"
+												>Gate pending</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="port-scan-active-authorized-enabled"
+												type="checkbox"
+											/>
+											Allow active-authorized plugins for this port scan
+										</label>
+										<p
+											id="port-scan-active-authorized-note"
+											class="subtle-note"
+										>
+											Disabled by default. Checked opt-ins remain
+											suppressed until the global active-authorized
+											gate is enabled.
+										</p>
+									</div>
+									<button type="submit">Queue port scan</button>
+									<p id="port-scan-error" class="error hidden"></p>
+								</form>
+							</article>
+						</section>
+					</div>
+				</section>
