@@ -462,7 +462,7 @@ async fn run_daemon_with_retry(
 }
 
 async fn run_daemon(
-    config: AppConfig,
+    mut config: AppConfig,
     worker_id: String,
     store: AnyScanStore,
     detectors: DetectorEngine,
@@ -476,6 +476,19 @@ async fn run_daemon(
         &worker_runtime.registration,
         worker_registration_ttl,
     )?;
+    // Initial inventory policy fetch — best-effort. Failure here keeps the
+    // local /etc/agentd/runtime.env fallback (or InventoryConfig::default())
+    // in place so the worker can still claim non-policy-gated tasks. The
+    // streaming follow-on flusher's host_is_allowed check will keep dropping
+    // hosts outside the local allowlist until a refresh succeeds.
+    if let Err(error) = refresh_inventory_policy_from_control_plane(&mut config, &store) {
+        warn!(
+            %error,
+            "initial inventory policy fetch failed; using local fallback (workers may drop hosts outside the local allowlist)"
+        );
+    }
+    let inventory_refresh_interval = inventory_refresh_interval();
+    let mut last_inventory_refresh_at = Instant::now();
     let (remote_update_tx, remote_update_rx) =
         watch::channel(registered_worker.remote_update_requested_at);
     let (registration_shutdown_tx, registration_shutdown_rx) = oneshot::channel();
@@ -683,6 +696,15 @@ async fn run_daemon(
                 }
             }
 
+            if last_inventory_refresh_at.elapsed() >= inventory_refresh_interval {
+                if let Err(error) =
+                    refresh_inventory_policy_from_control_plane(&mut config, &store)
+                {
+                    warn!(%error, "inventory policy refresh failed; keeping prior policy");
+                }
+                last_inventory_refresh_at = Instant::now();
+            }
+
             let effective_config = load_effective_runtime_config(&config, &store)?;
             let idle_sleep_seconds = if active_tasks.is_empty() {
                 effective_config.scan.poll_interval_seconds
@@ -706,6 +728,14 @@ async fn run_once(
     detectors: DetectorEngine,
     worker_runtime: &WorkerRuntime,
 ) -> Result<()> {
+    let mut config = config.clone();
+    if let Err(error) = refresh_inventory_policy_from_control_plane(&mut config, &store) {
+        warn!(
+            %error,
+            "initial inventory policy fetch failed; using local fallback"
+        );
+    }
+    let config = &config;
     let worker_registration_ttl = worker_registration_ttl_seconds(config);
     let worker_registration_interval =
         worker_registration_refresh_interval(config, worker_registration_ttl);
@@ -5507,17 +5537,54 @@ fn load_effective_runtime_config(
     base_config.with_scan_defaults_summary(&scan_settings)
 }
 
+const INVENTORY_REFRESH_INTERVAL_ENV: &str = "AGENT_INVENTORY_REFRESH_SECONDS";
+const DEFAULT_INVENTORY_REFRESH_INTERVAL_SECONDS: u64 = 300;
+
+fn inventory_refresh_interval() -> Duration {
+    let parsed = env::var(INVENTORY_REFRESH_INTERVAL_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_INVENTORY_REFRESH_INTERVAL_SECONDS);
+    Duration::from_secs(parsed)
+}
+
+fn apply_inventory_policy_snapshot_to_config(
+    config: &mut AppConfig,
+    snapshot: &anyscan::core::InventoryPolicySnapshot,
+) -> Result<()> {
+    let updated = config.with_inventory_policy_snapshot(snapshot)?;
+    config.inventory = updated.inventory;
+    Ok(())
+}
+
+fn refresh_inventory_policy_from_control_plane(
+    config: &mut AppConfig,
+    store: &AnyScanStore,
+) -> Result<()> {
+    let snapshot = store.load_inventory_policy()?;
+    apply_inventory_policy_snapshot_to_config(config, &snapshot)?;
+    info!(
+        allowed_host_suffixes = config.inventory.allowed_host_suffixes.len(),
+        allowed_hosts = config.inventory.allowed_hosts.len(),
+        allowed_cidrs = config.inventory.allowed_cidrs.len(),
+        allowed_ports = config.inventory.allowed_ports.len(),
+        "refreshed inventory policy from control plane"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
         ScannerOutputCounter, WORKER_REGISTRATION_TTL_MULTIPLIER,
-        apply_follow_on_selection_mode_to_targets,
+        apply_follow_on_selection_mode_to_targets, apply_inventory_policy_snapshot_to_config,
         derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
-        filter_endpoints_excluding_streamed, normalize_platform_architecture,
-        normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
-        parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
-        streaming_followon_should_flush, validated_target_tag,
+        filter_endpoints_excluding_streamed, inventory_refresh_interval,
+        normalize_platform_architecture, normalize_platform_operating_system, parse_endpoint_token,
+        parse_ip_addr_show_output, parse_json_endpoint_lines, scanner_target_range_for_adapter,
+        should_push_resume_state, streaming_followon_should_flush, validated_target_tag,
         worker_registration_refresh_interval, worker_registration_ttl_seconds,
     };
     use anyscan::config::AppConfig;
@@ -6523,5 +6590,82 @@ mod tests {
         assert_eq!(post, vec!["3.3.3.3:80".to_string()]);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn apply_inventory_policy_snapshot_overwrites_allowlists_in_config() {
+        use anyscan::core::InventoryPolicySnapshot;
+
+        let mut config = AppConfig::default();
+        // local fallback default: only "localhost" is allowed
+        assert_eq!(
+            config.inventory.allowed_host_suffixes,
+            vec!["localhost".to_string()]
+        );
+
+        let snapshot = InventoryPolicySnapshot {
+            allowed_host_suffixes: vec!["example.com".to_string()],
+            allowed_hosts: vec!["box.example.net".to_string()],
+            allowed_cidrs: vec!["10.0.0.0/8".to_string()],
+            allowed_ports: vec![80, 443, 8080],
+        };
+
+        apply_inventory_policy_snapshot_to_config(&mut config, &snapshot)
+            .expect("snapshot should apply cleanly");
+
+        assert_eq!(
+            config.inventory.allowed_host_suffixes,
+            vec!["example.com".to_string()]
+        );
+        assert_eq!(
+            config.inventory.allowed_hosts,
+            vec!["box.example.net".to_string()]
+        );
+        assert_eq!(config.inventory.allowed_cidrs, vec!["10.0.0.0/8".to_string()]);
+        assert_eq!(config.inventory.allowed_ports, vec![80, 443, 8080]);
+
+        // The previous "localhost" suffix is gone — the API host's policy wins.
+        assert!(config.host_is_allowed("box.example.net"));
+        assert!(config.host_is_allowed("api.example.com"));
+        assert!(config.host_is_allowed("10.0.0.42"));
+        assert!(!config.host_is_allowed("evil.test"));
+        assert!(!config.host_is_allowed("localhost"));
+    }
+
+    #[test]
+    fn inventory_refresh_interval_uses_env_or_default() {
+        let key = "AGENT_INVENTORY_REFRESH_SECONDS";
+        let prior = std::env::var(key).ok();
+
+        // SAFETY: tests can race on env vars across threads; cargo test default
+        // is multithreaded but these env keys are unique to this assertion set.
+        // The pattern matches what other helpers in this file already do.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+
+        unsafe {
+            std::env::set_var(key, "42");
+        }
+        assert_eq!(inventory_refresh_interval(), Duration::from_secs(42));
+
+        unsafe {
+            std::env::set_var(key, "0");
+        }
+        // Zero is rejected — falls back to the default
+        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+
+        unsafe {
+            std::env::set_var(key, "not-a-number");
+        }
+        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }
