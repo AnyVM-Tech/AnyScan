@@ -2907,6 +2907,56 @@ impl AppConfig {
         }
     }
 
+    pub fn inventory_policy_snapshot(&self) -> crate::core::InventoryPolicySnapshot {
+        crate::core::InventoryPolicySnapshot {
+            allowed_host_suffixes: self.inventory.allowed_host_suffixes.clone(),
+            allowed_hosts: self.inventory.allowed_hosts.clone(),
+            allowed_cidrs: self.inventory.allowed_cidrs.clone(),
+            allowed_ports: self.inventory.allowed_ports.clone(),
+        }
+    }
+
+    pub fn with_inventory_policy_snapshot(
+        &self,
+        snapshot: &crate::core::InventoryPolicySnapshot,
+    ) -> Result<Self> {
+        let mut config = self.clone();
+
+        let mut suffixes = snapshot
+            .allowed_host_suffixes
+            .iter()
+            .filter_map(|value| normalize_inventory_host(value))
+            .collect::<Vec<_>>();
+        suffixes.sort();
+        suffixes.dedup();
+        config.inventory.allowed_host_suffixes = suffixes;
+
+        let mut hosts = snapshot
+            .allowed_hosts
+            .iter()
+            .filter_map(|value| normalize_inventory_host(value))
+            .collect::<Vec<_>>();
+        hosts.sort();
+        hosts.dedup();
+        config.inventory.allowed_hosts = hosts;
+
+        let mut cidrs = snapshot
+            .allowed_cidrs
+            .iter()
+            .map(|value| normalize_inventory_cidr(value))
+            .collect::<Result<Vec<_>>>()?;
+        cidrs.sort();
+        cidrs.dedup();
+        config.inventory.allowed_cidrs = cidrs;
+
+        let mut ports = snapshot.allowed_ports.clone();
+        ports.sort_unstable();
+        ports.dedup();
+        config.inventory.allowed_ports = ports;
+
+        Ok(config)
+    }
+
     pub fn with_scan_defaults_summary(&self, summary: &ScanDefaultsSummary) -> Result<Self> {
         let mut config = self.clone();
         config.scan.request_engine_mode = summary.request_engine_mode;
@@ -3627,8 +3677,8 @@ mod tests {
     };
 
     use crate::core::{
-        GobusterTargetConfig, PortScanRequest, RepositoryDefinition, RequestEngineMode,
-        ScanDefaultsSummary, TargetDefinition, TargetStrategy,
+        GobusterTargetConfig, InventoryPolicySnapshot, PortScanRequest, RepositoryDefinition,
+        RequestEngineMode, ScanDefaultsSummary, TargetDefinition, TargetStrategy,
     };
 
     use super::{
@@ -3653,6 +3703,51 @@ mod tests {
         if let Some(parent) = path.parent() {
             let _ = fs::remove_dir(parent);
         }
+    }
+
+    #[test]
+    fn inventory_policy_snapshot_round_trips_into_app_config() {
+        let mut base = AppConfig::default();
+        base.inventory.allowed_host_suffixes = vec!["localhost".to_string()];
+        base.inventory.allowed_hosts.clear();
+        base.inventory.allowed_cidrs.clear();
+        base.inventory.allowed_ports.clear();
+
+        let snapshot = InventoryPolicySnapshot {
+            allowed_host_suffixes: vec![".example.com".to_string(), "Example.NET".to_string()],
+            allowed_hosts: vec!["BOX.Example.NET".to_string()],
+            allowed_cidrs: vec!["10.0.0.0/8".to_string()],
+            allowed_ports: vec![443, 80, 80],
+        };
+
+        let updated = base
+            .with_inventory_policy_snapshot(&snapshot)
+            .expect("snapshot should apply cleanly");
+
+        // host suffixes are lowercased, sorted, deduped (matches normalize_inventory)
+        assert_eq!(
+            updated.inventory.allowed_host_suffixes,
+            vec![".example.com".to_string(), "example.net".to_string()]
+        );
+        assert_eq!(
+            updated.inventory.allowed_hosts,
+            vec!["box.example.net".to_string()]
+        );
+        assert_eq!(
+            updated.inventory.allowed_cidrs,
+            vec!["10.0.0.0/8".to_string()]
+        );
+        assert_eq!(updated.inventory.allowed_ports, vec![80, 443]);
+
+        // round-trip the normalized policy back out and confirm field equality
+        let round_trip = updated.inventory_policy_snapshot();
+        assert_eq!(
+            round_trip.allowed_host_suffixes,
+            updated.inventory.allowed_host_suffixes
+        );
+        assert_eq!(round_trip.allowed_hosts, updated.inventory.allowed_hosts);
+        assert_eq!(round_trip.allowed_cidrs, updated.inventory.allowed_cidrs);
+        assert_eq!(round_trip.allowed_ports, updated.inventory.allowed_ports);
     }
 
     #[test]

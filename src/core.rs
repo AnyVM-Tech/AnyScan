@@ -2513,6 +2513,18 @@ pub struct ScanDefaultsSummary {
     pub directory_probing_discover_backup: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InventoryPolicySnapshot {
+    #[serde(default)]
+    pub allowed_host_suffixes: Vec<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+    #[serde(default)]
+    pub allowed_ports: Vec<u16>,
+}
+
 pub fn merge_coverage_source_stat(
     stats: &mut Vec<CoverageSourceStat>,
     source: &str,
