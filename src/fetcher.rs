@@ -2089,8 +2089,10 @@ fn robots_txt_candidates(body: &str) -> Vec<DiscoveryHint> {
 }
 
 fn strip_ascii_case_prefix<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    // `then_some` would evaluate the slice eagerly and panic when prefix.len() > input.len();
+    // use `then` so the slice is only computed when the length guard already passed.
     (input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then_some(&input[prefix.len()..])
+        .then(|| &input[prefix.len()..])
 }
 
 fn sanitize_robots_directive_candidate(value: &str) -> Option<String> {
@@ -4153,7 +4155,8 @@ mod tests {
 
     use super::{
         Fetcher, build_gobuster_word_candidates, discover_candidate_path_candidates,
-        discover_candidate_paths, response_similarity_key,
+        discover_candidate_paths, response_similarity_key, robots_txt_candidates,
+        strip_ascii_case_prefix,
     };
     use crate::{
         config::{AppConfig, ProxyMode, RequestProfileConfig, RequestProfileSecretRef},
@@ -5110,6 +5113,75 @@ paths:
         let second = response_similarity_key("missing resource at /assets/b.js", "/assets/b.js");
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_handles_input_shorter_than_prefix() {
+        // Regression: scan #21 worker 1a panicked with `byte index 8 is out of bounds of <html>`
+        // when robots.txt fetches returned an HTML body. `<html>` (6 bytes) is shorter than
+        // every directive prefix we test, so the slice must not be evaluated.
+        assert_eq!(strip_ascii_case_prefix("<html>", "Sitemap:"), None);
+        assert_eq!(strip_ascii_case_prefix("<html>", "Disallow:"), None);
+        assert_eq!(strip_ascii_case_prefix("<html>", "Allow:"), None);
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_handles_empty_input() {
+        assert_eq!(strip_ascii_case_prefix("", "Sitemap:"), None);
+        assert_eq!(strip_ascii_case_prefix("", ""), Some(""));
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_handles_single_byte_input() {
+        assert_eq!(strip_ascii_case_prefix("S", "Sitemap:"), None);
+        assert_eq!(strip_ascii_case_prefix("/", "Allow:"), None);
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_handles_input_exactly_prefix_length() {
+        // Matching: returns empty remainder.
+        assert_eq!(strip_ascii_case_prefix("Sitemap:", "Sitemap:"), Some(""));
+        assert_eq!(strip_ascii_case_prefix("SITEMAP:", "Sitemap:"), Some(""));
+        // Non-matching same length: returns None without slicing past end.
+        assert_eq!(strip_ascii_case_prefix("XXXXXXXX", "Sitemap:"), None);
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_handles_input_one_byte_longer_than_prefix() {
+        assert_eq!(
+            strip_ascii_case_prefix("Sitemap: ", "Sitemap:"),
+            Some(" "),
+        );
+        assert_eq!(strip_ascii_case_prefix("Sitemap:x", "Sitemap:"), Some("x"));
+        assert_eq!(strip_ascii_case_prefix("XXXXXXXXX", "Sitemap:"), None);
+    }
+
+    #[test]
+    fn strip_ascii_case_prefix_strips_value_for_normal_inputs() {
+        assert_eq!(
+            strip_ascii_case_prefix("Sitemap: https://example.com/sitemap.xml", "Sitemap:"),
+            Some(" https://example.com/sitemap.xml"),
+        );
+        assert_eq!(
+            strip_ascii_case_prefix("disallow: /admin", "Disallow:"),
+            Some(" /admin"),
+        );
+    }
+
+    #[test]
+    fn robots_txt_candidates_does_not_panic_on_html_body() {
+        // The original panic was triggered when a robots.txt URL responded with HTML;
+        // every line of the HTML body flows through strip_ascii_case_prefix.
+        let body = "<html><body><h1>not found</h1></body></html>";
+        let candidates = robots_txt_candidates(body);
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn robots_txt_candidates_does_not_panic_on_short_lines() {
+        let body = "\n<\n<h\n#comment only\n \n";
+        let candidates = robots_txt_candidates(body);
+        assert!(candidates.is_empty());
     }
 
     #[tokio::test]
