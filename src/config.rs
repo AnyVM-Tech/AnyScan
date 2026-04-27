@@ -490,6 +490,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "container-orchestration",
     "cicd-configs",
     "mobile-artifacts",
+    "cloud-storage-listing",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -1057,6 +1058,34 @@ const MOBILE_ARTIFACT_PATHS: &[&str] = &[
     "/app.json",
 ];
 
+const CLOUD_STORAGE_LISTING_PATHS: &[&str] = &[
+    "/?list-type=2",
+    "/?list-type=2&prefix=",
+    "/?list-type=2&delimiter=/",
+    "/?prefix=",
+    "/?delimiter=/",
+    "/?marker=",
+    "/?comp=list",
+    "/?comp=list&restype=container",
+    "/?versioning",
+    "/?policy",
+    "/?cors",
+    "/?website",
+    "/?lifecycle",
+    "/?logging",
+    "/?notification",
+    "/?tagging",
+    "/?acl",
+    "/?location",
+    "/?replication",
+    "/.well-known/cdn-cgi/trace",
+    "/cdn-cgi/trace",
+    "/.amazon/",
+    "/.gcs/",
+    "/.azure/",
+    "/services/list-buckets",
+];
+
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
 const DEFAULT_BOOTSTRAP_REPOSITORY_GITHUB_URL: &str =
     "https://github.com/Lorikazzzz/VulnScanner-zmap-alternative.git";
@@ -1604,6 +1633,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "container-orchestration" => Some(CONTAINER_ORCHESTRATION_PATHS),
         "cicd-configs" => Some(CICD_CONFIG_PATHS),
         "mobile-artifacts" => Some(MOBILE_ARTIFACT_PATHS),
+        "cloud-storage-listing" => Some(CLOUD_STORAGE_LISTING_PATHS),
         _ => None,
     }
 }
