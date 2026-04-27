@@ -39,6 +39,14 @@ pub async fn operator_overview() -> Html<String> {
     )
 }
 
+pub async fn operator_runs() -> Html<String> {
+    render_page(
+        "runs",
+        include_str!("../templates/operator/runs.html"),
+        include_str!("../templates/operator/runs.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,5 +100,58 @@ mod tests {
         let nav = render_nav("overview");
         assert!(nav.contains("data-nav=\"overview\" aria-current=\"page\""));
         assert!(!nav.contains("data-nav=\"targets\" aria-current=\"page\""));
+    }
+
+    #[tokio::test]
+    async fn operator_runs_serves_shell_and_runs_ids() {
+        let app = Router::new().route("/app/runs", get(operator_runs));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator runs test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator runs test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator runs test server should stay available");
+        });
+
+        let url = format!("http://{}/app/runs", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/runs should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator runs body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("data-nav=\"runs\" aria-current=\"page\""),
+            "rendered body should mark the Runs nav link as the active page"
+        );
+        assert!(
+            body.contains("id=\"run-form\""),
+            "rendered body should contain the queue scoped run form"
+        );
+        assert!(
+            body.contains("id=\"schedules-list\""),
+            "rendered body should contain the recurring schedules list"
+        );
+        assert!(
+            body.contains("id=\"port-scan-form\""),
+            "rendered body should contain the queue port scan form"
+        );
+
+        server.abort();
     }
 }
