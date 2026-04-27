@@ -2014,6 +2014,9 @@ async fn worker_control(
                 .load_scan_settings()
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
         },
+        WorkerControlRequest::LoadInventoryPolicy => WorkerControlResponse::InventoryPolicy {
+            policy: state.config.inventory_policy_snapshot(),
+        },
     };
 
     Ok(Json(response))
