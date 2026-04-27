@@ -586,10 +586,107 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", state.config.server.bind_addr))?;
     info!(bind = %state.config.server.bind_addr, "anyscan api listening");
+
+    spawn_claim_wedge_sweep(state.clone());
+
     axum::serve(listener, app)
         .await
         .context("api server failed")?;
     Ok(())
+}
+
+/// Periodic janitor that recovers from a dead-claimant wedge by:
+///   1. Finalizing in-progress runs whose jobs are all done but whose claim
+///      still points at a dead worker (the Run #2 / scan #21 99% case).
+///   2. Releasing stale claims on runs and port-scans whose owner has been
+///      offline beyond a tolerance window, so the next worker poll can
+///      re-claim immediately instead of waiting for the natural lease decay.
+///
+/// Tunable via env:
+///   ANYSCAN_WEDGE_SWEEP_INTERVAL_SECONDS  (default 30, 0 disables)
+///   ANYSCAN_WEDGE_SWEEP_STALE_SECONDS     (default 180)
+fn spawn_claim_wedge_sweep(state: Arc<AppState>) {
+    let interval_seconds = parse_env_seconds("ANYSCAN_WEDGE_SWEEP_INTERVAL_SECONDS", 30);
+    if interval_seconds == 0 {
+        info!("claim wedge sweep disabled by ANYSCAN_WEDGE_SWEEP_INTERVAL_SECONDS=0");
+        return;
+    }
+    let stale_seconds = parse_env_seconds("ANYSCAN_WEDGE_SWEEP_STALE_SECONDS", 180);
+    info!(
+        interval_seconds,
+        stale_seconds, "starting claim wedge sweep"
+    );
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick so we don't run the sweep before
+        // routes are warm — gives in-flight workers a chance to land their
+        // last ack before we self-finalize.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            run_claim_wedge_sweep_once(&state, stale_seconds).await;
+        }
+    });
+}
+
+async fn run_claim_wedge_sweep_once(state: &Arc<AppState>, stale_seconds: u64) {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(usize, usize)> {
+        let finalized = store.finalize_completed_runs()?;
+        for run in &finalized {
+            let summary = store
+                .summary(run.id)
+                .with_context(|| format!("summary for swept run {}", run.id))?;
+            let event = if matches!(run.status, anyscan::core::RunStatus::Failed) {
+                ApiEvent::RunFailed {
+                    run: run.clone(),
+                    summary,
+                    error: run
+                        .notes
+                        .clone()
+                        .unwrap_or_else(|| "run finalized by wedge sweep".to_string()),
+                }
+            } else {
+                ApiEvent::RunCompleted {
+                    run: run.clone(),
+                    summary,
+                }
+            };
+            if let Err(error) = store.append_event(Some(run.id), &event) {
+                warn!(run_id = run.id, ?error, "wedge sweep: failed to append run-finalized event");
+            }
+        }
+        let stale_window = chrono::Duration::seconds(i64::try_from(stale_seconds).unwrap_or(180));
+        let (runs_released, port_scans_released) = store.release_stale_claims(stale_window)?;
+        Ok((finalized.len(), runs_released.len() + port_scans_released.len()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((finalized, released))) => {
+            if finalized > 0 || released > 0 {
+                info!(
+                    runs_finalized = finalized,
+                    claims_released = released,
+                    "claim wedge sweep recovered stuck work"
+                );
+            }
+        }
+        Ok(Err(error)) => warn!(?error, "claim wedge sweep failed"),
+        Err(error) => warn!(?error, "claim wedge sweep task panicked"),
+    }
+}
+
+fn parse_env_seconds(name: &str, default: u64) -> u64 {
+    match std::env::var(name) {
+        Ok(value) => value.trim().parse::<u64>().unwrap_or_else(|error| {
+            warn!(env = name, value = %value, ?error, "invalid value, falling back to default");
+            default
+        }),
+        Err(_) => default,
+    }
 }
 
 async fn public_index() -> Html<&'static str> {

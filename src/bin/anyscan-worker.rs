@@ -3861,6 +3861,18 @@ fn truncate_note(value: &str, max_len: usize) -> String {
     }
 }
 
+/// Maximum consecutive heartbeat failures (status poll + renewal) tolerated
+/// before the heartbeat gives up and signals cancellation. Sized so we keep
+/// trying for roughly two lease periods on transient control-API outages —
+/// long enough to outlast a single 1a panic/restart without dropping the
+/// claim, short enough to avoid zombie workers running with no claim.
+fn run_claim_heartbeat_failure_budget(lease_seconds: u64) -> u32 {
+    let renew_interval_seconds = lease_seconds.saturating_div(3).max(1);
+    // Two lease periods of failures, plus a small floor.
+    let budget = (lease_seconds.saturating_mul(2) / renew_interval_seconds).max(6);
+    u32::try_from(budget).unwrap_or(u32::MAX)
+}
+
 async fn port_scan_claim_heartbeat(
     store: AnyScanStore,
     _worker_id: String,
@@ -3870,28 +3882,72 @@ async fn port_scan_claim_heartbeat(
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let failure_budget = run_claim_heartbeat_failure_budget(lease_seconds);
     let mut next_renewal = tokio::time::Instant::now() + renew_interval;
+    let mut consecutive_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
-                match store.get_port_scan(port_scan_id)? {
-                    Some(port_scan) if matches!(port_scan.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                match store.get_port_scan(port_scan_id) {
+                    Ok(Some(port_scan)) if matches!(port_scan.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    None => {
+                    Ok(None) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    _ => {}
+                    Ok(Some(_)) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(error) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        warn!(
+                            port_scan_id,
+                            consecutive_failures,
+                            failure_budget,
+                            %error,
+                            "transient error polling port scan status; will retry"
+                        );
+                        if consecutive_failures >= failure_budget {
+                            error!(
+                                port_scan_id,
+                                consecutive_failures,
+                                "abandoning port scan claim after exhausting heartbeat failure budget"
+                            );
+                            cancelled.store(true, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 }
                 if tokio::time::Instant::now() >= next_renewal {
-                    if let Err(error) = store.renew_port_scan_claim(port_scan_id, lease_seconds) {
-                        cancelled.store(true, Ordering::SeqCst);
-                        return Err(error);
+                    match store.renew_port_scan_claim(port_scan_id, lease_seconds) {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            next_renewal = tokio::time::Instant::now() + renew_interval;
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            warn!(
+                                port_scan_id,
+                                consecutive_failures,
+                                failure_budget,
+                                %error,
+                                "transient error renewing port scan claim; will retry"
+                            );
+                            if consecutive_failures >= failure_budget {
+                                error!(
+                                    port_scan_id,
+                                    consecutive_failures,
+                                    "abandoning port scan claim after exhausting heartbeat failure budget"
+                                );
+                                cancelled.store(true, Ordering::SeqCst);
+                                return Ok(());
+                            }
+                        }
                     }
-                    next_renewal = tokio::time::Instant::now() + renew_interval;
                 }
             }
         }
@@ -3906,14 +3962,38 @@ async fn bootstrap_job_claim_heartbeat(
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let failure_budget = run_claim_heartbeat_failure_budget(lease_seconds);
     let mut next_renewal = tokio::time::Instant::now() + renew_interval;
+    let mut consecutive_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
                 if tokio::time::Instant::now() >= next_renewal {
-                    store.renew_bootstrap_job_claim(bootstrap_job_id, lease_seconds)?;
-                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                    match store.renew_bootstrap_job_claim(bootstrap_job_id, lease_seconds) {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            next_renewal = tokio::time::Instant::now() + renew_interval;
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            warn!(
+                                bootstrap_job_id,
+                                consecutive_failures,
+                                failure_budget,
+                                %error,
+                                "transient error renewing bootstrap job claim; will retry"
+                            );
+                            if consecutive_failures >= failure_budget {
+                                error!(
+                                    bootstrap_job_id,
+                                    consecutive_failures,
+                                    "abandoning bootstrap job claim after exhausting heartbeat failure budget"
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3930,28 +4010,76 @@ async fn job_claim_heartbeat(
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let failure_budget = run_claim_heartbeat_failure_budget(lease_seconds);
     let mut next_renewal = tokio::time::Instant::now() + renew_interval;
+    let mut consecutive_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
-                match store.get_run(run_id)? {
-                    Some(run) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                match store.get_run(run_id) {
+                    Ok(Some(run)) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    None => {
+                    Ok(None) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    _ => {}
+                    Ok(Some(_)) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(error) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        warn!(
+                            run_id,
+                            job_id,
+                            consecutive_failures,
+                            failure_budget,
+                            %error,
+                            "transient error polling run status; will retry"
+                        );
+                        if consecutive_failures >= failure_budget {
+                            error!(
+                                run_id,
+                                job_id,
+                                consecutive_failures,
+                                "abandoning job claim after exhausting heartbeat failure budget"
+                            );
+                            cancelled.store(true, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 }
                 if tokio::time::Instant::now() >= next_renewal {
-                    if let Err(error) = store.renew_job_claim(job_id, lease_seconds) {
-                        cancelled.store(true, Ordering::SeqCst);
-                        return Err(error);
+                    match store.renew_job_claim(job_id, lease_seconds) {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            next_renewal = tokio::time::Instant::now() + renew_interval;
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            warn!(
+                                run_id,
+                                job_id,
+                                consecutive_failures,
+                                failure_budget,
+                                %error,
+                                "transient error renewing job claim; will retry"
+                            );
+                            if consecutive_failures >= failure_budget {
+                                error!(
+                                    run_id,
+                                    job_id,
+                                    consecutive_failures,
+                                    "abandoning job claim after exhausting heartbeat failure budget"
+                                );
+                                cancelled.store(true, Ordering::SeqCst);
+                                return Ok(());
+                            }
+                        }
                     }
-                    next_renewal = tokio::time::Instant::now() + renew_interval;
                 }
             }
         }
@@ -3967,25 +4095,72 @@ async fn run_claim_heartbeat(
     mut shutdown: oneshot::Receiver<()>,
 ) -> Result<()> {
     let renew_interval = run_claim_heartbeat_interval(lease_seconds);
+    let failure_budget = run_claim_heartbeat_failure_budget(lease_seconds);
     let mut next_renewal = tokio::time::Instant::now() + renew_interval;
+    let mut consecutive_failures: u32 = 0;
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tokio::time::sleep(CLAIM_CANCELLATION_POLL_INTERVAL) => {
-                match store.get_run(run_id)? {
-                    Some(run) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
+                match store.get_run(run_id) {
+                    Ok(Some(run)) if matches!(run.status, RunStatus::Stopping | RunStatus::Completed | RunStatus::Failed) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    None => {
+                    Ok(None) => {
                         cancelled.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                    _ => {}
+                    Ok(Some(_)) => {
+                        consecutive_failures = 0;
+                    }
+                    Err(error) => {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        warn!(
+                            run_id,
+                            consecutive_failures,
+                            failure_budget,
+                            %error,
+                            "transient error polling run status; will retry"
+                        );
+                        if consecutive_failures >= failure_budget {
+                            error!(
+                                run_id,
+                                consecutive_failures,
+                                "abandoning run claim after exhausting heartbeat failure budget"
+                            );
+                            cancelled.store(true, Ordering::SeqCst);
+                            return Ok(());
+                        }
+                        continue;
+                    }
                 }
                 if tokio::time::Instant::now() >= next_renewal {
-                    store.renew_run_claim(run_id, lease_seconds)?;
-                    next_renewal = tokio::time::Instant::now() + renew_interval;
+                    match store.renew_run_claim(run_id, lease_seconds) {
+                        Ok(()) => {
+                            consecutive_failures = 0;
+                            next_renewal = tokio::time::Instant::now() + renew_interval;
+                        }
+                        Err(error) => {
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            warn!(
+                                run_id,
+                                consecutive_failures,
+                                failure_budget,
+                                %error,
+                                "transient error renewing run claim; will retry"
+                            );
+                            if consecutive_failures >= failure_budget {
+                                error!(
+                                    run_id,
+                                    consecutive_failures,
+                                    "abandoning run claim after exhausting heartbeat failure budget"
+                                );
+                                cancelled.store(true, Ordering::SeqCst);
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
         }

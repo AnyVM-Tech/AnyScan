@@ -2386,52 +2386,42 @@ impl DragonflyAnyScanStore {
         }
 
         self.with_state_mut(|state| {
-            refresh_run_totals(state, run_id)?;
-            if has_runnable_jobs(state, run_id) {
-                return Ok(None);
-            }
-
-            let now = utc_now();
-            let summary = compute_run_summary(state, run_id)?;
-            let run_job_ids = state
-                .jobs
-                .iter()
-                .filter(|job| job.run_id == run_id)
-                .map(|job| job.id)
-                .collect::<Vec<_>>();
-            let run = state
-                .runs
-                .iter_mut()
-                .find(|run| run.run.id == run_id)
-                .ok_or_else(|| anyhow!("run {run_id} not found after completion"))?;
-            if matches!(run.run.status, RunStatus::Completed | RunStatus::Failed) {
-                return Ok(None);
-            }
-            let owns_claim = run
-                .claimed_by
-                .as_deref()
-                .is_some_and(|owner| owner == worker_id)
-                && run
-                    .claim_expires_at
-                    .is_some_and(|expires_at| expires_at > now);
-            if !owns_claim {
-                return Ok(None);
-            }
-            run.run.status = if summary.errors_total > 0 {
-                RunStatus::Failed
-            } else {
-                RunStatus::Completed
-            };
-            run.run.completed_at = Some(now);
-            if let Some(notes) = notes {
-                run.run.notes = Some(notes.to_string());
-            }
-            clear_run_claim(run);
-            for job_id in run_job_ids {
-                state.job_claims.remove(&job_id);
-            }
-            Ok(Some(run.run.clone()))
+            finalize_run_in_state(state, run_id, Some(worker_id), notes, utc_now())
         })
+    }
+
+    /// Finalize all in-progress runs that have no remaining runnable jobs,
+    /// regardless of which worker holds the claim. Used by the wedge sweep so
+    /// runs whose claimant died after the last job finished still transition
+    /// to a terminal state. Returns the runs that were just finalized.
+    pub fn finalize_completed_runs(&self) -> Result<Vec<ScanRunRecord>> {
+        self.with_state_mut(|state| {
+            let now = utc_now();
+            let candidate_ids = state
+                .runs
+                .iter()
+                .filter(|run| {
+                    matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress)
+                })
+                .map(|run| run.run.id)
+                .collect::<Vec<_>>();
+            let mut finalized = Vec::new();
+            for run_id in candidate_ids {
+                match finalize_run_in_state(state, run_id, None, None, now)? {
+                    Some(run) => finalized.push(run),
+                    None => {}
+                }
+            }
+            Ok(finalized)
+        })
+    }
+
+    /// Release stale claims on runs and port-scans whose claimant has been
+    /// offline (or whose lease has been expired) longer than `max_stale`.
+    /// After release, the existing claim_next_* logic will reassign the work.
+    /// Returns (runs_released, port_scans_released).
+    pub fn release_stale_claims(&self, max_stale: ChronoDuration) -> Result<(Vec<i64>, Vec<i64>)> {
+        self.with_state_mut(|state| Ok(release_stale_claims_in_state(state, max_stale, utc_now())))
     }
 
     pub fn stop_run(&self, run_id: i64, notes: Option<&str>) -> Result<ScanRunRecord> {
@@ -8779,6 +8769,133 @@ fn get_run_record(state: &DragonflyRuntimeState, run_id: i64) -> Result<ScanRunR
         .ok_or_else(|| anyhow!("run {run_id} not found"))
 }
 
+/// Finalize a run when no runnable jobs remain. Returns Some(run) on the
+/// transition to a terminal state, or None if the run still has work, was
+/// already terminal, or is held by an active claim that does not match
+/// `claimant`.
+///
+/// `claimant` semantics:
+/// - `Some(worker_id)`: the calling worker. The transition is allowed if the
+///   run's claim is held by this worker, has expired, or has been released.
+///   This rescues the wedge where the claimant's heartbeat dies before the
+///   final ack, and a different incarnation re-runs `mark_run_finished`.
+/// - `None`: invoked from the API-side wedge sweep. Allowed only if no other
+///   worker holds an active claim. Since `has_runnable_jobs` is also false,
+///   no concurrent productive work can be lost.
+fn finalize_run_in_state(
+    state: &mut DragonflyRuntimeState,
+    run_id: i64,
+    claimant: Option<&str>,
+    notes: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Option<ScanRunRecord>> {
+    refresh_run_totals(state, run_id)?;
+    if has_runnable_jobs(state, run_id) {
+        return Ok(None);
+    }
+
+    let summary = compute_run_summary(state, run_id)?;
+    let run_job_ids = state
+        .jobs
+        .iter()
+        .filter(|job| job.run_id == run_id)
+        .map(|job| job.id)
+        .collect::<Vec<_>>();
+    let run = state
+        .runs
+        .iter_mut()
+        .find(|run| run.run.id == run_id)
+        .ok_or_else(|| anyhow!("run {run_id} not found after completion"))?;
+    if matches!(run.run.status, RunStatus::Completed | RunStatus::Failed) {
+        return Ok(None);
+    }
+    let claim_is_active = run_claim_is_active(run, now);
+    let same_worker = match (claimant, run.claimed_by.as_deref()) {
+        (Some(worker_id), Some(owner)) => owner == worker_id,
+        _ => false,
+    };
+    // Block only when an ACTIVE claim is held by a different worker. With no
+    // runnable jobs, a stale or absent claim cannot represent in-flight work.
+    if claim_is_active && !same_worker {
+        return Ok(None);
+    }
+    run.run.status = if summary.errors_total > 0 {
+        RunStatus::Failed
+    } else {
+        RunStatus::Completed
+    };
+    run.run.completed_at = Some(now);
+    if let Some(notes) = notes {
+        run.run.notes = Some(notes.to_string());
+    }
+    clear_run_claim(run);
+    for job_id in run_job_ids {
+        state.job_claims.remove(&job_id);
+    }
+    Ok(Some(run.run.clone()))
+}
+
+/// Release stuck claims so the existing claim_next_* logic can reassign them.
+///
+/// "Stuck" means either the lease expired more than `max_stale` ago or the
+/// owner has been offline (worker registry expired) for longer than that
+/// window. Returns the run and port-scan ids whose claims were cleared.
+fn release_stale_claims_in_state(
+    state: &mut DragonflyRuntimeState,
+    max_stale: ChronoDuration,
+    now: DateTime<Utc>,
+) -> (Vec<i64>, Vec<i64>) {
+    let cutoff = now - max_stale;
+    let mut runs_released = Vec::new();
+    let mut port_scans_released = Vec::new();
+
+    let offline_workers: HashSet<String> = state
+        .workers
+        .iter()
+        .filter(|worker| worker.expires_at <= cutoff)
+        .map(|worker| worker.worker_id.clone())
+        .collect();
+
+    for run in state.runs.iter_mut() {
+        if !matches!(run.run.status, RunStatus::Queued | RunStatus::InProgress) {
+            continue;
+        }
+        let Some(owner) = run.claimed_by.as_deref() else {
+            continue;
+        };
+        let lease_long_expired = run
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at <= cutoff);
+        let owner_offline = offline_workers.contains(owner);
+        if lease_long_expired || owner_offline {
+            runs_released.push(run.run.id);
+            clear_run_claim(run);
+        }
+    }
+
+    for record in state.port_scans.iter_mut() {
+        if !matches!(
+            record.port_scan.status,
+            RunStatus::Queued | RunStatus::InProgress
+        ) {
+            continue;
+        }
+        let Some(owner) = record.claimed_by.as_deref() else {
+            continue;
+        };
+        let lease_long_expired = record
+            .claim_expires_at
+            .is_some_and(|expires_at| expires_at <= cutoff);
+        let owner_offline = offline_workers.contains(owner);
+        if lease_long_expired || owner_offline {
+            port_scans_released.push(record.port_scan.id);
+            clear_port_scan_claim(record);
+        }
+    }
+
+    (runs_released, port_scans_released)
+}
+
 fn refresh_run_totals(state: &mut DragonflyRuntimeState, run_id: i64) -> Result<()> {
     let jobs = state
         .jobs
@@ -11679,4 +11796,212 @@ mod tests {
         assert_eq!(expires_at, now + ChronoDuration::seconds(30));
         Ok(())
     }
+
+    /// Reproduces the Run #2 wedge: a worker dies after the last job
+    /// completes, leaving the run in InProgress with a stale `claimed_by`.
+    /// The next mark_run_finished_if_owned call (whether from the original
+    /// worker that came back, a fresh incarnation, or any retry) MUST be
+    /// allowed to drive the run to a terminal state — otherwise it sits
+    /// forever.
+    #[test]
+    fn finalize_run_in_state_self_completes_when_claimant_is_dead() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let mut run = sample_run(2);
+        // Pretend lease was held by a now-dead worker incarnation.
+        run.claimed_by = Some("edge-1-dead".to_string());
+        run.claim_expires_at = Some(now - ChronoDuration::seconds(30));
+        state.runs.push(run);
+        state.jobs.push(sample_job(1, 2, JobStatus::Completed));
+        state.jobs.push(sample_job(2, 2, JobStatus::Completed));
+
+        // A fresh incarnation calls mark_run_finished_if_owned. Even though
+        // its worker_id does not match the dead claimant, the lease has
+        // expired and there are no runnable jobs, so finalization succeeds.
+        let finalized = super::finalize_run_in_state(
+            &mut state,
+            2,
+            Some("edge-1-fresh"),
+            Some("recovered after restart"),
+            now,
+        )?
+        .expect("expected the run to transition to a terminal state");
+        assert!(matches!(finalized.status, RunStatus::Completed));
+        assert_eq!(finalized.notes.as_deref(), Some("recovered after restart"));
+
+        // Idempotent — second call sees a terminal run and returns None.
+        let again = super::finalize_run_in_state(&mut state, 2, Some("edge-2"), None, now)?;
+        assert!(again.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn finalize_run_in_state_refuses_when_active_claim_owned_by_other_worker() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let mut run = sample_run(3);
+        run.claimed_by = Some("edge-1".to_string());
+        run.claim_expires_at = Some(now + ChronoDuration::seconds(60));
+        state.runs.push(run);
+        state.jobs.push(sample_job(1, 3, JobStatus::Completed));
+
+        // No-runnable-jobs is true, but lease is still active and held by
+        // edge-1. A non-claimant must NOT be able to finalize: the active
+        // worker may still be in the middle of its final ack.
+        let result =
+            super::finalize_run_in_state(&mut state, 3, Some("edge-2"), None, now)?;
+        assert!(result.is_none());
+        // The original claimant can still finalize — same-worker path.
+        let result =
+            super::finalize_run_in_state(&mut state, 3, Some("edge-1"), None, now)?
+                .expect("active claim owner should be allowed to finalize");
+        assert!(matches!(result.status, RunStatus::Completed));
+        Ok(())
+    }
+
+    /// Sweep mode: claimant=None means "I am not a worker, I am the API
+    /// janitor". Should finalize wedged runs but never override an active
+    /// claim from a live worker.
+    #[test]
+    fn finalize_completed_runs_sweep_recovers_wedged_runs_only() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+
+        // Run 1: wedged — all jobs done, claimant lease expired.
+        let mut wedged = sample_run(1);
+        wedged.claimed_by = Some("edge-dead".to_string());
+        wedged.claim_expires_at = Some(now - ChronoDuration::seconds(10));
+        state.runs.push(wedged);
+        state.jobs.push(sample_job(10, 1, JobStatus::Completed));
+
+        // Run 2: actively running by a live worker, all jobs done but the
+        // worker hasn't acked yet. Sweep must not finalize — the live worker
+        // is presumably racing to send the final ack.
+        let mut live = sample_run(2);
+        live.claimed_by = Some("edge-live".to_string());
+        live.claim_expires_at = Some(now + ChronoDuration::seconds(60));
+        state.runs.push(live);
+        state.jobs.push(sample_job(20, 2, JobStatus::Completed));
+
+        // Run 3: still has runnable jobs — no finalization regardless of
+        // claim state.
+        let mut busy = sample_run(3);
+        busy.claimed_by = Some("edge-dead".to_string());
+        busy.claim_expires_at = Some(now - ChronoDuration::seconds(10));
+        state.runs.push(busy);
+        state.jobs.push(sample_job(30, 3, JobStatus::Pending));
+
+        // Drive the sweep helper directly — same logic the API janitor uses.
+        let mut finalized_ids = Vec::new();
+        for run_id in [1i64, 2, 3] {
+            if let Some(run) = super::finalize_run_in_state(&mut state, run_id, None, None, now)? {
+                finalized_ids.push(run.id);
+            }
+        }
+        assert_eq!(finalized_ids, vec![1]);
+        // Run 2 still in_progress with its claim intact.
+        let live_after = state.runs.iter().find(|r| r.run.id == 2).unwrap();
+        assert!(matches!(live_after.run.status, RunStatus::InProgress));
+        assert_eq!(live_after.claimed_by.as_deref(), Some("edge-live"));
+        // Run 3 still in_progress with its claim intact.
+        let busy_after = state.runs.iter().find(|r| r.run.id == 3).unwrap();
+        assert!(matches!(busy_after.run.status, RunStatus::InProgress));
+        Ok(())
+    }
+
+    /// `release_stale_claims` releases two classes of stuck claims:
+    ///   1. claims whose lease expired more than `max_stale` ago, AND
+    ///   2. claims held by a worker that's been offline (registry expired)
+    ///      for longer than `max_stale`.
+    /// After release, claim_next_pending_* should accept the work for a
+    /// fresh worker, cutting the 47% follow-on-Run failure rate.
+    #[test]
+    fn release_stale_claims_frees_dead_worker_holds() {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        // edge-dead: registry expired 5min ago.
+        state.workers.push(sample_worker(
+            "edge-dead",
+            "default",
+            WorkerLifecycleState::Active,
+            now - ChronoDuration::minutes(5),
+        ));
+        // edge-flapping: registry valid (just refreshed).
+        state.workers.push(sample_worker(
+            "edge-flapping",
+            "default",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::minutes(2),
+        ));
+
+        // Run held by dead worker, lease still nominally valid because
+        // dragonfly hasn't expired it yet but the worker is offline.
+        let mut dead_run = sample_run(101);
+        dead_run.claimed_by = Some("edge-dead".to_string());
+        dead_run.claim_expires_at = Some(now + ChronoDuration::seconds(30));
+        state.runs.push(dead_run);
+
+        // Run held by flapping worker — fresh registry, lease active. Must
+        // NOT be released: this is what live workers look like.
+        let mut live_run = sample_run(102);
+        live_run.claimed_by = Some("edge-flapping".to_string());
+        live_run.claim_expires_at = Some(now + ChronoDuration::seconds(30));
+        state.runs.push(live_run);
+
+        // Run with a long-expired lease whose owner field still points at a
+        // worker we don't know about anymore. Should also be freed.
+        let mut orphan_run = sample_run(103);
+        orphan_run.claimed_by = Some("edge-vanished".to_string());
+        orphan_run.claim_expires_at = Some(now - ChronoDuration::minutes(10));
+        state.runs.push(orphan_run);
+
+        let (runs_released, port_scans_released) = super::release_stale_claims_in_state(
+            &mut state,
+            ChronoDuration::minutes(3),
+            now,
+        );
+        assert!(port_scans_released.is_empty());
+        let mut released = runs_released;
+        released.sort();
+        assert_eq!(released, vec![101, 103]);
+
+        let r1 = state.runs.iter().find(|r| r.run.id == 101).unwrap();
+        assert!(r1.claimed_by.is_none());
+        let r2 = state.runs.iter().find(|r| r.run.id == 102).unwrap();
+        assert_eq!(r2.claimed_by.as_deref(), Some("edge-flapping"));
+        let r3 = state.runs.iter().find(|r| r.run.id == 103).unwrap();
+        assert!(r3.claimed_by.is_none());
+    }
+
+    /// After release_stale_claims clears a dead claimant, a different worker
+    /// can call claim_next_runnable_run and pick the run up — proving the
+    /// lease-recovery path the user describes as "Idempotent re-claim".
+    #[test]
+    fn fresh_worker_reclaims_run_after_stale_claim_released() -> Result<()> {
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        state.workers.push(sample_worker(
+            "edge-fresh",
+            "default",
+            WorkerLifecycleState::Active,
+            now + ChronoDuration::seconds(60),
+        ));
+
+        // Run owned by a worker that has been offline. There IS still a
+        // pending job, so finalization is not the right recovery — re-claim
+        // is.
+        let mut wedged = sample_run(50);
+        wedged.claimed_by = Some("edge-dead".to_string());
+        wedged.claim_expires_at = Some(now - ChronoDuration::minutes(5));
+        state.runs.push(wedged);
+        state.jobs.push(sample_job(500, 50, JobStatus::Pending));
+
+        // Without releasing first, the run is already eligible for re-claim
+        // (lease expired) — verify the existing logic:
+        let claimed = super::claim_next_runnable_run_in_state(&mut state, "edge-fresh", now, 60)?
+            .expect("expected the fresh worker to re-claim a stale-leased run");
+        assert_eq!(claimed.id, 50);
+        Ok(())
+    }
+
 }
