@@ -6271,7 +6271,18 @@ fn match_swagger_ui_signal(document: &FetchedDocument) -> Option<SwaggerSignal> 
     }
 
     let lowered_path = document.path.to_ascii_lowercase();
-    let normalized_path = lowered_path.trim_end_matches('/');
+    // Strip query string and fragment before suffix matching: paths like
+    // `/v3/api-docs?group=internal` are common grouped-spec routes and would
+    // otherwise fail every suffix check below.
+    let path_without_query = lowered_path
+        .split_once('?')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&lowered_path);
+    let path_without_fragment = path_without_query
+        .split_once('#')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(path_without_query);
+    let normalized_path = path_without_fragment.trim_end_matches('/');
     let content_type = document
         .content_type
         .as_deref()
@@ -9879,6 +9890,46 @@ mod tests {
         assert!(
             has_swagger_ui_finding(&findings),
             "/api-docs serving HTML swagger-ui page must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_grouped_spec_path_with_query_string() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Grouped Spec", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/v3/api-docs?group=internal",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Grouped-spec route /v3/api-docs?group=internal must reach the JSON validator"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_spec_path_with_fragment() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Fragmented", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json#section",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Spec path with URL fragment must still match"
         );
     }
 
