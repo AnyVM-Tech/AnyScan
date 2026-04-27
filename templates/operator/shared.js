@@ -5884,16 +5884,25 @@
 				// nav/status onto extra rows. The CSS fallback (64px) applies
 				// while the appbar is still hidden (pre-auth).
 				const root = document.documentElement;
+				// Cap the observed height so a runaway resize-feedback loop
+				// (e.g. if any descendant CSS uses `var(--appbar-height)` for a
+				// min-height/min-width) can't push the page into the
+				// hundred-thousand-pixel territory. Real appbar heights are
+				// O(40-200px); 256px is generous.
+				const APPBAR_HEIGHT_CAP = 256;
+				let lastSetHeight = -1;
 				const updateAppbarHeight = () => {
-					const h = Math.round(
+					const raw = Math.round(
 						appbar.getBoundingClientRect().height
 					);
-					if (h > 0) {
-						root.style.setProperty(
-							'--appbar-height',
-							h + 'px'
-						);
-					}
+					if (raw <= 0) return;
+					const h = Math.min(raw, APPBAR_HEIGHT_CAP);
+					if (h === lastSetHeight) return;
+					lastSetHeight = h;
+					root.style.setProperty(
+						'--appbar-height',
+						h + 'px'
+					);
 				};
 				updateAppbarHeight();
 				if (typeof ResizeObserver !== 'undefined') {

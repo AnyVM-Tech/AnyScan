@@ -158,7 +158,13 @@
 				grid-template-columns: auto 1fr auto;
 				align-items: center;
 				gap: var(--space-5);
-				min-height: var(--appbar-height);
+				/* Don't pin min-height to var(--appbar-height): the ResizeObserver
+				   that drives that var reads the outer .appbar height, which is
+				   driven by THIS element. Equating them creates a layout
+				   feedback loop that runs the appbar height to ~80,000px and
+				   the page becomes a single empty scroll. The default 64px
+				   line-height of the brand mark + buttons is already enough
+				   to keep the bar visible without this constraint. */
 			}
 
 			.appbar__brand {
