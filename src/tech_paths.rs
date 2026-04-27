@@ -1469,6 +1469,22 @@ pub fn sensitive_variant_candidates(path: &str) -> Vec<TechPathCandidate> {
         }
     }
 
+    // Lifecycle expansion for `.env*` discoveries: when a `.env`-family
+    // file is found in a directory, the same directory is highly likely
+    // to host other lifecycle/environment variants (`.env.local`,
+    // `.env.production`, etc.). Emit the rest of the family so dynamic
+    // discovery surfaces them too — operators do not have to opt into
+    // the full static `dotenv-variants` profile to benefit.
+    for variant in dotenv_lifecycle_variants_for(trimmed) {
+        if seen.insert(variant.clone()) {
+            results.push(TechPathCandidate {
+                path: variant,
+                source: "sensitive-dotenv-variant",
+                score: 920,
+            });
+        }
+    }
+
     let directory_for_leaks = if trimmed.ends_with('/') {
         trimmed.trim_end_matches('/').to_string()
     } else {
@@ -1566,6 +1582,88 @@ fn backup_variant_score(variant: &str) -> u16 {
         return 860;
     }
     820
+}
+
+// Lifecycle / framework / edge-case suffixes for the `.env` family.
+// When `/foo/.env` is discovered we emit `/foo/.env.local`,
+// `/foo/.env.production`, etc.
+const DOTENV_LIFECYCLE_SUFFIXES: &[&str] = &[
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.staging",
+    ".env.test",
+    ".env.testing",
+    ".env.dev",
+    ".env.prod",
+    ".env.qa",
+    ".env.uat",
+    ".env.example",
+    ".env.sample",
+    ".env.dist",
+    ".env.template",
+    ".env.default",
+    ".env.development.local",
+    ".env.production.local",
+    ".env.staging.local",
+    ".env.test.local",
+    ".env.docker",
+    ".env.compose",
+    ".env.shared",
+    ".env.atlas",
+    ".env.vault",
+    ".env.vercel",
+    ".env.netlify",
+    ".env.heroku",
+    ".env.bak",
+    ".env.old",
+    ".env.orig",
+    ".env.save",
+    ".env.swp",
+    ".env.swo",
+    ".env~",
+    ".envrc",
+    ".flaskenv",
+];
+
+fn dotenv_lifecycle_variants_for(path: &str) -> Vec<String> {
+    if path.ends_with('/') {
+        return Vec::new();
+    }
+
+    let (parent_with_slash, file_name) = match path.rfind('/') {
+        Some(idx) => (&path[..=idx], &path[idx + 1..]),
+        None => return Vec::new(),
+    };
+
+    if !is_dotenv_family_basename(file_name) {
+        return Vec::new();
+    }
+
+    DOTENV_LIFECYCLE_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{parent_with_slash}{suffix}"))
+        .collect()
+}
+
+fn is_dotenv_family_basename(file_name: &str) -> bool {
+    let lowered = file_name.to_ascii_lowercase();
+    if lowered.is_empty() {
+        return false;
+    }
+    matches!(
+        lowered.as_str(),
+        "dotenv"
+            | ".dotenv"
+            | "env"
+            | "env.local"
+            | "env.production"
+            | ".envrc"
+            | ".flaskenv"
+    ) || lowered.starts_with(".env")
+        || lowered.starts_with("env.")
+        || lowered.starts_with(".env_")
 }
 
 fn parent_directory(path: &str) -> &str {
@@ -1984,5 +2082,73 @@ mod tests {
         let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
         assert!(paths.contains(&"/api/v1/.git/HEAD"));
         assert!(paths.contains(&"/api/v1/.DS_Store"));
+    }
+
+    #[test]
+    fn sensitive_variant_for_root_env_emits_lifecycle_family() {
+        let candidates = sensitive_variant_candidates("/.env");
+        let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
+
+        // Lifecycle / framework variants in the same directory.
+        assert!(paths.contains(&"/.env.production"));
+        assert!(paths.contains(&"/.env.staging"));
+        assert!(paths.contains(&"/.env.development"));
+        assert!(paths.contains(&"/.env.local"));
+        assert!(paths.contains(&"/.env.test"));
+        assert!(paths.contains(&"/.env.docker"));
+        assert!(paths.contains(&"/.env.vault"));
+
+        // The lifecycle source tag identifies the new generator.
+        let prod = candidates
+            .iter()
+            .find(|c| c.path == "/.env.production")
+            .expect(".env.production should be derived");
+        assert_eq!(prod.source, "sensitive-dotenv-variant");
+        assert!(prod.score >= 900, "lifecycle score = {}", prod.score);
+    }
+
+    #[test]
+    fn sensitive_variant_for_subdir_env_keeps_parent_directory() {
+        let candidates = sensitive_variant_candidates("/api/.env");
+        let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
+
+        assert!(paths.contains(&"/api/.env.local"));
+        assert!(paths.contains(&"/api/.env.production"));
+        assert!(paths.contains(&"/api/.env.staging"));
+        assert!(paths.contains(&"/api/.env.development.local"));
+        // No leakage into the root directory.
+        assert!(!paths.contains(&"/.env.production"));
+    }
+
+    #[test]
+    fn sensitive_variant_for_env_local_still_includes_other_lifecycle() {
+        // A discovered `.env.local` should also surface `.env.production`,
+        // `.env.staging`, etc. — not just backups of `.env.local` itself.
+        let candidates = sensitive_variant_candidates("/.env.local");
+        let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"/.env.production"));
+        assert!(paths.contains(&"/.env.staging"));
+        assert!(paths.contains(&"/.envrc"));
+    }
+
+    #[test]
+    fn sensitive_variant_for_envrc_treated_as_dotenv_family() {
+        let candidates = sensitive_variant_candidates("/.envrc");
+        let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"/.env"));
+        assert!(paths.contains(&"/.env.production"));
+    }
+
+    #[test]
+    fn sensitive_variant_non_env_file_skips_lifecycle_expansion() {
+        // A regular file should not get any `sensitive-dotenv-variant`
+        // entries — only backup variants and VCS leaks.
+        let candidates = sensitive_variant_candidates("/index.php");
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.source != "sensitive-dotenv-variant"),
+            "non-.env path should not yield dotenv lifecycle variants"
+        );
     }
 }
