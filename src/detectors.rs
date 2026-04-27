@@ -6286,6 +6286,14 @@ fn match_swagger_ui_signal(document: &FetchedDocument) -> Option<SwaggerSignal> 
             "/v2/api-docs",
             "/v3/api-docs",
             "/api-docs.json",
+            "/openapi/v2",
+            "/openapi/v3",
+            "/openapi/v2.json",
+            "/openapi/v3.json",
+            // /api-docs is ambiguous — many servers serve raw Swagger/OpenAPI
+            // JSON here while others serve the UI page; content-type below
+            // decides which validator actually runs.
+            "/api-docs",
         ],
     );
     let yaml_spec_path = matches_path_suffix(
@@ -6298,7 +6306,15 @@ fn match_swagger_ui_signal(document: &FetchedDocument) -> Option<SwaggerSignal> 
         ],
     );
     let ui_path = lowered_path.contains("/swagger-ui")
-        || matches_path_suffix(normalized_path, &["/swagger", "/api-docs"]);
+        || matches_path_suffix(
+            normalized_path,
+            &[
+                "/swagger",
+                "/api-docs",
+                "/swagger/index.html",
+                "/swagger/index.htm",
+            ],
+        );
 
     if json_spec_path && content_type_compatible(&content_type, &["json"]) {
         if let Some(signal) = validate_swagger_json_spec(body) {
@@ -9760,6 +9776,132 @@ mod tests {
             finding.evidence.contains("OpenAPI"),
             "evidence snippet must preserve original casing, got {:?}",
             finding.evidence
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_kubernetes_openapi_v2_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Kubernetes", "version": "v1.28.0" },
+  "paths": { "/api/v1/namespaces": { "get": { "summary": "List namespaces" } } }
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi/v2",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Kubernetes /openapi/v2 returning Swagger 2.0 JSON must match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_kubernetes_openapi_v3_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "Kubernetes", "version": "v1.28.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi/v3",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Kubernetes /openapi/v3 returning OpenAPI 3.x JSON must match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_dotnet_swagger_v1_json_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Example .NET API", "version": "v1" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger/v1/swagger.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/swagger/v1/swagger.json must reach the JSON validator (matches /swagger.json suffix)"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_api_docs_serving_raw_json() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Express API", "version": "1.0.0" },
+  "paths": { "/users": { "get": { "summary": "List users" } } }
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/api-docs",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/api-docs serving raw OpenAPI JSON must reach the JSON validator"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_still_matches_api_docs_serving_html_ui() {
+        let engine = DetectorEngine::new();
+        let body = r#"<!doctype html>
+<html>
+  <head><title>API Docs</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="./swagger-ui-bundle.js"></script>
+  </body>
+</html>"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/api-docs",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/api-docs serving HTML swagger-ui page must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_swagger_index_html_ui_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"<!doctype html>
+<html>
+  <head><title>Swagger</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <link rel="stylesheet" href="./swagger-ui.css">
+  </body>
+</html>"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger/index.html",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/swagger/index.html with swagger-ui assets must match"
         );
     }
 }
