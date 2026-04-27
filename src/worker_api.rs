@@ -15,15 +15,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::AppConfig,
     core::{
-        ApiEvent, ArchiveJobRecord, FetchTelemetry, FindingRecord, NewFinding,
-        PortScanProtocolFindingRecord, PortScanRecord, PortScanResumeStateRecord,
-        RecurringScheduleRecord,
-        RepositoryDefinition, RepositoryRecord, RunScope, RunSummary, ScanDefaultsSummary,
-        ScanJobRecord, ScanRunRecord, TargetDefinition, TargetRecord,
-        WorkerBootstrapCodeExchange, WorkerBootstrapCodeExchangeRequest,
-        WorkerBootstrapCandidateInput, WorkerBootstrapCandidateRecord,
-        WorkerBootstrapJobClaim, WorkerBootstrapJobRecord, WorkerRecord, WorkerRegistration,
-        WorkerRemoteCommandRecord,
+        ActiveAuthorizedPluginExecution, ApiEvent, ArchiveJobRecord, FetchTelemetry,
+        FindingRecord, NewFinding, PortScanProtocolFindingRecord, PortScanRecord,
+        PortScanResumeStateRecord, RecurringScheduleRecord, RepositoryDefinition,
+        RepositoryRecord, RunScope, RunSummary, ScanDefaultsSummary, ScanJobRecord,
+        ScanRunRecord, TargetDefinition, TargetRecord, WorkerBootstrapCodeExchange,
+        WorkerBootstrapCodeExchangeRequest, WorkerBootstrapCandidateInput,
+        WorkerBootstrapCandidateRecord, WorkerBootstrapJobClaim, WorkerBootstrapJobRecord,
+        WorkerRecord, WorkerRegistration, WorkerRemoteCommandRecord,
     },
 };
 
@@ -105,6 +104,13 @@ pub enum WorkerControlRequest {
     QueueRunWithEvent {
         requested_by: String,
         scope: Option<RunScope>,
+        /// Authorization policy to attach to the synthesized Run. `None`
+        /// preserves the historical `Default::default()` (false/false)
+        /// behavior used by ad-hoc queue paths. Follow-on Runs synthesized
+        /// from a parent port scan pass `Some(parent.active_authorized_plugins)`
+        /// so operator opt-in survives the worker→API hop.
+        #[serde(default)]
+        active_authorized_plugins: Option<ActiveAuthorizedPluginExecution>,
     },
     MaybeRunArchivePass,
     ClaimNextRunnableRun {
@@ -413,10 +419,12 @@ impl AnyScanWorkerApiClient {
         &self,
         requested_by: &str,
         scope: Option<&crate::core::RunScope>,
+        active_authorized_plugins: Option<&ActiveAuthorizedPluginExecution>,
     ) -> Result<QueuedRunWithSummary> {
         match self.request(WorkerControlRequest::QueueRunWithEvent {
             requested_by: requested_by.to_string(),
             scope: scope.cloned(),
+            active_authorized_plugins: active_authorized_plugins.cloned(),
         })? {
             WorkerControlResponse::QueuedRunWithSummary { queued } => Ok(queued),
             other => Err(unexpected_worker_response("queued run with summary", &other)),
@@ -1143,7 +1151,7 @@ mod tests {
         default_worker_api_proxy_url_for_base_url, load_env_value_from_file,
         WorkerControlRequest, WorkerControlResponse,
     };
-    use crate::core::InventoryPolicySnapshot;
+    use crate::core::{ActiveAuthorizedPluginExecution, InventoryPolicySnapshot};
 
     #[test]
     fn worker_control_request_load_inventory_policy_serializes_to_snake_case_tag() {
@@ -1190,6 +1198,68 @@ mod tests {
             default_worker_api_proxy_url_for_base_url("https://scan.anyvm.tech"),
             None
         );
+    }
+
+    #[test]
+    fn queue_run_with_event_carries_active_authorized_plugins_when_provided() {
+        let request = WorkerControlRequest::QueueRunWithEvent {
+            requested_by: "port-scan-worker".to_string(),
+            scope: None,
+            active_authorized_plugins: Some(ActiveAuthorizedPluginExecution {
+                global_gate_enabled: true,
+                request_opt_in_enabled: true,
+            }),
+        };
+        let json = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            json["active_authorized_plugins"]["global_gate_enabled"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            json["active_authorized_plugins"]["request_opt_in_enabled"],
+            serde_json::Value::Bool(true)
+        );
+
+        let decoded: WorkerControlRequest =
+            serde_json::from_value(json).expect("round-trip deserialize");
+        match decoded {
+            WorkerControlRequest::QueueRunWithEvent {
+                active_authorized_plugins: Some(policy),
+                ..
+            } => {
+                assert!(policy.global_gate_enabled);
+                assert!(policy.request_opt_in_enabled);
+                assert!(policy.is_enabled());
+            }
+            other => panic!("expected QueueRunWithEvent with policy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queue_run_with_event_omitting_policy_decodes_as_none_for_backwards_compatibility() {
+        // Older worker payloads predate the policy field; absent =>
+        // None so the API handler falls back to the safe Default.
+        let json = serde_json::json!({
+            "type": "queue_run_with_event",
+            "requested_by": "ad-hoc-operator",
+            "scope": null,
+        });
+        let decoded: WorkerControlRequest =
+            serde_json::from_value(json).expect("legacy payload should still parse");
+        match decoded {
+            WorkerControlRequest::QueueRunWithEvent {
+                active_authorized_plugins,
+                requested_by,
+                ..
+            } => {
+                assert_eq!(requested_by, "ad-hoc-operator");
+                assert!(
+                    active_authorized_plugins.is_none(),
+                    "missing field must decode as None to preserve fail-closed default"
+                );
+            }
+            other => panic!("expected QueueRunWithEvent, got {other:?}"),
+        }
     }
 
     #[test]

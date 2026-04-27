@@ -9991,6 +9991,72 @@ mod tests {
     }
 
     #[test]
+    fn create_run_propagates_parent_port_scan_active_authorized_plugins_to_follow_on_run() {
+        // Regression: streaming follow-on flusher used to synthesize Runs
+        // with `Default::default()` (false/false) for active_authorized
+        // regardless of the parent port scan's policy. This silenced the
+        // 29 active_authorized plugins (Geoserver RCE, Magento XXE, Log4J,
+        // PhpCgi RCE, MeshCentral, NetBox, NodeRED, Spip RCE, ...) on every
+        // host scan even though the operator opted in at queue time.
+        //
+        // The queue_run_with_active_authorized_plugins → create_run path is
+        // the store-side contract that the fix relies on: whatever policy
+        // the API handler hands us must round-trip into the Run record.
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let target = sample_target(101);
+        let parent_policy = ActiveAuthorizedPluginExecution {
+            global_gate_enabled: true,
+            request_opt_in_enabled: true,
+        };
+
+        let run = super::create_run(
+            &mut state,
+            None,
+            Some("port-scan-worker".to_string()),
+            None,
+            parent_policy.clone(),
+            &[target],
+            now,
+        );
+
+        assert_eq!(run.active_authorized_plugins, parent_policy);
+        assert!(
+            run.active_authorized_plugins.is_enabled(),
+            "follow-on Run synthesized from an opted-in parent must report is_enabled()"
+        );
+        assert_eq!(state.runs.len(), 1);
+        assert_eq!(state.runs[0].run.active_authorized_plugins, parent_policy);
+    }
+
+    #[test]
+    fn create_run_default_policy_remains_fail_closed_for_ad_hoc_paths() {
+        // Defense-in-depth: when the API handler receives a QueueRunWithEvent
+        // request with `active_authorized_plugins = None` (the ad-hoc queue
+        // path: operator CLI, worker-once), it dispatches to `queue_run`,
+        // which threads `ActiveAuthorizedPluginExecution::default()` through
+        // create_run. That default MUST stay false/false so unauthorized
+        // queue paths can never accidentally enable invasive plugins.
+        let now = Utc::now();
+        let mut state = DragonflyRuntimeState::default();
+        let target = sample_target(102);
+
+        let run = super::create_run(
+            &mut state,
+            None,
+            Some("ad-hoc-operator".to_string()),
+            None,
+            ActiveAuthorizedPluginExecution::default(),
+            &[target],
+            now,
+        );
+
+        assert!(!run.active_authorized_plugins.global_gate_enabled);
+        assert!(!run.active_authorized_plugins.request_opt_in_enabled);
+        assert!(!run.active_authorized_plugins.is_enabled());
+    }
+
+    #[test]
     fn materialize_schedule_preserves_active_authorized_plugins_without_run() {
         let now = Utc::now();
         let schedule = RecurringScheduleRecord {
