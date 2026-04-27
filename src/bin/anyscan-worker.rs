@@ -563,6 +563,21 @@ async fn run_daemon(
                 error!(%error, "failed to queue due schedules");
             }
 
+            // Refresh inventory policy here — before any of the claim arms
+            // below, all of which `continue` back to the loop top. A busy
+            // worker keeps claiming tasks via those fast paths, so anything
+            // placed *after* them never runs while the worker is saturated.
+            // Putting the refresh here also means every claim immediately
+            // below operates against the freshest fetched policy.
+            if last_inventory_refresh_at.elapsed() >= inventory_refresh_interval {
+                if let Err(error) =
+                    refresh_inventory_policy_from_control_plane(&mut config, &store)
+                {
+                    warn!(%error, "inventory policy refresh failed; keeping prior policy");
+                }
+                last_inventory_refresh_at = Instant::now();
+            }
+
             if active_tasks.len() < max_active_tasks
                 && worker_runtime.registration.supports_bootstrap
             {
@@ -696,15 +711,6 @@ async fn run_daemon(
                 }
             }
 
-            if last_inventory_refresh_at.elapsed() >= inventory_refresh_interval {
-                if let Err(error) =
-                    refresh_inventory_policy_from_control_plane(&mut config, &store)
-                {
-                    warn!(%error, "inventory policy refresh failed; keeping prior policy");
-                }
-                last_inventory_refresh_at = Instant::now();
-            }
-
             let effective_config = load_effective_runtime_config(&config, &store)?;
             let idle_sleep_seconds = if active_tasks.is_empty() {
                 effective_config.scan.poll_interval_seconds
@@ -729,6 +735,19 @@ async fn run_once(
     worker_runtime: &WorkerRuntime,
 ) -> Result<()> {
     let mut config = config.clone();
+    let worker_registration_ttl = worker_registration_ttl_seconds(&config);
+    let worker_registration_interval =
+        worker_registration_refresh_interval(&config, worker_registration_ttl);
+    let registered_worker = register_worker_or_bail(
+        &store,
+        &worker_runtime.registration,
+        worker_registration_ttl,
+    )?;
+    // Fetch inventory policy AFTER register_worker_or_bail — non-register
+    // /api/worker/control requests in worker_control authenticate as an
+    // already-registered worker, so a fresh agent has to register first or
+    // the LoadInventoryPolicy call returns 401 and falls back to the local
+    // policy for the entire one-shot run.
     if let Err(error) = refresh_inventory_policy_from_control_plane(&mut config, &store) {
         warn!(
             %error,
@@ -736,14 +755,6 @@ async fn run_once(
         );
     }
     let config = &config;
-    let worker_registration_ttl = worker_registration_ttl_seconds(config);
-    let worker_registration_interval =
-        worker_registration_refresh_interval(config, worker_registration_ttl);
-    let registered_worker = register_worker_or_bail(
-        &store,
-        &worker_runtime.registration,
-        worker_registration_ttl,
-    )?;
     let (remote_update_tx, remote_update_rx) =
         watch::channel(registered_worker.remote_update_requested_at);
     let (registration_shutdown_tx, registration_shutdown_rx) = oneshot::channel();
