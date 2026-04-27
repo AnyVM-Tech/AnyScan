@@ -91,6 +91,20 @@ def render_evidence(rule: dict[str, object], summary: str, document: dict[str, o
     return str(rule.get("evidence", summary))
 
 
+def _abbrev(value: str, limit: int = 80) -> str:
+    if len(value) <= limit:
+        return value
+    half = max(1, (limit - 3) // 2)
+    return f"{value[:half]}...{value[-half:]}"
+
+
+def _first_match_token(haystack: str, needles: list[str]) -> str | None:
+    for needle in needles:
+        if needle and needle in haystack:
+            return needle
+    return None
+
+
 def collect_matched_signals(
     rule: dict[str, object],
     path: str,
@@ -99,27 +113,41 @@ def collect_matched_signals(
     header_blob: str,
     aliases: list[str],
 ) -> list[str]:
+    """Return matched_signals as ``"<category>:<substring>"`` entries.
+
+    Carries the actual matched fragment (the path token, body keyword, regex
+    match excerpt, etc.) so reviewers can see *why* the rule fired without
+    re-running the plugin.
+    """
     signals: list[str] = []
-    if rule.get("path_contains") and contains_all(
-        path, [str(value).lower() for value in rule.get("path_contains", [])]
-    ):
-        signals.append("path_contains")
-    if rule.get("any_of_path_contains") and contains_any(
-        path, [str(value).lower() for value in rule.get("any_of_path_contains", [])]
-    ):
-        signals.append("path_hint")
-    if rule.get("body_contains") and contains_all(
-        body, [str(value).lower() for value in rule.get("body_contains", [])]
-    ):
-        signals.append("body_contains")
-    if rule.get("any_of_body_contains") and contains_any(
-        body, [str(value).lower() for value in rule.get("any_of_body_contains", [])]
-    ):
-        signals.append("body_hint")
-    if rule.get("path_regex") and re.search(str(rule.get("path_regex")), path, flags=re.IGNORECASE):
-        signals.append("path_regex")
-    if rule.get("body_regex") and re.search(str(rule.get("body_regex")), body, flags=re.IGNORECASE):
-        signals.append("body_regex")
+
+    path_contains_list = [str(value).lower() for value in rule.get("path_contains", [])]
+    if path_contains_list and contains_all(path, path_contains_list):
+        signals.append(f"path_contains:{','.join(path_contains_list)}")
+
+    any_of_path_contains_list = [str(value).lower() for value in rule.get("any_of_path_contains", [])]
+    matched_path_hint = _first_match_token(path, any_of_path_contains_list)
+    if matched_path_hint is not None:
+        signals.append(f"path_hint:{matched_path_hint}")
+
+    body_contains_list = [str(value).lower() for value in rule.get("body_contains", [])]
+    if body_contains_list and contains_all(body, body_contains_list):
+        signals.append(f"body_contains:{','.join(body_contains_list)}")
+
+    any_of_body_contains_list = [str(value).lower() for value in rule.get("any_of_body_contains", [])]
+    matched_body_hint = _first_match_token(body, any_of_body_contains_list)
+    if matched_body_hint is not None:
+        signals.append(f"body_hint:{matched_body_hint}")
+
+    if rule.get("path_regex"):
+        match = re.search(str(rule.get("path_regex")), path, flags=re.IGNORECASE)
+        if match:
+            signals.append(f"path_regex:{_abbrev(match.group(0))}")
+    if rule.get("body_regex"):
+        match = re.search(str(rule.get("body_regex")), body, flags=re.IGNORECASE)
+        if match:
+            signals.append(f"body_regex:{_abbrev(match.group(0))}")
+
     header_contains = {
         str(name).strip().lower(): str(value).strip().lower()
         for name, value in dict(rule.get("header_contains", {})).items()
@@ -128,17 +156,22 @@ def collect_matched_signals(
     if header_contains and all(
         token in headers.get(name, "") for name, token in header_contains.items()
     ):
-        signals.append("header_contains")
-    if rule.get("header_regex") and re.search(
-        str(rule.get("header_regex")), header_blob, flags=re.IGNORECASE
-    ):
-        signals.append("header_regex")
-    if aliases and (
-        contains_any(path, aliases)
-        or contains_any(body, aliases)
-        or contains_any(header_blob, aliases)
-    ):
-        signals.append("alias")
+        rendered = ",".join(f"{name}={token}" for name, token in header_contains.items())
+        signals.append(f"header_contains:{rendered}")
+
+    if rule.get("header_regex"):
+        match = re.search(str(rule.get("header_regex")), header_blob, flags=re.IGNORECASE)
+        if match:
+            signals.append(f"header_regex:{_abbrev(match.group(0))}")
+
+    if aliases:
+        matched_alias = (
+            _first_match_token(path, aliases)
+            or _first_match_token(body, aliases)
+            or _first_match_token(header_blob, aliases)
+        )
+        if matched_alias is not None:
+            signals.append(f"alias:{matched_alias}")
     return signals
 
 
@@ -150,12 +183,51 @@ def score_value(rule: dict[str, object], field: str, default: int = 1) -> int:
         return default
 
 
+DEFAULT_STATUS_IN: tuple[int, ...] = (200, 201, 202, 203, 204, 206)
+DEFAULT_MIN_BODY_BYTES = 50
+
+
+def _resolved_status_filter(rule: dict[str, object]) -> list[int] | None:
+    """Return the status whitelist to apply to this rule.
+
+    - When the rule does not declare ``status_in``, default to 2xx
+      (matches PR #53's SwaggerUI hardening: a finding requires a successful
+      response, not a CDN error page).
+    - When the rule sets ``status_in: []`` explicitly, treat that as opt-out
+      ("no status filter") so exploit-marker plugins can still reach 4xx/5xx
+      bodies.
+    """
+    raw = rule.get("status_in")
+    if raw is None:
+        return list(DEFAULT_STATUS_IN)
+    values = [int(value) for value in raw]
+    if not values:
+        return None
+    return values
+
+
 def match_rule(document: dict[str, object], rule: dict[str, object]) -> bool:
     path = str(document.get("path", "")).lower()
-    body = str(document.get("body", "")).lower()
+    raw_body = str(document.get("body", ""))
+    body = raw_body.lower()
     status = int(document.get("status", 0) or 0)
     headers = normalize_headers(document)
     header_blob = "\n".join(f"{name}: {value}" for name, value in headers.items())
+
+    # Default-deny on non-2xx unless the rule explicitly opts out via
+    # ``status_in: []``. Same shape as PR #53's SwaggerUI matcher.
+    status_filter = _resolved_status_filter(rule)
+    if status_filter is not None and status not in status_filter:
+        return False
+
+    min_body_bytes = rule.get("min_body_bytes")
+    if min_body_bytes is None:
+        min_body_bytes = DEFAULT_MIN_BODY_BYTES
+    try:
+        if len(raw_body) < int(min_body_bytes):
+            return False
+    except (TypeError, ValueError):
+        pass
 
     path_contains = [str(value).lower() for value in rule.get("path_contains", [])]
     any_of_path_contains = [str(value).lower() for value in rule.get("any_of_path_contains", [])]
@@ -169,7 +241,6 @@ def match_rule(document: dict[str, object], rule: dict[str, object]) -> bool:
     any_of_body_not_contains = [
         str(value).lower() for value in rule.get("any_of_body_not_contains", [])
     ]
-    status_in = [int(value) for value in rule.get("status_in", [])]
     body_regex = rule.get("body_regex")
     path_regex = rule.get("path_regex")
     body_not_regex = rule.get("body_not_regex")
@@ -239,8 +310,6 @@ def match_rule(document: dict[str, object], rule: dict[str, object]) -> bool:
             return False
         if matched:
             score += score_value(rule, "any_of_body_contains_score")
-    if status_in and status not in status_in:
-        return False
     if path_regex:
         positive_matchers += 1
         matched = bool(re.search(str(path_regex), path, flags=re.IGNORECASE))
