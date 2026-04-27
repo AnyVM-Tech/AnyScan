@@ -5540,13 +5540,16 @@ fn load_effective_runtime_config(
 const INVENTORY_REFRESH_INTERVAL_ENV: &str = "AGENT_INVENTORY_REFRESH_SECONDS";
 const DEFAULT_INVENTORY_REFRESH_INTERVAL_SECONDS: u64 = 300;
 
-fn inventory_refresh_interval() -> Duration {
-    let parsed = env::var(INVENTORY_REFRESH_INTERVAL_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
+fn parse_inventory_refresh_interval(raw: Option<&str>) -> Duration {
+    let parsed = raw
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_INVENTORY_REFRESH_INTERVAL_SECONDS);
     Duration::from_secs(parsed)
+}
+
+fn inventory_refresh_interval() -> Duration {
+    parse_inventory_refresh_interval(env::var(INVENTORY_REFRESH_INTERVAL_ENV).ok().as_deref())
 }
 
 fn apply_inventory_policy_snapshot_to_config(
@@ -5581,10 +5584,10 @@ mod tests {
         ScannerOutputCounter, WORKER_REGISTRATION_TTL_MULTIPLIER,
         apply_follow_on_selection_mode_to_targets, apply_inventory_policy_snapshot_to_config,
         derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
-        filter_endpoints_excluding_streamed, inventory_refresh_interval,
-        normalize_platform_architecture, normalize_platform_operating_system, parse_endpoint_token,
-        parse_ip_addr_show_output, parse_json_endpoint_lines, scanner_target_range_for_adapter,
-        should_push_resume_state, streaming_followon_should_flush, validated_target_tag,
+        filter_endpoints_excluding_streamed, normalize_platform_architecture,
+        normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
+        parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
+        streaming_followon_should_flush, validated_target_tag,
         worker_registration_refresh_interval, worker_registration_ttl_seconds,
     };
     use anyscan::config::AppConfig;
@@ -6633,39 +6636,43 @@ mod tests {
     }
 
     #[test]
-    fn inventory_refresh_interval_uses_env_or_default() {
-        let key = "AGENT_INVENTORY_REFRESH_SECONDS";
-        let prior = std::env::var(key).ok();
+    fn parse_inventory_refresh_interval_handles_unset_zero_and_invalid_inputs() {
+        use super::parse_inventory_refresh_interval;
 
-        // SAFETY: tests can race on env vars across threads; cargo test default
-        // is multithreaded but these env keys are unique to this assertion set.
-        // The pattern matches what other helpers in this file already do.
-        unsafe {
-            std::env::remove_var(key);
-        }
-        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+        // Unset / None -> default
+        assert_eq!(
+            parse_inventory_refresh_interval(None),
+            Duration::from_secs(300)
+        );
 
-        unsafe {
-            std::env::set_var(key, "42");
-        }
-        assert_eq!(inventory_refresh_interval(), Duration::from_secs(42));
+        // Valid positive integer
+        assert_eq!(
+            parse_inventory_refresh_interval(Some("42")),
+            Duration::from_secs(42)
+        );
 
-        unsafe {
-            std::env::set_var(key, "0");
-        }
-        // Zero is rejected — falls back to the default
-        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+        // Whitespace is trimmed
+        assert_eq!(
+            parse_inventory_refresh_interval(Some("  42  ")),
+            Duration::from_secs(42)
+        );
 
-        unsafe {
-            std::env::set_var(key, "not-a-number");
-        }
-        assert_eq!(inventory_refresh_interval(), Duration::from_secs(300));
+        // Zero is rejected — falls back to default
+        assert_eq!(
+            parse_inventory_refresh_interval(Some("0")),
+            Duration::from_secs(300)
+        );
 
-        unsafe {
-            match prior {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+        // Non-numeric -> default
+        assert_eq!(
+            parse_inventory_refresh_interval(Some("not-a-number")),
+            Duration::from_secs(300)
+        );
+
+        // Empty string -> default
+        assert_eq!(
+            parse_inventory_refresh_interval(Some("")),
+            Duration::from_secs(300)
+        );
     }
 }
