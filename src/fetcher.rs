@@ -6257,4 +6257,120 @@ paths:
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn cicd_configs_profile_fetches_jenkinsfile_through_fetcher() {
+        #[derive(Clone, Default)]
+        struct PathCapture {
+            paths: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn record(
+            State(capture): State<PathCapture>,
+            uri: axum::http::Uri,
+        ) -> (StatusCode, [(header::HeaderName, &'static str); 1], String) {
+            capture.paths.lock().await.push(uri.path().to_string());
+            (
+                StatusCode::NOT_FOUND,
+                [(CONTENT_TYPE, "text/plain")],
+                "not found".to_string(),
+            )
+        }
+
+        async fn root_handler(State(capture): State<PathCapture>) -> Html<&'static str> {
+            capture.paths.lock().await.push("/".to_string());
+            Html("<html><head><title>cicd-fixture</title></head><body></body></html>")
+        }
+
+        async fn jenkinsfile_handler(
+            State(capture): State<PathCapture>,
+        ) -> ([(header::HeaderName, &'static str); 1], &'static str) {
+            capture.paths.lock().await.push("/Jenkinsfile".to_string());
+            (
+                [(CONTENT_TYPE, "text/plain")],
+                "pipeline { agent any; stages { stage('build') { steps { sh 'echo SECRET=glpat-aaaaaaaaaaaaaaaaaaaa' } } } }",
+            )
+        }
+
+        async fn gitlab_handler(
+            State(capture): State<PathCapture>,
+        ) -> ([(header::HeaderName, &'static str); 1], &'static str) {
+            capture.paths.lock().await.push("/.gitlab-ci.yml".to_string());
+            (
+                [(CONTENT_TYPE, "text/plain")],
+                "image: alpine\nstages: [test]\ntest:\n  script: echo $CI_JOB_TOKEN",
+            )
+        }
+
+        let capture = PathCapture::default();
+        let app = Router::new()
+            .route("/", get(root_handler))
+            .route("/Jenkinsfile", get(jenkinsfile_handler))
+            .route("/.gitlab-ci.yml", get(gitlab_handler))
+            .fallback(record)
+            .with_state(capture.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cicd test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("cicd test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("cicd test server should stay available")
+        });
+        let base_url = format!("http://{}", address);
+
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 50;
+        config.inventory.path_profiles.clear();
+        config
+            .inventory
+            .path_profiles
+            .push("cicd-configs".to_string());
+        config
+            .validate()
+            .expect("cicd-configs profile should validate");
+
+        let resolved_paths = config
+            .resolved_default_paths()
+            .expect("default paths should resolve with cicd-configs profile");
+
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 99,
+            label: "cicd-configs".to_string(),
+            base_url,
+            paths: resolved_paths,
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        fetcher
+            .fetch_target(&target)
+            .await
+            .expect("cicd-configs target fetch should succeed");
+
+        let observed = capture.paths.lock().await.clone();
+        let fixture_paths = ["/Jenkinsfile", "/.gitlab-ci.yml", "/"];
+        let hits = fixture_paths
+            .iter()
+            .filter(|fixture| observed.iter().any(|seen| seen == *fixture))
+            .count();
+        assert!(
+            hits >= 2,
+            "expected at least 2 of {fixture_paths:?} to reach the test server; observed {observed:?}",
+        );
+
+        server.abort();
+    }
 }
