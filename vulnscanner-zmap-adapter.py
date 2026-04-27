@@ -37,6 +37,15 @@ DEFAULT_SENDER_THREADS = HOST_CPU_THREADS
 # c6in.xlarge confirms 1/2/4 receivers all hit the same send ceiling.
 DEFAULT_RECEIVER_THREADS = 1
 DEFAULT_COOLDOWN_SECONDS = 5
+# Concurrency cap for the multi-NIC parent. anygpt-4 bench data shows the
+# kernel TX path on c6in.metal-class boxes saturates around 4 concurrent
+# scanner processes regardless of how many ENAs are attached: 4-NIC peaks
+# at 12.8M aggregate, 8-NIC regressed to 1.3M because the 5th-8th
+# children CPU-starved the first four into AIMD-cratering on every
+# window. Keeping at most 4 active shards leaves headroom for agentd +
+# other system processes and keeps the per-shard AIMD loops in their
+# converged band. Override via ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES.
+DEFAULT_MAX_CONCURRENT_SUBPROCESSES = 4
 CURRENT_CHILD: subprocess.Popen[bytes] | None = None
 PROGRESS_LINE_RE = re.compile(
     r"(?P<minutes>\d+):(?P<seconds>\d+)\s+(?P<percent>\d+)%;\s+send:\s+"
@@ -351,6 +360,25 @@ def parse_scanner_interfaces(value: str | None) -> list[str]:
     return result
 
 
+def cap_concurrent_subprocesses(
+    interfaces: list[str], *, max_concurrent: int
+) -> list[str]:
+    """Truncate the per-shard interface list to ``max_concurrent`` entries.
+
+    The kernel TX path saturates well below the per-NIC ENA spec on
+    c6in.metal — anygpt-4 saw 4-NIC sustain 12.8M aggregate while 8-NIC
+    cratered to 1.3M because the extra shards CPU-starved the originals.
+    Capping the active shard count below the available NIC count keeps
+    the working set inside the kernel sweet spot. ``max_concurrent`` of 0
+    or negative disables the cap entirely so test harnesses can exercise
+    the unbounded path.
+    """
+
+    if max_concurrent <= 0:
+        return list(interfaces)
+    return list(interfaces[:max_concurrent])
+
+
 def format_target_range(start: int, end: int) -> str:
     """Render an IPv4 [start, end] inclusive range using the scanner's accepted forms.
 
@@ -551,7 +579,23 @@ def run_dynamic_scanner(
     nic_reader = (
         rate_controller.NicStatsReader(interface) if interface is not None else None
     )
+    system_load_reader = rate_controller.SystemLoadReader()
     fallback_rate = resolve_rate_limit(invocation)
+    # Layer per-instance defaults underneath any explicit env knobs. The
+    # detection short-circuits on ANYSCAN_INSTANCE_TYPE so a multi-NIC
+    # parent that already detected once doesn't redo IMDS in every
+    # child. apply_instance_defaults preserves operator overrides — env
+    # knobs always win — and only fills in floor/ceiling/starting_rate
+    # when the operator hasn't pinned them.
+    instance_type = rate_controller.detect_instance_type(env=env)
+    if instance_type:
+        os.environ.setdefault("ANYSCAN_INSTANCE_TYPE", instance_type)
+    policy, fallback_rate = rate_controller.apply_instance_defaults(
+        policy=policy,
+        fallback_rate=fallback_rate,
+        instance_type=instance_type,
+        env=env,
+    )
     calibration_path = env_string("ANYSCAN_RATE_CALIBRATION_PATH") or str(
         rate_controller.DEFAULT_CALIBRATION_PATH
     )
@@ -567,6 +611,7 @@ def run_dynamic_scanner(
         "controller_started",
         {
             "interface": interface,
+            "instance_type": instance_type,
             "starting_rate": starting_rate,
             "fallback_rate": fallback_rate,
             "policy_floor": policy.floor,
@@ -575,6 +620,9 @@ def run_dynamic_scanner(
             "multiplicative_factor": policy.multiplicative_factor,
             "window_seconds": policy.window_seconds,
             "heartbeat_threshold_ms": policy.heartbeat_latency_threshold_ms,
+            "cpu_load_threshold": policy.cpu_load_threshold,
+            "drop_ratio_threshold": policy.drop_ratio_threshold,
+            "vcpu_count": system_load_reader.vcpu_count,
             "calibration_path": str(calibration.path),
         },
     )
@@ -640,6 +688,7 @@ def run_dynamic_scanner(
                 interface=interface,
                 starting_rate=starting_rate,
                 calibration=calibration,
+                system_load_reader=system_load_reader,
             ),
             runner=runner,
         )
@@ -792,6 +841,14 @@ def run_multi_nic_scanner(
     operators see all rate-controller telemetry in one journal stream.
     """
 
+    requested_interfaces = list(interfaces)
+    max_concurrent = env_int(
+        "ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES",
+        DEFAULT_MAX_CONCURRENT_SUBPROCESSES,
+    )
+    interfaces = cap_concurrent_subprocesses(
+        requested_interfaces, max_concurrent=max_concurrent
+    )
     target_range = require_string(invocation, "target_range")
     shards = split_target_range_for_shards(target_range, len(interfaces))
     if len(shards) < len(interfaces):
@@ -800,12 +857,24 @@ def run_multi_nic_scanner(
         # rather than spawning empty children.
         interfaces = interfaces[: len(shards)]
 
+    # Detect once at the parent so each shard child inherits the resolved
+    # type via ANYSCAN_INSTANCE_TYPE without redoing the IMDS round-trip.
+    if rate_controller is not None:
+        instance_type = rate_controller.detect_instance_type(env=os.environ)
+        if instance_type:
+            os.environ.setdefault("ANYSCAN_INSTANCE_TYPE", instance_type)
+    else:
+        instance_type = None
+
     if rate_controller is not None:
         rate_controller.emit_metric(
             "multi_nic_orchestration_started",
             {
                 "interfaces": interfaces,
+                "requested_interfaces": requested_interfaces,
                 "shard_count": len(shards),
+                "max_concurrent": max_concurrent,
+                "instance_type": instance_type,
                 "target_range": target_range,
             },
         )

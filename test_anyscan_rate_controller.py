@@ -453,5 +453,436 @@ class EnvHelpersTests(unittest.TestCase):
             self.assertEqual(resolved, 4_000_000)
 
 
+class CpuVsNetworkSlipTests(unittest.TestCase):
+    """Verify CPU-pressure scenarios stop cratering the rate (improvement #1)."""
+
+    def setUp(self) -> None:
+        self.policy = rc.AimdPolicy()
+
+    def _load(self, *, load: float, vcpu: int = 8) -> rc.SystemLoad:
+        return rc.SystemLoad(load_average_1min=load, vcpu_count=vcpu)
+
+    def test_cpu_pressure_holds_rate_instead_of_halving(self) -> None:
+        # 8 vCPUs, load 8.5 (load/vcpu=1.06 > 0.8) AND heartbeat slip,
+        # tx_dropped=0, achieved == set: pure CPU starvation.
+        measurement = make_measurement(
+            set_rate=4_000_000,
+            achieved_pps=3_900_000,
+            tx_dropped_delta=0,
+            heartbeat_max_latency_ms=6_000,
+        )
+        load = self._load(load=8.5, vcpu=8)
+        self.assertEqual(
+            rc.classify_window(measurement, self.policy, system_load=load),
+            rc.SLIP_CPU,
+        )
+        self.assertEqual(
+            rc.compute_next_rate(self.policy, 4_000_000, measurement, system_load=load),
+            4_000_000,  # held, not halved
+        )
+
+    def test_network_pressure_still_halves_rate_with_low_load(self) -> None:
+        # tx_dropped > 0, load low (no CPU pressure): pure network slip.
+        measurement = make_measurement(
+            set_rate=4_000_000,
+            achieved_pps=3_900_000,
+            tx_dropped_delta=10_000,
+            heartbeat_max_latency_ms=200,
+        )
+        load = self._load(load=2.0, vcpu=8)  # 0.25 per vcpu, well under threshold
+        self.assertEqual(
+            rc.classify_window(measurement, self.policy, system_load=load),
+            rc.SLIP_NETWORK,
+        )
+        self.assertEqual(
+            rc.compute_next_rate(self.policy, 4_000_000, measurement, system_load=load),
+            2_000_000,  # halved
+        )
+
+    def test_both_pressure_picks_dominant_via_drop_ratio(self) -> None:
+        # Significant drop ratio: NIC genuinely overrun, network is dominant
+        # cause even though CPU is also pegged. Halve.
+        big_drops = make_measurement(
+            set_rate=4_000_000,
+            achieved_pps=3_900_000,
+            tx_dropped_delta=200_000,  # 200k of ~117M packets — 0.17% > 0.1% threshold
+            heartbeat_max_latency_ms=6_000,
+        )
+        load = self._load(load=8.5, vcpu=8)
+        self.assertEqual(
+            rc.classify_window(big_drops, self.policy, system_load=load),
+            rc.SLIP_NETWORK,
+        )
+        # Trivial drop ratio: drops are noise from the AIMD probe; CPU is
+        # actually the dominant cause. Hold rate.
+        tiny_drops = make_measurement(
+            set_rate=4_000_000,
+            achieved_pps=3_900_000,
+            tx_dropped_delta=10,  # 10 of 117M = 8.5e-8 << threshold
+            heartbeat_max_latency_ms=6_000,
+        )
+        self.assertEqual(
+            rc.classify_window(tiny_drops, self.policy, system_load=load),
+            rc.SLIP_CPU,
+        )
+
+    def test_legacy_classify_when_no_system_load_supplied(self) -> None:
+        # Drops + heartbeat, no system_load -> legacy SLIP/SLIP_NETWORK.
+        # Ensures bundles without the loadavg reader keep their pre-PR
+        # behavior. Asserted both via the constant alias and the new name.
+        measurement = make_measurement(
+            set_rate=2_000_000,
+            achieved_pps=1_900_000,
+            tx_dropped_delta=42,
+        )
+        self.assertEqual(rc.classify_window(measurement, self.policy), rc.SLIP)
+        self.assertEqual(rc.classify_window(measurement, self.policy), rc.SLIP_NETWORK)
+        self.assertEqual(
+            rc.compute_next_rate(self.policy, 2_000_000, measurement),
+            1_000_000,
+        )
+
+    def test_low_load_with_heartbeat_jitter_classified_network(self) -> None:
+        # Load is low but heartbeat slipped — unusual, but legacy behavior
+        # treats this as network-style slip (rate-side response). Preserve.
+        measurement = make_measurement(
+            set_rate=2_000_000,
+            achieved_pps=1_900_000,
+            heartbeat_max_latency_ms=6_000,
+        )
+        load = self._load(load=1.0, vcpu=8)  # 0.125 per vcpu
+        self.assertEqual(
+            rc.classify_window(measurement, self.policy, system_load=load),
+            rc.SLIP_NETWORK,
+        )
+
+    def test_drops_with_low_load_classified_network(self) -> None:
+        # Drops with no CPU pressure: classic NIC saturation, halve.
+        measurement = make_measurement(
+            set_rate=2_000_000,
+            achieved_pps=1_950_000,
+            tx_dropped_delta=500,
+            heartbeat_max_latency_ms=200,
+        )
+        load = self._load(load=1.0, vcpu=8)
+        self.assertEqual(
+            rc.classify_window(measurement, self.policy, system_load=load),
+            rc.SLIP_NETWORK,
+        )
+
+    def test_clean_window_with_load_info_still_clean(self) -> None:
+        # No drops, no jitter, achieved == set, even on a busy box: clean.
+        measurement = make_measurement(set_rate=1_000_000, achieved_pps=970_000)
+        load = self._load(load=10.0, vcpu=8)  # busy but not slipping
+        self.assertEqual(
+            rc.classify_window(measurement, self.policy, system_load=load),
+            rc.CLEAN,
+        )
+
+    def test_invalid_policy_rejects_bad_thresholds(self) -> None:
+        with self.assertRaises(ValueError):
+            rc.AimdPolicy(cpu_load_threshold=0.0)
+        with self.assertRaises(ValueError):
+            rc.AimdPolicy(drop_ratio_threshold=-0.1)
+        with self.assertRaises(ValueError):
+            rc.AimdPolicy(drop_ratio_threshold=1.5)
+
+
+class SystemLoadReaderTests(unittest.TestCase):
+    def test_reads_one_minute_load_from_synthetic_proc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "loadavg"
+            path.write_text("8.50 6.10 5.00 1/3000 1234\n")
+            reader = rc.SystemLoadReader(loadavg_path=path, vcpu_count=8)
+            load = reader.read()
+            self.assertAlmostEqual(load.load_average_1min, 8.5)
+            self.assertEqual(load.vcpu_count, 8)
+            self.assertAlmostEqual(load.load_average_per_vcpu, 8.5 / 8)
+
+    def test_missing_proc_returns_zero_load(self) -> None:
+        reader = rc.SystemLoadReader(loadavg_path="/nonexistent/loadavg", vcpu_count=4)
+        load = reader.read()
+        self.assertEqual(load.load_average_1min, 0.0)
+        self.assertEqual(load.vcpu_count, 4)
+
+    def test_corrupt_proc_returns_zero_load(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "loadavg"
+            path.write_text("not-a-number\n")
+            reader = rc.SystemLoadReader(loadavg_path=path, vcpu_count=2)
+            self.assertEqual(reader.read().load_average_1min, 0.0)
+
+    def test_per_vcpu_handles_zero_vcpu_gracefully(self) -> None:
+        # Defense-in-depth: vcpu_count=0 must not divide-by-zero.
+        load = rc.SystemLoad(load_average_1min=4.0, vcpu_count=0)
+        self.assertEqual(load.load_average_per_vcpu, 4.0)
+
+
+class InstanceDefaultsTests(unittest.TestCase):
+    def test_lookup_known_classes(self) -> None:
+        metal = rc.lookup_instance_defaults("c6in.metal")
+        self.assertEqual(metal.starting_rate, 4_000_000)
+        self.assertEqual(metal.ceiling, 12_000_000)
+        small = rc.lookup_instance_defaults("c6in.xlarge")
+        self.assertEqual(small.starting_rate, 500_000)
+        self.assertEqual(small.ceiling, 2_000_000)
+        m5 = rc.lookup_instance_defaults("m5.xlarge")
+        self.assertEqual(m5.starting_rate, 200_000)
+
+    def test_lookup_unknown_returns_none(self) -> None:
+        self.assertIsNone(rc.lookup_instance_defaults("alien.42xlarge"))
+        self.assertIsNone(rc.lookup_instance_defaults(""))
+        self.assertIsNone(rc.lookup_instance_defaults(None))
+
+    def test_apply_fills_unset_knobs_for_metal(self) -> None:
+        policy = rc.AimdPolicy()  # defaults
+        new_policy, new_starting = rc.apply_instance_defaults(
+            policy=policy,
+            fallback_rate=500_000,
+            instance_type="c6in.metal",
+            env={},
+        )
+        self.assertEqual(new_policy.floor, 1_000_000)
+        self.assertEqual(new_policy.ceiling, 12_000_000)
+        self.assertEqual(new_starting, 4_000_000)
+
+    def test_apply_preserves_explicit_env_overrides(self) -> None:
+        policy = rc.policy_from_env(
+            {
+                "ANYSCAN_RATE_FLOOR": "200000",
+                "ANYSCAN_RATE_CEILING": "5000000",
+            }
+        )
+        new_policy, new_starting = rc.apply_instance_defaults(
+            policy=policy,
+            fallback_rate=750_000,
+            instance_type="c6in.metal",
+            env={
+                "ANYSCAN_RATE_FLOOR": "200000",
+                "ANYSCAN_RATE_CEILING": "5000000",
+                "SCANNER_DEFAULT_RATE": "750000",
+            },
+        )
+        self.assertEqual(new_policy.floor, 200_000)
+        self.assertEqual(new_policy.ceiling, 5_000_000)
+        self.assertEqual(new_starting, 750_000)
+
+    def test_apply_partial_overrides_only_fills_missing(self) -> None:
+        # Operator pinned floor but not ceiling: floor stays at env value,
+        # ceiling gets the metal default.
+        policy = rc.policy_from_env({"ANYSCAN_RATE_FLOOR": "300000"})
+        new_policy, new_starting = rc.apply_instance_defaults(
+            policy=policy,
+            fallback_rate=500_000,
+            instance_type="c6in.metal",
+            env={"ANYSCAN_RATE_FLOOR": "300000"},
+        )
+        self.assertEqual(new_policy.floor, 300_000)
+        self.assertEqual(new_policy.ceiling, 12_000_000)
+        self.assertEqual(new_starting, 4_000_000)
+
+    def test_apply_unknown_instance_type_is_no_op(self) -> None:
+        policy = rc.AimdPolicy()
+        new_policy, new_starting = rc.apply_instance_defaults(
+            policy=policy,
+            fallback_rate=500_000,
+            instance_type=None,
+            env={},
+        )
+        self.assertEqual(new_policy, policy)
+        self.assertEqual(new_starting, 500_000)
+
+    def test_detect_via_dmi_when_product_name_is_real(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dmi = Path(tmpdir) / "product_name"
+            dmi.write_text("c6in.metal\n")
+            detected = rc.detect_instance_type(
+                env={},
+                dmi_path=dmi,
+                imds_fetcher=lambda: None,
+            )
+            self.assertEqual(detected, "c6in.metal")
+
+    def test_detect_skips_dmi_amazon_ec2_falls_back_to_imds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dmi = Path(tmpdir) / "product_name"
+            dmi.write_text("Amazon EC2\n")
+            detected = rc.detect_instance_type(
+                env={},
+                dmi_path=dmi,
+                imds_fetcher=lambda: "c6in.xlarge",
+            )
+            self.assertEqual(detected, "c6in.xlarge")
+
+    def test_detect_env_override_short_circuits(self) -> None:
+        # The IMDS fetcher MUST NOT run when env supplies the type.
+        called: list[bool] = []
+
+        def fetcher() -> str:
+            called.append(True)
+            return "c6in.xlarge"
+
+        detected = rc.detect_instance_type(
+            env={"ANYSCAN_INSTANCE_TYPE": "c6in.metal"},
+            dmi_path="/nonexistent",
+            imds_fetcher=fetcher,
+        )
+        self.assertEqual(detected, "c6in.metal")
+        self.assertEqual(called, [])
+
+    def test_detect_returns_none_when_all_sources_fail(self) -> None:
+        detected = rc.detect_instance_type(
+            env={},
+            dmi_path="/nonexistent/path",
+            imds_fetcher=lambda: None,
+        )
+        self.assertIsNone(detected)
+
+    def test_detect_rejects_garbage_strings(self) -> None:
+        # Random product strings (e.g. on-prem hardware) must not match.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dmi = Path(tmpdir) / "product_name"
+            dmi.write_text("PowerEdge R740xd\n")
+            detected = rc.detect_instance_type(
+                env={},
+                dmi_path=dmi,
+                imds_fetcher=lambda: None,
+            )
+            self.assertIsNone(detected)
+
+
+class PartialWindowCalibrationTests(unittest.TestCase):
+    """Verify calibration is persisted on every clean window AND on terminal."""
+
+    def _stub_runner(
+        self,
+        rates_then_crash: list[tuple[int, str]],
+    ) -> tuple[rc.WindowRunner, list[int]]:
+        """Build a runner that emits exactly the given (rate, classification)
+        pairs and then raises a mid-window crash on the next call."""
+
+        seen_rates: list[int] = []
+        cursor = {"i": 0}
+
+        class ScriptedRunner(rc.WindowRunner):
+            def run(self, *, rate, window_seconds, is_first_window):
+                seen_rates.append(rate)
+                idx = cursor["i"]
+                cursor["i"] += 1
+                if idx >= len(rates_then_crash):
+                    # Simulate scanner crash mid-window.
+                    return rc.WindowMeasurement(
+                        set_rate=rate,
+                        elapsed_seconds=1.0,
+                        tx_packets_delta=0,
+                        tx_dropped_delta=0,
+                        heartbeat_max_latency_ms=0,
+                        scanner_finished_naturally=False,
+                        scanner_exit_code=139,
+                    )
+                _expected_rate, kind = rates_then_crash[idx]
+                if kind == "clean":
+                    return make_measurement(
+                        set_rate=rate, achieved_pps=rate * 0.97
+                    )
+                if kind == "slip":
+                    return make_measurement(
+                        set_rate=rate,
+                        achieved_pps=rate * 0.95,
+                        tx_dropped_delta=42,
+                    )
+                raise AssertionError(f"unknown kind: {kind}")
+
+        return ScriptedRunner(), seen_rates
+
+    def test_persists_on_each_clean_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calib = rc.RateCalibrationStore(Path(tmpdir) / "rate-calibration.json")
+            policy = rc.AimdPolicy(window_seconds=30)
+            # Clean window 1 at 500k -> bumps to 700k. Clean window 2 at 700k.
+            # Then a mid-window crash on window 3.
+            runner, seen = self._stub_runner(
+                [
+                    (500_000, "clean"),
+                    (700_000, "clean"),
+                ]
+            )
+            controller = rc.RateController(
+                options=rc.ControllerOptions(
+                    policy=policy,
+                    window_seconds=float(policy.window_seconds),
+                    interface="eth0",
+                    starting_rate=500_000,
+                    calibration=calib,
+                ),
+                runner=runner,
+                log_sink=io.StringIO(),
+            )
+            with self.assertRaises(rc.ScannerWindowError):
+                controller.run()
+            self.assertEqual(seen, [500_000, 700_000, 900_000])
+            # Calibration must reflect the highest CLEAN rate seen (700_000),
+            # NOT 500_000 (older snapshot would persist that) and NOT
+            # 900_000 (the crashed rate).
+            entry = calib.lookup("eth0")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.learned_rate, 700_000)
+
+    def test_persists_when_crash_strikes_before_any_clean_window(self) -> None:
+        # If the scanner crashes on window 1, max_clean_rate is 0 and we
+        # must NOT persist anything (regression guard for not stomping
+        # the prior calibration with 0).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calib = rc.RateCalibrationStore(Path(tmpdir) / "rate-calibration.json")
+            calib.store("eth0", 1_500_000, now_iso="2026-04-26T00:00:00Z")
+            runner, _ = self._stub_runner([])
+            controller = rc.RateController(
+                options=rc.ControllerOptions(
+                    policy=rc.AimdPolicy(window_seconds=30),
+                    window_seconds=30.0,
+                    interface="eth0",
+                    starting_rate=500_000,
+                    calibration=calib,
+                ),
+                runner=runner,
+                log_sink=io.StringIO(),
+            )
+            with self.assertRaises(rc.ScannerWindowError):
+                controller.run()
+            entry = calib.lookup("eth0")
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry.learned_rate, 1_500_000)  # untouched
+
+    def test_persists_after_natural_finish(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calib = rc.RateCalibrationStore(Path(tmpdir) / "rate-calibration.json")
+            policy = rc.AimdPolicy(window_seconds=30)
+            scenario = StubWindow(
+                achieved_pps_for_set={500_000: 480_000, 700_000: 680_000},
+                drops_for_set={},
+                heartbeat_for_set={},
+                natural_finish_after_window=2,
+            )
+            runner = StubRunner(scenario)
+            controller = rc.RateController(
+                options=rc.ControllerOptions(
+                    policy=policy,
+                    window_seconds=float(policy.window_seconds),
+                    interface="eth1",
+                    starting_rate=500_000,
+                    calibration=calib,
+                ),
+                runner=runner,
+                log_sink=io.StringIO(),
+                max_windows=5,
+            )
+            controller.run()
+            entry = calib.lookup("eth1")
+            self.assertIsNotNone(entry)
+            # Window 1: clean at 500k. Window 2: clean at 700k AND scanner
+            # finished naturally. Highest clean rate = 700k.
+            self.assertEqual(entry.learned_rate, 700_000)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -315,6 +315,14 @@ apply_host_resource_defaults() {
             && [ "$scanner_eni_candidates" != "${scanner_eni_candidates%,*}" ]; then
             upsert_env_value "ANYSCAN_SCANNER_INTERFACES" "$scanner_eni_candidates" "$RUNTIME_ENV_FILE"
         fi
+        # Subprocess concurrency cap for the multi-NIC parent. anygpt-4
+        # c6in.metal bench data: 4-NIC sustained 12.8M aggregate pps;
+        # 8-NIC regressed to 1.3M because shards 5-8 CPU-starved the
+        # others. 4 is the kernel TX sweet spot regardless of NIC count.
+        # Operators can raise/lower per host class after install.
+        if [ -z "$(env_value "ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES" "4" "$RUNTIME_ENV_FILE"
+        fi
     fi
 
     # Defaults for the egress bandwidth reservation that ExecStartPre installs.

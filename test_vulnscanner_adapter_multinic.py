@@ -440,5 +440,103 @@ class AdapterFanoutEnvTests(unittest.TestCase):
         self.assertIn("10.0.0.5:80", result.stdout)
 
 
+class CapConcurrentSubprocessesTests(unittest.TestCase):
+    """Verify the multi-NIC adapter caps concurrent shards (improvement #2)."""
+
+    def test_cap_truncates_to_first_n_interfaces(self) -> None:
+        ifaces = ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5", "eth6", "eth7"]
+        capped = adapter.cap_concurrent_subprocesses(ifaces, max_concurrent=4)
+        self.assertEqual(capped, ["eth0", "eth1", "eth2", "eth3"])
+
+    def test_cap_below_count_returns_full_list(self) -> None:
+        capped = adapter.cap_concurrent_subprocesses(["eth0", "eth1"], max_concurrent=4)
+        self.assertEqual(capped, ["eth0", "eth1"])
+
+    def test_cap_zero_or_negative_disables_cap(self) -> None:
+        ifaces = ["eth0", "eth1", "eth2"]
+        self.assertEqual(adapter.cap_concurrent_subprocesses(ifaces, max_concurrent=0), ifaces)
+        self.assertEqual(adapter.cap_concurrent_subprocesses(ifaces, max_concurrent=-1), ifaces)
+
+    def test_cap_does_not_mutate_input(self) -> None:
+        ifaces = ["eth0", "eth1", "eth2", "eth3", "eth4"]
+        original = list(ifaces)
+        adapter.cap_concurrent_subprocesses(ifaces, max_concurrent=2)
+        self.assertEqual(ifaces, original)
+
+
+class MultiNicSubprocessCapIntegrationTests(unittest.TestCase):
+    """End-to-end: pass 8 interfaces, observe 4 spawn calls (default cap=4)."""
+
+    def _run_with_interfaces(
+        self, interfaces: list[str], *, env_max: str | None = None
+    ) -> tuple[int, list[str]]:
+        invocation = {
+            "target_range": "10.0.0.0-10.0.0.255",
+            "ports": "80",
+            "rate_limit": 0,
+        }
+        spawn_calls: list[str] = []
+
+        class StubChild:
+            def __init__(self, iface: str, shard_output: Path) -> None:
+                self._iface = iface
+                self._shard_output = shard_output
+                self.pid = 100000 + len(spawn_calls)
+                self.returncode = 0
+
+            def wait(self) -> int:
+                self._shard_output.write_text("")
+                return 0
+
+            def poll(self) -> int:
+                return 0
+
+        def fake_spawn(invocation_dict, *, interface, stderr_log):
+            shard_output = Path(invocation_dict["output_path"])
+            shard_output.parent.mkdir(parents=True, exist_ok=True)
+            stderr_log.parent.mkdir(parents=True, exist_ok=True)
+            stderr_log.write_text("")
+            spawn_calls.append(interface)
+            return StubChild(interface, shard_output)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "merged.out"
+            output_path.touch()
+            env_patch: dict[str, str] = {}
+            if env_max is not None:
+                env_patch["ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES"] = env_max
+            with mock.patch.object(adapter, "_spawn_shard_adapter", side_effect=fake_spawn), \
+                 mock.patch.dict(os.environ, env_patch, clear=False):
+                exit_code = adapter.run_multi_nic_scanner(
+                    invocation, output_path, interfaces
+                )
+        return exit_code, spawn_calls
+
+    def test_eight_interfaces_capped_to_four_by_default(self) -> None:
+        ifaces = [f"eth{i}" for i in range(8)]
+        exit_code, spawned = self._run_with_interfaces(ifaces)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawned, ["eth0", "eth1", "eth2", "eth3"])
+
+    def test_env_override_raises_cap(self) -> None:
+        ifaces = [f"eth{i}" for i in range(8)]
+        exit_code, spawned = self._run_with_interfaces(ifaces, env_max="6")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawned, ["eth0", "eth1", "eth2", "eth3", "eth4", "eth5"])
+
+    def test_env_override_zero_disables_cap(self) -> None:
+        ifaces = [f"eth{i}" for i in range(8)]
+        exit_code, spawned = self._run_with_interfaces(ifaces, env_max="0")
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawned, ifaces)
+
+    def test_three_interfaces_unchanged_under_default_cap(self) -> None:
+        # Cap=4 with 3 NICs is a no-op — common path on smaller boxes.
+        ifaces = ["eth0", "eth1", "eth2"]
+        exit_code, spawned = self._run_with_interfaces(ifaces)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(spawned, ifaces)
+
+
 if __name__ == "__main__":
     unittest.main()
