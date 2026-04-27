@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -39,9 +40,34 @@ DEFAULT_HEARTBEAT_LATENCY_THRESHOLD_MS = 5_000
 DEFAULT_ACHIEVED_RATIO_FLOOR = 0.9
 DEFAULT_CALIBRATION_PATH = Path("/var/lib/agentd/rate-calibration.json")
 DEFAULT_TERMINATE_GRACE_SECONDS = 5
+# Loadavg / vcpu ratio above which we treat the host as CPU-saturated.
+# A 1-min loadavg per vCPU >= 0.8 means the run-queue is sized close to
+# the available CPUs; combined with a heartbeat-jitter signal that means
+# our process is starved, not the NIC.
+DEFAULT_CPU_LOAD_THRESHOLD = 0.8
+# Below this drop ratio we treat the few packets the kernel dropped as
+# noise rather than evidence of NIC saturation, so when CPU pressure is
+# also present we attribute the slip to CPU. 0.001 = 0.1% of tx_packets.
+DEFAULT_DROP_RATIO_THRESHOLD = 0.001
+# Default DMI path Linux uses to expose the system product name. On AWS
+# bare-metal hosts (c6in.metal et al) this often contains the actual
+# instance type; on EC2 VMs it usually contains "Amazon EC2" and we have
+# to fall back to IMDS for the type.
+DEFAULT_DMI_PRODUCT_PATH = "/sys/devices/virtual/dmi/id/product_name"
+DEFAULT_IMDS_TIMEOUT_SECONDS = 1.0
 
 CLEAN = "clean"
-SLIP = "slip"
+# Network-side slip: kernel TX queue overflow, rate-limit overhead, or
+# under-achieved rate without a CPU explanation. Response: shrink rate.
+SLIP_NETWORK = "slip_network"
+# Host-CPU starvation: heartbeat slip co-occurs with high loadavg/vcpu.
+# Response: leave the rate alone — shrinking it does not free CPU and
+# wastes the headroom we already converged to.
+SLIP_CPU = "slip_cpu"
+# Backwards-compatibility alias. The pre-PR controller only emitted a
+# single SLIP value (semantically equivalent to SLIP_NETWORK), and
+# external callers + tests still compare against it.
+SLIP = SLIP_NETWORK
 
 
 @dataclass(frozen=True)
@@ -55,6 +81,8 @@ class AimdPolicy:
     achieved_ratio_floor: float = DEFAULT_ACHIEVED_RATIO_FLOOR
     heartbeat_latency_threshold_ms: int = DEFAULT_HEARTBEAT_LATENCY_THRESHOLD_MS
     window_seconds: int = DEFAULT_WINDOW_SECONDS
+    cpu_load_threshold: float = DEFAULT_CPU_LOAD_THRESHOLD
+    drop_ratio_threshold: float = DEFAULT_DROP_RATIO_THRESHOLD
 
     def __post_init__(self) -> None:
         if self.floor <= 0:
@@ -71,6 +99,10 @@ class AimdPolicy:
             raise ValueError("heartbeat_latency_threshold_ms must be > 0")
         if self.window_seconds <= 0:
             raise ValueError("window_seconds must be > 0")
+        if self.cpu_load_threshold <= 0:
+            raise ValueError("cpu_load_threshold must be > 0")
+        if not 0.0 <= self.drop_ratio_threshold <= 1.0:
+            raise ValueError("drop_ratio_threshold must be in [0, 1]")
 
 
 @dataclass(frozen=True)
@@ -108,44 +140,89 @@ class ScannerWindowError(RuntimeError):
 def classify_window(
     measurement: WindowMeasurement,
     policy: AimdPolicy,
+    *,
+    system_load: Optional["SystemLoad"] = None,
 ) -> str:
-    """Return ``CLEAN`` or ``SLIP`` for the supplied window measurement.
+    """Return ``CLEAN``, ``SLIP_NETWORK``, or ``SLIP_CPU`` for a window.
 
     A window is clean iff the kernel is not dropping packets, the host can
     still service its own scheduler (no heartbeat slip), and the scanner is
     actually consuming the rate budget we set. The achieved-rate floor is
     skipped when the scanner finished naturally inside the window because
     that means it ran out of targets, not throttle.
+
+    When ``system_load`` is supplied we further distinguish CPU-caused
+    slips (heartbeat slip co-occurring with a saturated run-queue) from
+    network-caused slips (kernel TX drops or rate-limit overhead). On CPU
+    slips the controller leaves the rate alone — halving it would not
+    free any CPU and would just waste the headroom we already learned.
+    When ``system_load`` is None we keep the legacy "any slip is network"
+    behavior so existing call sites and bundles without the loadavg
+    reader keep their pre-improvement semantics.
     """
 
-    if measurement.tx_dropped_delta > 0:
-        return SLIP
-    if measurement.heartbeat_max_latency_ms > policy.heartbeat_latency_threshold_ms:
-        return SLIP
-    if measurement.scanner_finished_naturally:
+    network_drops = measurement.tx_dropped_delta > 0
+    rate_starved = (
+        not measurement.scanner_finished_naturally
+        and measurement.achieved_pps + 1e-9
+        < policy.achieved_ratio_floor * float(measurement.set_rate)
+    )
+    heartbeat_slip = (
+        measurement.heartbeat_max_latency_ms > policy.heartbeat_latency_threshold_ms
+    )
+
+    if system_load is None:
+        if network_drops or heartbeat_slip or rate_starved:
+            return SLIP_NETWORK
         return CLEAN
-    threshold = policy.achieved_ratio_floor * float(measurement.set_rate)
-    if measurement.achieved_pps + 1e-9 < threshold:
-        return SLIP
-    return CLEAN
+
+    cpu_saturated = system_load.load_average_per_vcpu > policy.cpu_load_threshold
+    cpu_pressure = cpu_saturated and heartbeat_slip
+    network_pressure = network_drops or rate_starved or (heartbeat_slip and not cpu_saturated)
+
+    if not cpu_pressure and not network_pressure:
+        return CLEAN
+    if cpu_pressure and not network_pressure:
+        return SLIP_CPU
+    if network_pressure and not cpu_pressure:
+        return SLIP_NETWORK
+
+    # Both signals firing — pick the dominant cause. A non-trivial drop
+    # ratio means the NIC is genuinely overrun (shrink rate); pure
+    # rate-starvation with no drops on a saturated host points at CPU
+    # contention starving the scanner threads, not the wire.
+    drop_ratio = (
+        measurement.tx_dropped_delta / measurement.tx_packets_delta
+        if measurement.tx_packets_delta > 0
+        else 0.0
+    )
+    if drop_ratio > policy.drop_ratio_threshold:
+        return SLIP_NETWORK
+    return SLIP_CPU
 
 
 def compute_next_rate(
     policy: AimdPolicy,
     current_rate: int,
     measurement: WindowMeasurement,
+    *,
+    system_load: Optional["SystemLoad"] = None,
 ) -> int:
     """Return the rate to use for the next window.
 
-    Clean -> additive bump capped at ceiling. Slip -> multiplicative shrink
-    floored at policy.floor. Clamped on both sides regardless of the
-    starting point so a misconfigured ``current_rate`` cannot escape the
-    bounds.
+    Clean -> additive bump capped at ceiling. SLIP_NETWORK -> multiplicative
+    shrink floored at policy.floor. SLIP_CPU -> rate is held; the right
+    response is to shed subprocess concurrency (handled by the multi-NIC
+    parent), not to crater the rate we already learned. Clamped on both
+    sides regardless of the starting point so a misconfigured
+    ``current_rate`` cannot escape the bounds.
     """
 
-    classification = classify_window(measurement, policy)
+    classification = classify_window(measurement, policy, system_load=system_load)
     if classification == CLEAN:
         proposed = current_rate + policy.additive_step
+    elif classification == SLIP_CPU:
+        proposed = current_rate
     else:
         proposed = int(current_rate * policy.multiplicative_factor)
     return clamp_rate(proposed, policy)
@@ -351,6 +428,254 @@ class NicStatsReader:
 
 
 # ---------------------------------------------------------------------------
+# System load (for CPU-vs-network slip distinction)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SystemLoad:
+    """Snapshot of the host's run-queue pressure relative to its vCPU count.
+
+    Sampled once per AIMD window so :func:`classify_window` can tell a
+    CPU-starved process apart from a NIC-saturated one. Both can produce
+    heartbeat slip; only the network case responds to shrinking the rate.
+    """
+
+    load_average_1min: float
+    vcpu_count: int
+
+    @property
+    def load_average_per_vcpu(self) -> float:
+        if self.vcpu_count <= 0:
+            return self.load_average_1min
+        return self.load_average_1min / float(self.vcpu_count)
+
+
+class SystemLoadReader:
+    """Reads /proc/loadavg and reports loadavg-per-vcpu.
+
+    The vCPU count is captured once at construction time (default
+    ``os.cpu_count()``) because the topology is stable for the lifetime
+    of a worker process; the loadavg field is re-read on every
+    :meth:`read` call so the controller observes contention on a
+    per-window basis. Tests inject ``loadavg_path`` and ``vcpu_count``
+    so they don't depend on the host's actual /proc.
+    """
+
+    def __init__(
+        self,
+        *,
+        loadavg_path: os.PathLike[str] | str = "/proc/loadavg",
+        vcpu_count: Optional[int] = None,
+    ) -> None:
+        self._loadavg_path = Path(loadavg_path)
+        self._vcpu_count = (
+            vcpu_count if vcpu_count is not None and vcpu_count > 0 else max(1, os.cpu_count() or 1)
+        )
+
+    @property
+    def vcpu_count(self) -> int:
+        return self._vcpu_count
+
+    def read(self) -> SystemLoad:
+        try:
+            raw = self._loadavg_path.read_text().strip()
+        except OSError:
+            return SystemLoad(0.0, self._vcpu_count)
+        parts = raw.split()
+        if not parts:
+            return SystemLoad(0.0, self._vcpu_count)
+        try:
+            load = float(parts[0])
+        except ValueError:
+            return SystemLoad(0.0, self._vcpu_count)
+        if load < 0:
+            load = 0.0
+        return SystemLoad(load, self._vcpu_count)
+
+
+# ---------------------------------------------------------------------------
+# Per-instance defaults
+#
+# Different AWS instance classes have wildly different natural pps ceilings
+# — c6in.xlarge tops out around 1.7M, c6in.metal delivers 12M+ at 1-NIC
+# (anygpt-4 bench data). Starting every host at the conservative 500k seed
+# means c6in.metal wastes 4-6 windows ramping; pinning the seed and
+# ceiling per-class skips that ramp and lets the controller settle into
+# the correct band on window 1.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class InstanceDefaults:
+    """Per-class starting rate and AIMD bounds.
+
+    ``starting_rate`` seeds the controller when there is no per-interface
+    calibration to reuse. ``floor`` and ``ceiling`` widen / clamp the
+    AIMD band so the controller can both ramp up to the host's natural
+    ceiling and shrink down to a useful floor on slip.
+    """
+
+    starting_rate: int
+    floor: int
+    ceiling: int
+
+
+# Conservative table; ceilings are kernel-TX bounds we have measured (or
+# estimated linearly within a class), not ENA spec maxima. Anything not
+# listed falls through to DEFAULT_FLOOR/DEFAULT_CEILING and the
+# operator-supplied SCANNER_DEFAULT_RATE.
+INSTANCE_TYPE_DEFAULTS: dict[str, InstanceDefaults] = {
+    "m5.xlarge": InstanceDefaults(200_000, 100_000, 1_000_000),
+    "m5.2xlarge": InstanceDefaults(400_000, 100_000, 1_500_000),
+    "c6in.xlarge": InstanceDefaults(500_000, 100_000, 2_000_000),
+    "c6in.2xlarge": InstanceDefaults(1_000_000, 100_000, 4_000_000),
+    "c6in.4xlarge": InstanceDefaults(1_500_000, 200_000, 6_000_000),
+    "c6in.8xlarge": InstanceDefaults(3_000_000, 500_000, 8_000_000),
+    "c6in.16xlarge": InstanceDefaults(3_500_000, 500_000, 10_000_000),
+    "c6in.32xlarge": InstanceDefaults(4_000_000, 1_000_000, 12_000_000),
+    "c6in.metal": InstanceDefaults(4_000_000, 1_000_000, 12_000_000),
+}
+
+
+_INSTANCE_TYPE_RE = re.compile(r"^[a-z0-9]+\.[a-z0-9]+$")
+
+
+def _looks_like_instance_type(value: str) -> bool:
+    return bool(_INSTANCE_TYPE_RE.match(value))
+
+
+def detect_instance_type(
+    *,
+    env: Optional[Mapping[str, str]] = None,
+    dmi_path: os.PathLike[str] | str = DEFAULT_DMI_PRODUCT_PATH,
+    imds_fetcher: Optional[Callable[[], Optional[str]]] = None,
+) -> Optional[str]:
+    """Best-effort detection of the EC2 instance type running this worker.
+
+    Resolution order, first hit wins:
+    1. ``ANYSCAN_INSTANCE_TYPE`` from ``env`` — explicit override for
+       tests, dev runs, and to skip IMDS round-trips on subsequent
+       child processes (the parent caches its detection there).
+    2. ``/sys/devices/virtual/dmi/id/product_name``: on AWS bare-metal
+       hosts this often exposes the actual instance type. On VMs it
+       is usually ``Amazon EC2`` and we fall through.
+    3. ``imds_fetcher()`` (defaults to a real IMDSv2 round-trip): the
+       authoritative source for VM instance types. Tightly bounded
+       timeout so a missing IMDS does not delay scanner startup.
+
+    Returns ``None`` when no source produces a recognizable type. The
+    fetcher hook exists so unit tests do not have to monkey-patch
+    urllib.
+    """
+
+    env = env if env is not None else os.environ
+    explicit = env.get("ANYSCAN_INSTANCE_TYPE")
+    if explicit and explicit.strip():
+        candidate = explicit.strip()
+        if _looks_like_instance_type(candidate):
+            return candidate
+
+    try:
+        product = Path(dmi_path).read_text().strip()
+    except OSError:
+        product = ""
+    if product and _looks_like_instance_type(product):
+        return product
+
+    fetcher = imds_fetcher if imds_fetcher is not None else _default_imds_fetcher
+    try:
+        fetched = fetcher()
+    except Exception:  # noqa: BLE001 - best-effort detection
+        fetched = None
+    if fetched and _looks_like_instance_type(fetched.strip()):
+        return fetched.strip()
+    return None
+
+
+def _default_imds_fetcher() -> Optional[str]:
+    """Real-world IMDSv2 round-trip used when no test fetcher is supplied."""
+
+    import urllib.error
+    import urllib.request
+
+    timeout = DEFAULT_IMDS_TIMEOUT_SECONDS
+    try:
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        with urllib.request.urlopen(token_req, timeout=timeout) as resp:
+            token = resp.read().decode("ascii", errors="replace").strip()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    try:
+        type_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/instance-type",
+            headers={"X-aws-ec2-metadata-token": token},
+        )
+        with urllib.request.urlopen(type_req, timeout=timeout) as resp:
+            return resp.read().decode("ascii", errors="replace").strip()
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def lookup_instance_defaults(instance_type: Optional[str]) -> Optional[InstanceDefaults]:
+    if not instance_type:
+        return None
+    return INSTANCE_TYPE_DEFAULTS.get(instance_type.strip())
+
+
+def apply_instance_defaults(
+    *,
+    policy: AimdPolicy,
+    fallback_rate: int,
+    instance_type: Optional[str],
+    env: Optional[Mapping[str, str]] = None,
+) -> tuple[AimdPolicy, int]:
+    """Layer the per-instance defaults under any explicit env overrides.
+
+    The contract is: env-supplied knobs always win. We only fill in floor,
+    ceiling, and starting (fallback) rate when the corresponding env var
+    is missing. This means an operator who pins ANYSCAN_RATE_CEILING by
+    hand still gets exactly that value on c6in.metal, while a stock host
+    silently picks up the table's c6in.metal ceiling.
+    """
+
+    defaults = lookup_instance_defaults(instance_type)
+    if defaults is None:
+        return policy, fallback_rate
+
+    env = env if env is not None else os.environ
+    new_floor = (
+        defaults.floor
+        if not _env_value_present(env, "ANYSCAN_RATE_FLOOR")
+        else policy.floor
+    )
+    new_ceiling = (
+        defaults.ceiling
+        if not _env_value_present(env, "ANYSCAN_RATE_CEILING")
+        else policy.ceiling
+    )
+    if new_ceiling < new_floor:
+        new_ceiling = new_floor
+
+    new_policy = replace(policy, floor=new_floor, ceiling=new_ceiling)
+
+    if _env_value_present(env, "SCANNER_DEFAULT_RATE"):
+        new_starting = fallback_rate
+    else:
+        new_starting = defaults.starting_rate
+    return new_policy, new_starting
+
+
+def _env_value_present(env: Mapping[str, str], key: str) -> bool:
+    raw = env.get(key)
+    return raw is not None and raw.strip() != ""
+
+
+# ---------------------------------------------------------------------------
 # Telemetry
 # ---------------------------------------------------------------------------
 
@@ -396,6 +721,12 @@ class ControllerOptions:
     calibration: Optional[RateCalibrationStore]
     persist_on_clean: bool = True
     terminate_grace_seconds: float = DEFAULT_TERMINATE_GRACE_SECONDS
+    # Optional CPU-pressure source. Sampled once per window and passed
+    # into ``classify_window`` so the controller can hold rate when the
+    # slip is CPU-caused. When ``None`` (e.g. older bundles or test
+    # harnesses) the controller falls back to the legacy
+    # any-slip-is-network classification.
+    system_load_reader: Optional["SystemLoadReader"] = None
 
 
 class WindowRunner:
@@ -436,43 +767,52 @@ class RateController:
         rate = clamp_rate(self._options.starting_rate, self._options.policy)
         reports: list[WindowReport] = []
         max_clean_rate = 0
+        last_persisted_rate = 0
         idx = 0
-        while True:
-            idx += 1
-            if self._max_windows is not None and idx > self._max_windows:
-                break
-            measurement = self._runner.run(
-                rate=rate,
-                window_seconds=self._options.window_seconds,
-                is_first_window=idx == 1,
-            )
-            # Distinguish "scanner finished and exited cleanly" from
-            # "scanner crashed mid-window". The former is success and stops
-            # the loop; the latter is a hard failure that must propagate so
-            # we don't quietly respawn into the same broken state.
-            if (
-                not measurement.scanner_finished_naturally
-                and measurement.scanner_exit_code != 0
-                and measurement.elapsed_seconds < self._options.window_seconds
-            ):
-                raise ScannerWindowError(
-                    measurement.scanner_exit_code,
-                    window_index=idx,
-                    set_rate=rate,
+        try:
+            while True:
+                idx += 1
+                if self._max_windows is not None and idx > self._max_windows:
+                    break
+                measurement = self._runner.run(
+                    rate=rate,
+                    window_seconds=self._options.window_seconds,
+                    is_first_window=idx == 1,
                 )
-            classification = classify_window(measurement, self._options.policy)
-            next_rate = compute_next_rate(self._options.policy, rate, measurement)
-            report = WindowReport(
-                index=idx,
-                set_rate=rate,
-                measurement=measurement,
-                classification=classification,
-                next_rate=next_rate,
-            )
-            reports.append(report)
-            emit_metric(
-                "rate_adjustment",
-                {
+                # Distinguish "scanner finished and exited cleanly" from
+                # "scanner crashed mid-window". The former is success and stops
+                # the loop; the latter is a hard failure that must propagate so
+                # we don't quietly respawn into the same broken state.
+                if (
+                    not measurement.scanner_finished_naturally
+                    and measurement.scanner_exit_code != 0
+                    and measurement.elapsed_seconds < self._options.window_seconds
+                ):
+                    raise ScannerWindowError(
+                        measurement.scanner_exit_code,
+                        window_index=idx,
+                        set_rate=rate,
+                    )
+                system_load = (
+                    self._options.system_load_reader.read()
+                    if self._options.system_load_reader is not None
+                    else None
+                )
+                classification = classify_window(
+                    measurement, self._options.policy, system_load=system_load
+                )
+                next_rate = compute_next_rate(
+                    self._options.policy, rate, measurement, system_load=system_load
+                )
+                report = WindowReport(
+                    index=idx,
+                    set_rate=rate,
+                    measurement=measurement,
+                    classification=classification,
+                    next_rate=next_rate,
+                )
+                reports.append(report)
+                metric_payload: dict[str, object] = {
                     "window": idx,
                     "set_rate": rate,
                     "achieved_pps": int(measurement.achieved_pps),
@@ -482,30 +822,62 @@ class RateController:
                     "classification": classification,
                     "next_rate": next_rate,
                     "interface": self._options.interface,
-                },
-                sink=self._log_sink,
-            )
-            if classification == CLEAN and rate > max_clean_rate:
-                max_clean_rate = rate
-            if measurement.scanner_finished_naturally:
-                break
-            rate = next_rate
+                }
+                if system_load is not None:
+                    metric_payload["loadavg_per_vcpu"] = round(
+                        system_load.load_average_per_vcpu, 3
+                    )
+                    metric_payload["vcpu_count"] = system_load.vcpu_count
+                emit_metric("rate_adjustment", metric_payload, sink=self._log_sink)
+                if classification == CLEAN and rate > max_clean_rate:
+                    max_clean_rate = rate
+                    # Persist on every clean window where we set a new
+                    # high-water mark. PR #58 only wrote at end-of-run, so
+                    # a scanner crash mid-loop dropped the calibration on
+                    # the floor; this guarantees the learned rate
+                    # survives even partial windows.
+                    last_persisted_rate = self._maybe_persist_calibration(
+                        max_clean_rate, last_persisted_rate
+                    )
+                if measurement.scanner_finished_naturally:
+                    break
+                rate = next_rate
+        finally:
+            # Terminal persist regardless of how the loop exited (natural
+            # finish, max_windows cap, ScannerWindowError). Idempotent
+            # against the per-window writes above so we don't spam the
+            # store on a clean exit.
+            if max_clean_rate > 0:
+                self._maybe_persist_calibration(max_clean_rate, last_persisted_rate)
+        return reports
 
-        if (
+    def _maybe_persist_calibration(
+        self, learned_rate: int, last_persisted_rate: int
+    ) -> int:
+        """Best-effort write of ``learned_rate`` to the calibration store.
+
+        Returns the rate now reflected on disk (either the new write or
+        ``last_persisted_rate`` when the write was a no-op or failed).
+        Never raises; persistence is always best-effort.
+        """
+
+        if not (
             self._options.persist_on_clean
             and self._options.calibration is not None
             and self._options.interface
-            and max_clean_rate > 0
+            and learned_rate > last_persisted_rate
         ):
-            try:
-                self._options.calibration.store(self._options.interface, max_clean_rate)
-            except Exception as error:  # noqa: BLE001 - best-effort persistence
-                emit_metric(
-                    "calibration_persist_failed",
-                    {"interface": self._options.interface, "error": str(error)},
-                    sink=self._log_sink,
-                )
-        return reports
+            return last_persisted_rate
+        try:
+            self._options.calibration.store(self._options.interface, learned_rate)
+            return learned_rate
+        except Exception as error:  # noqa: BLE001 - best-effort persistence
+            emit_metric(
+                "calibration_persist_failed",
+                {"interface": self._options.interface, "error": str(error)},
+                sink=self._log_sink,
+            )
+            return last_persisted_rate
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +1009,16 @@ def policy_from_env(env: Mapping[str, str]) -> AimdPolicy:
             DEFAULT_HEARTBEAT_LATENCY_THRESHOLD_MS,
         ),
         window_seconds=_env_int(env, "ANYSCAN_RATE_WINDOW_SECONDS", DEFAULT_WINDOW_SECONDS),
+        cpu_load_threshold=_env_float(
+            env,
+            "ANYSCAN_CPU_LOAD_THRESHOLD",
+            DEFAULT_CPU_LOAD_THRESHOLD,
+        ),
+        drop_ratio_threshold=_env_float(
+            env,
+            "ANYSCAN_DROP_RATIO_THRESHOLD",
+            DEFAULT_DROP_RATIO_THRESHOLD,
+        ),
     )
 
 
@@ -695,6 +1077,13 @@ __all__ = [
     "JitterMonitor",
     "NicStatsReader",
     "NicCounters",
+    "SystemLoad",
+    "SystemLoadReader",
+    "InstanceDefaults",
+    "INSTANCE_TYPE_DEFAULTS",
+    "detect_instance_type",
+    "lookup_instance_defaults",
+    "apply_instance_defaults",
     "SubprocessWindowRunner",
     "WindowRunner",
     "compute_next_rate",
@@ -712,6 +1101,11 @@ __all__ = [
     "DEFAULT_HEARTBEAT_LATENCY_THRESHOLD_MS",
     "DEFAULT_ACHIEVED_RATIO_FLOOR",
     "DEFAULT_CALIBRATION_PATH",
+    "DEFAULT_CPU_LOAD_THRESHOLD",
+    "DEFAULT_DROP_RATIO_THRESHOLD",
+    "DEFAULT_DMI_PRODUCT_PATH",
     "CLEAN",
     "SLIP",
+    "SLIP_NETWORK",
+    "SLIP_CPU",
 ]
