@@ -549,6 +549,7 @@ main() {
     install -m 0755 "$SCRIPT_DIR/bootstrap-agent-host.sh" "$bundle_root/bootstrap-agent-host.sh"
     install -m 0755 "$SCRIPT_DIR/install-worker-bundle.sh" "$bundle_root/install-worker-bundle.sh"
     install -m 0755 "$SCRIPT_DIR/reserve-control-bandwidth.sh" "$bundle_root/bin/reserve-control-bandwidth.sh"
+    install -m 0755 "$SCRIPT_DIR/tools/tune-scanner-host.sh" "$bundle_root/bin/tune-scanner-host.sh"
     install -m 0644 "$SCRIPT_DIR/runtime.worker.env.template" "$bundle_root/env/runtime.env.template"
 
     worker_supports_bootstrap="$WORKER_SUPPORTS_BOOTSTRAP_OVERRIDE"
@@ -619,6 +620,7 @@ Remote agent bundle for ${os}/${arch}
 Contents:
   - bin/agentd
   - bin/reserve-control-bandwidth.sh
+  - bin/tune-scanner-host.sh
   - optional bin/scanner
   - tor/ (bundled tor binary, libs, geoip data)
   - extensions/

@@ -56,6 +56,8 @@ REMOTE_UPDATE_HELPER_SOURCE_FILE="${REMOTE_UPDATE_HELPER_SOURCE_FILE:-$BUNDLE_RO
 REMOTE_UPDATE_HELPER_DEST_FILE="${REMOTE_UPDATE_HELPER_DEST_FILE:-$BIN_DIR/agentd-remote-update.sh}"
 RESERVE_BANDWIDTH_HELPER_SOURCE_FILE="${RESERVE_BANDWIDTH_HELPER_SOURCE_FILE:-$BUNDLE_ROOT/bin/reserve-control-bandwidth.sh}"
 RESERVE_BANDWIDTH_HELPER_DEST_FILE="${RESERVE_BANDWIDTH_HELPER_DEST_FILE:-$BIN_DIR/reserve-control-bandwidth.sh}"
+TUNE_SCANNER_HOST_HELPER_SOURCE_FILE="${TUNE_SCANNER_HOST_HELPER_SOURCE_FILE:-$BUNDLE_ROOT/bin/tune-scanner-host.sh}"
+TUNE_SCANNER_HOST_HELPER_DEST_FILE="${TUNE_SCANNER_HOST_HELPER_DEST_FILE:-$BIN_DIR/tune-scanner-host.sh}"
 DEFAULT_REMOTE_UPDATE_INSTALLER_URL="${DEFAULT_REMOTE_UPDATE_INSTALLER_URL:-}"
 INSTALL_CONTROL_URL_OVERRIDE="${INSTALL_CONTROL_URL_OVERRIDE:-}"
 INSTALL_MANAGEMENT_URL_OVERRIDE="${INSTALL_MANAGEMENT_URL_OVERRIDE:-}"
@@ -175,19 +177,28 @@ apply_host_resource_defaults() {
     fi
 
     if [ -x "$VULNSCANNER_BIN_DEST" ]; then
-        # Cap zmap at ~100k pps by default. With 60-byte SYN probes that is
-        # about 50 Mbit/s — well under a 1 Gbit NIC ceiling, leaving plenty
-        # of headroom for the agentd control plane even if the tc reservation
-        # below fails to install. Operators can raise or remove the cap by
-        # editing SCANNER_DEFAULT_RATE in the runtime env.
+        # Default cap on per-scan probe rate when the control plane does not
+        # specify one. 500k pps × ~64-byte SYN ≈ 256 Mbit/s, still well under
+        # the 1 Gbit ceiling that PR #28's reserve-control-bandwidth.sh sets
+        # for the bulk class — and the tc reservation is now the primary
+        # safety net for control-plane heartbeats, not this cap. Bench on
+        # c6in.xlarge (4 vCPU) shows the bundled scanner sustains ~1.7M pps
+        # with sender_threads=4 receivers=1 against an unreachable /24, so
+        # operators can raise SCANNER_DEFAULT_RATE further if they have
+        # measured headroom. Set to 0 to disable the cap entirely.
         if [ -z "$(env_value "SCANNER_DEFAULT_RATE" "$RUNTIME_ENV_FILE" || true)" ]; then
-            upsert_env_value "SCANNER_DEFAULT_RATE" "100000" "$RUNTIME_ENV_FILE"
+            upsert_env_value "SCANNER_DEFAULT_RATE" "500000" "$RUNTIME_ENV_FILE"
         fi
         if [ -z "$(env_value "SCANNER_SENDER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "SCANNER_SENDER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
         fi
+        # PR #13 sets DEFAULT_RECEIVER_THREADS=1 in the python adapter because
+        # the AF_PACKET capture queue serializes per-receiver and per-CPU
+        # spawning wastes cycles on lock contention without raising capture
+        # throughput. Bench against an unreachable /24 confirms 1/2/4 receivers
+        # all hit the same ~1.7M pps send ceiling, so default to 1 here.
         if [ -z "$(env_value "SCANNER_RECEIVER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
-            upsert_env_value "SCANNER_RECEIVER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
+            upsert_env_value "SCANNER_RECEIVER_THREADS" "1" "$RUNTIME_ENV_FILE"
         fi
         if [ -n "$preferred_scanner_bin" ]; then
             upsert_env_value "SCANNER_BIN" "$preferred_scanner_bin" "$RUNTIME_ENV_FILE"
@@ -208,6 +219,35 @@ apply_host_resource_defaults() {
     if [ -z "$(env_value "ANYSCAN_RESERVE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
         upsert_env_value "ANYSCAN_RESERVE_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
     fi
+    # Mirror the iface for tune-scanner-host.sh's ip-link txqueuelen call so it
+    # does not have to re-detect the default route on every service start.
+    if [ -z "$(env_value "ANYSCAN_TUNE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
+        upsert_env_value "ANYSCAN_TUNE_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
+    fi
+}
+
+apply_scanner_host_tunings() {
+    if [ ! -x "$TUNE_SCANNER_HOST_HELPER_DEST_FILE" ]; then
+        return 0
+    fi
+    if [ ! -x "$VULNSCANNER_BIN_DEST" ]; then
+        # No scanner installed -> no point bumping kernel queues for it.
+        return 0
+    fi
+    printf '[*] Applying scanner host tunings (sysctl drop-in + txqueuelen)...\n'
+    # Run with the runtime env so ANYSCAN_TUNE_* overrides from the operator
+    # take effect at install time too. Wrap in a subshell so the sourced env
+    # vars do not leak into subsequent install steps. The helper fails open
+    # on every error.
+    (
+        if [ -f "$RUNTIME_ENV_FILE" ]; then
+            set -a
+            # shellcheck disable=SC1090
+            . "$RUNTIME_ENV_FILE" 2>/dev/null || true
+            set +a
+        fi
+        "$TUNE_SCANNER_HOST_HELPER_DEST_FILE" apply || true
+    )
 }
 
 detect_existing_install() {
@@ -440,6 +480,9 @@ main() {
     if [ -f "$RESERVE_BANDWIDTH_HELPER_SOURCE_FILE" ]; then
         install -m 0755 "$RESERVE_BANDWIDTH_HELPER_SOURCE_FILE" "$RESERVE_BANDWIDTH_HELPER_DEST_FILE"
     fi
+    if [ -f "$TUNE_SCANNER_HOST_HELPER_SOURCE_FILE" ]; then
+        install -m 0755 "$TUNE_SCANNER_HOST_HELPER_SOURCE_FILE" "$TUNE_SCANNER_HOST_HELPER_DEST_FILE"
+    fi
 
     printf '[*] Installing extension assets...\n'
     install -m 0644 "$BUNDLE_ROOT/extensions/bootstrap-provisioner.json" "$LOCAL_BOOTSTRAP_MANIFEST_DEST"
@@ -539,6 +582,7 @@ main() {
     fi
 
     apply_host_resource_defaults "$cpu_threads"
+    apply_scanner_host_tunings
 
     if [ "$existing_install" = "true" ]; then
         preserve_existing_identity

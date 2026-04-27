@@ -15,6 +15,11 @@ EnvironmentFile=-/var/lib/agentd/agent.env
 # prefix bypasses User=/AmbientCapabilities=) and fails-open: the script
 # itself returns 0 even if tc/iptables policy rejects the change.
 ExecStartPre=+/opt/agentd/bin/reserve-control-bandwidth.sh apply
+# Bump kernel queues + NIC txqueuelen so the scanner is not throttled by
+# default sysctl values when it pushes >500k pps. Idempotent and
+# fail-open. The `+` prefix bypasses ProtectKernelTunables=true so sysctl
+# writes succeed; the persistent /etc/sysctl.d drop-in handles boot.
+ExecStartPre=+/opt/agentd/bin/tune-scanner-host.sh apply
 ExecStopPost=+/opt/agentd/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/agentd/bin/agentd daemon
 Restart=always

@@ -15,10 +15,17 @@ import threading
 from pathlib import Path
 
 HOST_CPU_THREADS = max(1, os.cpu_count() or 1)
-DEFAULT_RATE_LIMIT = 1_000
+# Last-resort fallback when neither the per-scan invocation nor the
+# SCANNER_DEFAULT_RATE env var supplies a rate. install-worker-bundle.sh
+# writes SCANNER_DEFAULT_RATE=500000 by default, so this constant is only
+# used in test/dev contexts where the env file is absent. Kept in sync
+# with the installer default to avoid surprising operators who run the
+# adapter outside the bundled service.
+DEFAULT_RATE_LIMIT = 500_000
 DEFAULT_SENDER_THREADS = HOST_CPU_THREADS
 # Receivers serialize on the AF_PACKET queue, so per-CPU spawning wastes
-# cycles on lock contention without raising capture throughput.
+# cycles on lock contention without raising capture throughput. Bench on
+# c6in.xlarge confirms 1/2/4 receivers all hit the same send ceiling.
 DEFAULT_RECEIVER_THREADS = 1
 DEFAULT_COOLDOWN_SECONDS = 5
 CURRENT_CHILD: subprocess.Popen[bytes] | None = None
