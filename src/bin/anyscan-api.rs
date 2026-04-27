@@ -430,9 +430,10 @@ async fn main() -> Result<()> {
         .route("/app/catalog", get(operator_pages::operator_catalog))
         .route("/scanning-policy", get(public_policy))
         .route("/scanner-identity", get(public_policy))
-        .route("/opt-out", get(public_page))
-        .route("/claim", get(public_page))
-        .route("/abuse", get(public_page))
+        .route("/opt-out", get(public_disclosure))
+        .route("/claim", get(public_disclosure))
+        .route("/abuse", get(public_disclosure))
+        .route("/disclosure", get(public_disclosure))
         .route("/data-policy", get(public_policy))
         .route("/.well-known/security.txt", get(security_txt))
         .route("/api/public/profile", get(public_profile))
@@ -621,6 +622,10 @@ async fn public_about() -> Html<&'static str> {
 
 async fn public_policy() -> Html<&'static str> {
     Html(include_str!("../../templates/public/policy.html"))
+}
+
+async fn public_disclosure() -> Html<&'static str> {
+    Html(include_str!("../../templates/public/disclosure.html"))
 }
 
 async fn enforce_worker_only_host_routes(
@@ -4597,6 +4602,45 @@ mod tests {
         // The slimmer search page must NOT carry the about/workflows sections.
         assert!(!body.contains(r#"id="about""#));
         assert!(!body.contains(r#"id="workflows""#));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_disclosure_routes_serve_form_content() {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new()
+            .route("/disclosure", get(public_disclosure))
+            .route("/claim", get(public_disclosure))
+            .route("/opt-out", get(public_disclosure))
+            .route("/abuse", get(public_disclosure));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        for path in ["/disclosure", "/claim", "/opt-out", "/abuse"] {
+            let body = reqwest::get(format!("http://{addr}{path}"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(
+                body.contains(r#"id="responsible-disclosure""#),
+                "missing responsible-disclosure on {path}"
+            );
+            assert!(body.contains(r#"id="claim""#), "missing #claim on {path}");
+            assert!(body.contains(r#"id="opt-out""#), "missing #opt-out on {path}");
+            assert!(body.contains(r#"id="abuse""#), "missing #abuse on {path}");
+            assert!(
+                body.contains("data-disclosure-tabs"),
+                "sub-tab strip missing on {path}"
+            );
+        }
 
         server.abort();
     }
