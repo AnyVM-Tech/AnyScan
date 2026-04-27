@@ -122,8 +122,13 @@ disable_check() {
 
 unknown_action_check() {
     local out rc
-    out="$("$TARGET_SCRIPT" notarealaction 2>&1)" || true
+    # `out=$(...) || true` would clobber $? to true's exit code, so the
+    # assertion below would always pass. Suspend `set -e` for the capture
+    # so $? reflects the script's real exit instead.
+    set +e
+    out="$("$TARGET_SCRIPT" notarealaction 2>&1)"
     rc=$?
+    set -e
     if [ "$rc" -ne 0 ]; then
         note_fail "unknown action exit code" "expected 0, got $rc"
     else

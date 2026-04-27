@@ -177,15 +177,22 @@ apply_host_resource_defaults() {
     fi
 
     if [ -x "$VULNSCANNER_BIN_DEST" ]; then
-        # Default cap on per-scan probe rate when the control plane does not
-        # specify one. 500k pps × ~64-byte SYN ≈ 256 Mbit/s, still well under
-        # the 1 Gbit ceiling that PR #28's reserve-control-bandwidth.sh sets
-        # for the bulk class — and the tc reservation is now the primary
-        # safety net for control-plane heartbeats, not this cap. Bench on
-        # c6in.xlarge (4 vCPU) shows the bundled scanner sustains ~1.7M pps
-        # with sender_threads=4 receivers=1 against an unreachable /24, so
-        # operators can raise SCANNER_DEFAULT_RATE further if they have
-        # measured headroom. Set to 0 to disable the cap entirely.
+        # Fallback rate the scanner adapter uses when a per-scan invocation
+        # omits `rate_limit` entirely. The Rust worker always serializes
+        # `rate_limit` (including 0) into the invocation, so this fallback
+        # currently fires only for direct adapter callers (tests, scripts);
+        # for invocations from the worker, `rate_limit=0` means "no --rate
+        # flag, scanner runs at its natural ceiling". The worker also reports
+        # this value to the control plane as registration metadata so the
+        # control plane can pick a reasonable per-scan rate. 500k pps ×
+        # ~64-byte SYN ≈ 256 Mbit/s, well under the 1 Gbit ceiling that
+        # PR #28's reserve-control-bandwidth.sh sets for the bulk class —
+        # the tc reservation is the primary safety net for control-plane
+        # heartbeats, not this value. Bench on c6in.xlarge (4 vCPU) shows
+        # the bundled scanner sustains ~1.7M pps with sender_threads=4
+        # receivers=1 against an unreachable /24; operators can raise
+        # SCANNER_DEFAULT_RATE further if they have measured headroom. Set
+        # to 0 to disable the fallback (--rate flag omitted).
         if [ -z "$(env_value "SCANNER_DEFAULT_RATE" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "SCANNER_DEFAULT_RATE" "500000" "$RUNTIME_ENV_FILE"
         fi

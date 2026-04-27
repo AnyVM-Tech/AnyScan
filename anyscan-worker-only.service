@@ -17,9 +17,12 @@ EnvironmentFile=-/var/lib/agentd/agent.env
 ExecStartPre=+/opt/agentd/bin/reserve-control-bandwidth.sh apply
 # Bump kernel queues + NIC txqueuelen so the scanner is not throttled by
 # default sysctl values when it pushes >500k pps. Idempotent and
-# fail-open. The `+` prefix bypasses ProtectKernelTunables=true so sysctl
-# writes succeed; the persistent /etc/sysctl.d drop-in handles boot.
-ExecStartPre=+/opt/agentd/bin/tune-scanner-host.sh apply
+# fail-open. The `-+` prefix runs as root (so sysctl writes bypass
+# ProtectKernelTunables=true) AND tells systemd to ignore failures, so a
+# partial upgrade that has not yet shipped the helper does not block the
+# worker from starting; the persistent /etc/sysctl.d drop-in still gets
+# reapplied at the next boot or remote update.
+ExecStartPre=-+/opt/agentd/bin/tune-scanner-host.sh apply
 ExecStopPost=+/opt/agentd/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/agentd/bin/agentd daemon
 Restart=always

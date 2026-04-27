@@ -131,6 +131,11 @@ const HOSTED_AGENT_BUNDLE_ASSETS: &[EmbeddedBundleAsset] = &[
         executable: true,
     },
     EmbeddedBundleAsset {
+        relative_path: "tools/tune-scanner-host.sh",
+        contents: include_bytes!("../../tools/tune-scanner-host.sh"),
+        executable: true,
+    },
+    EmbeddedBundleAsset {
         relative_path: "runtime.worker.env.template",
         contents: include_bytes!("../../runtime.worker.env.template"),
         executable: false,
