@@ -6923,4 +6923,79 @@ paths:
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn header_policy_detectors_fire_on_open_cors_through_fetcher() {
+        use crate::detectors::DetectorEngine;
+
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                let mut headers = HeaderMap::new();
+                headers.insert("access-control-allow-origin", "*".parse().unwrap());
+                headers.insert(
+                    "access-control-allow-credentials",
+                    "true".parse().unwrap(),
+                );
+                (headers, Html("<html><body>cors-open</body></html>"))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should report local addr");
+        let base_url = format!("http://{address}");
+        let server: JoinHandle<()> = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should stay available")
+        });
+
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 1;
+        config.scan.max_discovered_paths_per_target = 1;
+        config.scan.enable_path_discovery = false;
+        config.validate().expect("test config should validate");
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 9_010,
+            label: "open-cors-live".to_string(),
+            base_url,
+            paths: vec!["/".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("live fetch should succeed");
+        assert!(
+            !report.documents.is_empty(),
+            "expected at least one fetched document"
+        );
+
+        let engine = DetectorEngine::new();
+        let mut detectors = std::collections::HashSet::new();
+        for document in &report.documents {
+            for finding in engine.scan_document(document) {
+                detectors.insert(finding.detector);
+            }
+        }
+        assert!(
+            detectors.contains("open_cors_with_credentials"),
+            "live HTTP fetch did not surface open_cors_with_credentials finding; saw {detectors:?}"
+        );
+
+        server.abort();
+    }
 }

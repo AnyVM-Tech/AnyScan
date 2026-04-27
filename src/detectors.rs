@@ -931,6 +931,7 @@ impl DetectorEngine {
         scan_verbose_stack_traces(document, &mut seen, &mut findings);
         scan_contextual_assignments(document, &mut seen, &mut findings);
         scan_structured_contextual_assignments(document, &mut seen, &mut findings);
+        scan_header_policy_detectors(document, &mut seen, &mut findings);
         scan_response_header_contextual_assignments(document, &mut seen, &mut findings);
         scan_cookie_header_contextual_assignments(document, &mut seen, &mut findings);
         scan_inline_script_contextual_assignments(document, &mut seen, &mut findings);
@@ -1149,6 +1150,193 @@ fn scan_external_detector_packs(
             }
         }
     }
+}
+
+fn scan_header_policy_detectors(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    let acao = extract_header_value(document, "access-control-allow-origin");
+    let acac = extract_header_value(document, "access-control-allow-credentials");
+    let credentials_true = acac
+        .as_deref()
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if let Some(origin_value) = acao.as_deref() {
+        let trimmed_origin = origin_value.trim();
+        if trimmed_origin == "*" && credentials_true {
+            push_header_policy_finding(
+                findings,
+                seen,
+                document,
+                "open_cors_with_credentials",
+                Severity::High,
+                FindingConfidence::High,
+                trimmed_origin,
+                &format!(
+                    "Access-Control-Allow-Origin: * with Access-Control-Allow-Credentials: true (status={})",
+                    document.status
+                ),
+                vec![
+                    "access_control_allow_origin_wildcard".to_string(),
+                    "access_control_allow_credentials_true".to_string(),
+                ],
+                vec!["cors_misconfiguration".to_string()],
+            );
+        } else if credentials_true && looks_like_reflective_origin(trimmed_origin) {
+            push_header_policy_finding(
+                findings,
+                seen,
+                document,
+                "open_cors_reflective_origin",
+                Severity::High,
+                FindingConfidence::Medium,
+                trimmed_origin,
+                &format!(
+                    "Access-Control-Allow-Origin reflected a specific origin alongside Access-Control-Allow-Credentials: true (status={})",
+                    document.status
+                ),
+                vec![
+                    "access_control_allow_origin_specific".to_string(),
+                    "access_control_allow_credentials_true".to_string(),
+                ],
+                vec!["cors_misconfiguration".to_string()],
+            );
+        }
+    }
+
+    if request_url_is_https(document)
+        && extract_header_value(document, "strict-transport-security").is_none()
+    {
+        push_header_policy_finding(
+            findings,
+            seen,
+            document,
+            "missing_hsts_on_https",
+            Severity::Low,
+            FindingConfidence::High,
+            "",
+            &format!(
+                "HTTPS response did not include a Strict-Transport-Security header (status={})",
+                document.status
+            ),
+            vec!["missing_strict_transport_security".to_string()],
+            vec!["transport_security".to_string()],
+        );
+    }
+
+    if let Some(csp) = extract_header_value(document, "content-security-policy") {
+        if let Some(directive) = csp_has_unsafe_in_script_or_default(&csp) {
+            push_header_policy_finding(
+                findings,
+                seen,
+                document,
+                "weak_csp_unsafe_directives",
+                Severity::Medium,
+                FindingConfidence::High,
+                &csp,
+                &format!(
+                    "Content-Security-Policy {directive} contains unsafe-inline or unsafe-eval (status={})",
+                    document.status
+                ),
+                vec![format!("csp_{directive}_unsafe").replace('-', "_")],
+                vec!["weak_csp".to_string()],
+            );
+        }
+    }
+}
+
+fn push_header_policy_finding(
+    findings: &mut Vec<FindingCandidate>,
+    seen: &mut HashSet<String>,
+    document: &FetchedDocument,
+    detector_name: &str,
+    severity: Severity,
+    confidence: FindingConfidence,
+    header_value: &str,
+    evidence: &str,
+    matched_signals: Vec<String>,
+    review_labels: Vec<String>,
+) {
+    let redacted_value = truncate_header_value(header_value, 200);
+    let fingerprint_source =
+        format!("{detector_name}:{}:{header_value}", document.path);
+    let fingerprint = fingerprint(&fingerprint_source);
+    let dedupe_key = format!("{}:{detector_name}:{fingerprint}", document.path);
+    if !seen.insert(dedupe_key) {
+        return;
+    }
+
+    findings.push(FindingCandidate {
+        detector: detector_name.to_string(),
+        severity,
+        path: document.path.clone(),
+        redacted_value,
+        evidence: evidence.trim().to_string(),
+        fingerprint,
+        confidence: Some(confidence),
+        matched_signals,
+        review_labels,
+        plugin_metadata: None,
+    });
+}
+
+fn truncate_header_value(value: &str, limit: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= limit {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(limit).collect();
+    format!("{truncated}...")
+}
+
+fn looks_like_reflective_origin(value: &str) -> bool {
+    let candidate = value.trim();
+    if candidate.is_empty() || candidate == "*" || candidate.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    if candidate.contains(',') {
+        return false;
+    }
+    if let Ok(parsed) = Url::parse(candidate) {
+        let scheme = parsed.scheme();
+        return scheme == "http" || scheme == "https";
+    }
+    false
+}
+
+fn request_url_is_https(document: &FetchedDocument) -> bool {
+    Url::parse(&document.url)
+        .map(|url| url.scheme().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+fn csp_has_unsafe_in_script_or_default(csp: &str) -> Option<&'static str> {
+    for directive_chunk in csp.split(';') {
+        let trimmed = directive_chunk.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut tokens = trimmed.split_ascii_whitespace();
+        let Some(name) = tokens.next() else {
+            continue;
+        };
+        let lowered_name = name.to_ascii_lowercase();
+        let directive_label = match lowered_name.as_str() {
+            "script-src" => "script-src",
+            "default-src" => "default-src",
+            _ => continue,
+        };
+        for token in tokens {
+            let lowered_token = token.trim_matches(&['\'', '"'][..]).to_ascii_lowercase();
+            if lowered_token == "unsafe-inline" || lowered_token == "unsafe-eval" {
+                return Some(directive_label);
+            }
+        }
+    }
+    None
 }
 
 fn scan_response_header_contextual_assignments(
@@ -6100,7 +6288,11 @@ mod tests {
     use super::{DetectorEngine, candidate_detectors, compare_numeric_versions};
 
     fn document(path: &str, body: &str) -> FetchedDocument {
-        document_with_headers(path, body, &[])
+        document_with_headers(
+            path,
+            body,
+            &[("Strict-Transport-Security", "max-age=31536000")],
+        )
     }
 
     fn document_with_headers(path: &str, body: &str, headers: &[(&str, &str)]) -> FetchedDocument {
@@ -7997,6 +8189,10 @@ mod tests {
             headers: vec![
                 ("X-Api-Key".to_string(), "your_api_key_here".to_string()),
                 ("Authorization".to_string(), "Bearer ${TOKEN}".to_string()),
+                (
+                    "Strict-Transport-Security".to_string(),
+                    "max-age=31536000".to_string(),
+                ),
             ],
             body: String::new(),
             truncated: false,
@@ -8069,6 +8265,7 @@ mod tests {
                     "Cookie",
                     "remember_me=${TOKEN}; private_token=your_api_key_here",
                 ),
+                ("Strict-Transport-Security", "max-age=31536000"),
             ],
         ));
 
@@ -8817,5 +9014,227 @@ mod tests {
         assert!(jwt.redacted_value.contains("****"));
         // The full token must not appear verbatim in redacted_value.
         assert!(!jwt.redacted_value.contains(alg_none));
+    }
+
+    #[test]
+    fn header_policy_open_cors_with_credentials_fires_on_wildcard_with_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/api/data",
+            "{}",
+            &[
+                ("Access-Control-Allow-Origin", "*"),
+                ("Access-Control-Allow-Credentials", "true"),
+            ],
+        ));
+
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "open_cors_with_credentials")
+            .expect("open_cors_with_credentials finding");
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(
+            finding.confidence,
+            Some(crate::core::FindingConfidence::High)
+        );
+        assert_eq!(finding.redacted_value, "*");
+        assert!(finding.evidence.contains("status=200"));
+    }
+
+    #[test]
+    fn header_policy_open_cors_with_credentials_does_not_fire_without_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/api/data",
+            "{}",
+            &[("Access-Control-Allow-Origin", "*")],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "open_cors_with_credentials")
+        );
+    }
+
+    #[test]
+    fn header_policy_open_cors_with_credentials_does_not_fire_when_safe() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/api/data",
+            "{}",
+            &[
+                ("Access-Control-Allow-Origin", "https://trusted.example"),
+                ("Access-Control-Allow-Credentials", "false"),
+            ],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "open_cors_with_credentials")
+        );
+    }
+
+    #[test]
+    fn header_policy_open_cors_reflective_origin_fires_on_specific_origin_with_credentials() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/api/data",
+            "{}",
+            &[
+                ("Access-Control-Allow-Origin", "https://attacker.example"),
+                ("Access-Control-Allow-Credentials", "true"),
+            ],
+        ));
+
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "open_cors_reflective_origin")
+            .expect("open_cors_reflective_origin finding");
+        assert_eq!(finding.severity, Severity::High);
+        assert_eq!(
+            finding.confidence,
+            Some(crate::core::FindingConfidence::Medium)
+        );
+        assert_eq!(finding.redacted_value, "https://attacker.example");
+    }
+
+    #[test]
+    fn header_policy_open_cors_reflective_origin_does_not_fire_on_null_origin() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/api/data",
+            "{}",
+            &[
+                ("Access-Control-Allow-Origin", "null"),
+                ("Access-Control-Allow-Credentials", "true"),
+            ],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "open_cors_reflective_origin")
+        );
+    }
+
+    #[test]
+    fn header_policy_missing_hsts_fires_on_https_without_header() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers("/", "<html></html>", &[]));
+
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "missing_hsts_on_https")
+            .expect("missing_hsts_on_https finding");
+        assert_eq!(finding.severity, Severity::Low);
+        assert_eq!(
+            finding.confidence,
+            Some(crate::core::FindingConfidence::High)
+        );
+    }
+
+    #[test]
+    fn header_policy_missing_hsts_does_not_fire_when_header_is_present() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html></html>",
+            &[("Strict-Transport-Security", "max-age=63072000")],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "missing_hsts_on_https")
+        );
+    }
+
+    #[test]
+    fn header_policy_missing_hsts_does_not_fire_on_http() {
+        let mut doc = document_with_headers("/", "<html></html>", &[]);
+        doc.url = "http://insecure.test/".to_string();
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&doc);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "missing_hsts_on_https")
+        );
+    }
+
+    #[test]
+    fn header_policy_weak_csp_fires_on_unsafe_inline_in_script_src() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html></html>",
+            &[(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self' 'unsafe-inline'",
+            )],
+        ));
+
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "weak_csp_unsafe_directives")
+            .expect("weak_csp_unsafe_directives finding");
+        assert_eq!(finding.severity, Severity::Medium);
+        assert_eq!(
+            finding.confidence,
+            Some(crate::core::FindingConfidence::High)
+        );
+        assert!(finding.evidence.contains("script-src"));
+    }
+
+    #[test]
+    fn header_policy_weak_csp_fires_on_unsafe_eval_in_default_src() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html></html>",
+            &[(
+                "Content-Security-Policy",
+                "default-src 'self' 'unsafe-eval'",
+            )],
+        ));
+        let finding = findings
+            .iter()
+            .find(|finding| finding.detector == "weak_csp_unsafe_directives")
+            .expect("weak_csp_unsafe_directives finding");
+        assert!(finding.evidence.contains("default-src"));
+    }
+
+    #[test]
+    fn header_policy_weak_csp_does_not_fire_on_strict_policy() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html></html>",
+            &[(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'self' 'nonce-abc123'",
+            )],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "weak_csp_unsafe_directives")
+        );
+    }
+
+    #[test]
+    fn header_policy_weak_csp_ignores_unsafe_in_other_directives() {
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(&document_with_headers(
+            "/",
+            "<html></html>",
+            &[(
+                "Content-Security-Policy",
+                "style-src 'self' 'unsafe-inline'; script-src 'self'",
+            )],
+        ));
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.detector == "weak_csp_unsafe_directives")
+        );
     }
 }
