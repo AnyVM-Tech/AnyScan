@@ -426,6 +426,7 @@ async fn main() -> Result<()> {
         .route("/app/workers", get(operator_pages::operator_workers))
         .route("/app/findings", get(operator_pages::operator_findings))
         .route("/app/coverage", get(operator_pages::operator_coverage))
+        .route("/app/catalog", get(operator_pages::operator_catalog))
         .route("/scanning-policy", get(public_page))
         .route("/scanner-identity", get(public_page))
         .route("/opt-out", get(public_page))
