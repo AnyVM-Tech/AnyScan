@@ -566,39 +566,28 @@
 				const approveBootstrap = canApproveBootstrapCandidates();
 				const moderatePublicFindings = canModeratePublicFindings();
 
-				elements.workerTokenAccessNote.textContent = manageWorkers
-					? 'Issue and revoke join tokens'
-					: 'Read-only visibility';
-				elements.workerTokenForm.classList.toggle(
-					'hidden',
-					!manageWorkers
-				);
-				elements.workerTokenReadonlyNote.classList.toggle(
-					'hidden',
-					manageWorkers
-				);
-				elements.workersRemoteUpdateAll.classList.toggle(
-					'hidden',
-					!manageWorkers
-				);
+				if (elements.workerTokenAccessNote) {
+					elements.workerTokenAccessNote.textContent = manageWorkers
+						? 'Issue and revoke join tokens'
+						: 'Read-only visibility';
+				}
+				elements.workerTokenForm?.classList.toggle('hidden', !manageWorkers);
+				elements.workerTokenReadonlyNote?.classList.toggle('hidden', manageWorkers);
+				elements.workersRemoteUpdateAll?.classList.toggle('hidden', !manageWorkers);
 
-				elements.bootstrapApprovalAccessNote.textContent =
-					approveBootstrap
+				if (elements.bootstrapApprovalAccessNote) {
+					elements.bootstrapApprovalAccessNote.textContent = approveBootstrap
 						? 'Approve or reject pending worker candidates'
 						: 'Read-only visibility';
-				elements.bootstrapApprovalForm.classList.toggle(
-					'hidden',
-					!approveBootstrap
-				);
-				elements.bootstrapApprovalReadonlyNote.classList.toggle(
-					'hidden',
-					approveBootstrap
-				);
+				}
+				elements.bootstrapApprovalForm?.classList.toggle('hidden', !approveBootstrap);
+				elements.bootstrapApprovalReadonlyNote?.classList.toggle('hidden', approveBootstrap);
 
-				elements.findingsPublicationAccessNote.textContent =
-					moderatePublicFindings
+				if (elements.findingsPublicationAccessNote) {
+					elements.findingsPublicationAccessNote.textContent = moderatePublicFindings
 						? 'Search redacted findings and publish or suppress public summaries.'
 						: 'Search redacted findings with read-only visibility into public publication state.';
+				}
 			}
 
 			function closeEvents() {
@@ -5248,7 +5237,7 @@
 					error.message || fallbackMessage;
 			}
 
-			elements.findingsQueryForm.addEventListener(
+			elements.findingsQueryForm?.addEventListener(
 				'submit',
 				async event => {
 					event.preventDefault();
@@ -5265,7 +5254,7 @@
 				}
 			);
 
-			elements.findingsQueryResetButton.addEventListener(
+			elements.findingsQueryResetButton?.addEventListener(
 				'click',
 				async () => {
 					try {
@@ -5313,7 +5302,7 @@
 				);
 			});
 
-			elements.pluginQueryForm.addEventListener('submit', async event => {
+			elements.pluginQueryForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.pluginQueryError.classList.add('hidden');
 				state.pluginCatalogQuery = buildPluginCatalogQuery();
@@ -5327,7 +5316,7 @@
 				}
 			});
 
-			elements.pluginQueryResetButton.addEventListener(
+			elements.pluginQueryResetButton?.addEventListener(
 				'click',
 				async () => {
 					try {
@@ -5341,7 +5330,7 @@
 				}
 			);
 
-			elements.loginForm.addEventListener('submit', async event => {
+			elements.loginForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				const username = document
 					.getElementById('username')
@@ -5366,7 +5355,7 @@
 				}
 			});
 
-			elements.logoutButton.addEventListener('click', async () => {
+			elements.logoutButton?.addEventListener('click', async () => {
 				try {
 					await request('/api/session', { method: 'DELETE' });
 				} finally {
@@ -5374,7 +5363,7 @@
 				}
 			});
 
-			elements.refreshButton.addEventListener('click', async () => {
+			elements.refreshButton?.addEventListener('click', async () => {
 				try {
 					await loadDashboard();
 				} catch (error) {
@@ -5382,7 +5371,7 @@
 				}
 			});
 
-			elements.scanSettingsForm.addEventListener(
+			elements.scanSettingsForm?.addEventListener(
 				'submit',
 				async event => {
 					event.preventDefault();
@@ -5409,7 +5398,7 @@
 				}
 			);
 
-			elements.binDatasetImportForm.addEventListener(
+			elements.binDatasetImportForm?.addEventListener(
 				'submit',
 				async event => {
 					event.preventDefault();
@@ -5441,7 +5430,7 @@
 				}
 			);
 
-			elements.binLookupForm.addEventListener('submit', async event => {
+			elements.binLookupForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.binLookupError.classList.add('hidden');
 
@@ -5461,7 +5450,7 @@
 				}
 			});
 
-			elements.workerTokenForm.addEventListener('submit', async event => {
+			elements.workerTokenForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.workerTokenError.classList.add('hidden');
 
@@ -5494,7 +5483,7 @@
 				}
 			});
 
-			elements.bootstrapDispatchEnabled.addEventListener('change', () => {
+			elements.bootstrapDispatchEnabled?.addEventListener('change', () => {
 				syncBootstrapDispatchVisibility();
 			});
 
@@ -5505,14 +5494,14 @@
 				}
 			);
 
-			elements.bootstrapCandidateId.addEventListener('change', () => {
+			elements.bootstrapCandidateId?.addEventListener('change', () => {
 				const candidate = findBootstrapCandidateById(
 					elements.bootstrapCandidateId.value
 				);
 				populateBootstrapApprovalDefaults(candidate);
 			});
 
-			elements.bootstrapApprovalForm.addEventListener(
+			elements.bootstrapApprovalForm?.addEventListener(
 				'submit',
 				async event => {
 					event.preventDefault();
@@ -5560,7 +5549,7 @@
 				}
 			);
 
-			elements.bootstrapRejectButton.addEventListener(
+			elements.bootstrapRejectButton?.addEventListener(
 				'click',
 				async () => {
 					elements.bootstrapApprovalError.classList.add('hidden');
@@ -5613,7 +5602,7 @@
 				}
 			);
 
-			elements.queueButton.addEventListener('click', async () => {
+			elements.queueButton?.addEventListener('click', async () => {
 				try {
 					await request('/api/runs', {
 						method: 'POST',
@@ -5628,7 +5617,7 @@
 				}
 			});
 
-			elements.targetForm.addEventListener('submit', async event => {
+			elements.targetForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.targetError.classList.add('hidden');
 
@@ -5673,7 +5662,7 @@
 				}
 			});
 
-			elements.runForm.addEventListener('submit', async event => {
+			elements.runForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.runError.classList.add('hidden');
 				const scope = buildRunScope(
@@ -5714,7 +5703,7 @@
 				}
 			});
 
-			elements.scheduleForm.addEventListener('submit', async event => {
+			elements.scheduleForm?.addEventListener('submit', async event => {
 				event.preventDefault();
 				elements.scheduleError.classList.add('hidden');
 
@@ -5803,7 +5792,7 @@
 				}
 			});
 
-			elements.workersRemoteUpdateAll.addEventListener(
+			elements.workersRemoteUpdateAll?.addEventListener(
 				'click',
 				async () => {
 					try {
