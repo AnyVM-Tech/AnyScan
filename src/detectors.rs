@@ -6393,21 +6393,63 @@ fn validate_swagger_json_spec(body: &str) -> Option<SwaggerSignal> {
 }
 
 fn validate_swagger_yaml_spec(body: &str) -> Option<SwaggerSignal> {
-    let trimmed = body.trim_start();
-    let lowered_trim = trimmed.to_ascii_lowercase();
-    let leading = body.len().saturating_sub(trimmed.len());
+    // Walk lines from the top, skipping YAML prologue (directives `%...`,
+    // document markers `---`/`...`, comment lines `#...`, blanks). The first
+    // real content line must start with `openapi:` or `swagger:`.
+    let bytes = body.as_bytes();
+    let mut cursor = 0usize;
+    let mut iterations = 0usize;
 
-    for prefix in ["openapi:", "swagger:"] {
-        if lowered_trim.starts_with(prefix) {
-            let start = leading;
-            let end = leading + prefix.len();
-            return Some(SwaggerSignal {
-                matched: body[start..end].to_string(),
-                start,
-                end,
-            });
+    while cursor < body.len() && iterations < 64 {
+        iterations += 1;
+
+        let line_end = body[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(body.len());
+        let trimmed_line_end = if line_end > cursor && bytes[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line = &body[cursor..trimmed_line_end];
+        let trimmed_line = line.trim_start();
+        let content_start = cursor + (line.len() - trimmed_line.len());
+
+        let is_blank = trimmed_line.is_empty();
+        let is_comment = trimmed_line.starts_with('#');
+        let is_directive = trimmed_line.starts_with('%');
+        let is_doc_marker = trimmed_line == "---"
+            || trimmed_line == "..."
+            || (trimmed_line.starts_with("---")
+                && trimmed_line
+                    .as_bytes()
+                    .get(3)
+                    .copied()
+                    .is_some_and(|b| b == b' ' || b == b'\t' || b == b'#'));
+
+        if !(is_blank || is_comment || is_directive || is_doc_marker) {
+            let lowered = trimmed_line.to_ascii_lowercase();
+            for prefix in ["openapi:", "swagger:"] {
+                if lowered.starts_with(prefix) {
+                    let start = content_start;
+                    let end = content_start + prefix.len();
+                    return Some(SwaggerSignal {
+                        matched: body[start..end].to_string(),
+                        start,
+                        end,
+                    });
+                }
+            }
+            return None;
         }
+
+        if line_end >= body.len() {
+            break;
+        }
+        cursor = line_end + 1;
     }
+
     None
 }
 
@@ -9890,6 +9932,72 @@ mod tests {
         assert!(
             has_swagger_ui_finding(&findings),
             "/api-docs serving HTML swagger-ui page must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_document_marker_prologue() {
+        let engine = DetectorEngine::new();
+        let body =
+            "---\nopenapi: 3.0.3\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with leading `---` document marker must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_comment_prologue() {
+        let engine = DetectorEngine::new();
+        let body = "# Generated from internal source\n# Do not edit by hand\nopenapi: 3.0.3\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with leading comment lines must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_directive_and_marker_prologue() {
+        let engine = DetectorEngine::new();
+        let body = "%YAML 1.2\n---\n# Generated\nswagger: \"2.0\"\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with directive + document marker + comment prologue must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_yaml_when_first_real_line_is_not_openapi_key() {
+        let engine = DetectorEngine::new();
+        let body =
+            "---\ntitle: Some YAML doc\nopenapi: 3.0.3\ninfo:\n  title: Example API\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "YAML where openapi: is not the FIRST content key must not match (the spec key must be at the document root)"
         );
     }
 
