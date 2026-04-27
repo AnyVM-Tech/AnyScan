@@ -386,6 +386,32 @@
 				margin-top: 0;
 			}
 
+			/* Sub-tab nav for pages that split content into multiple panes
+			   (Findings: Search / Live / Publications). */
+			.subtabs {
+				display: flex;
+				gap: var(--space-2);
+				flex-wrap: wrap;
+				margin: var(--space-3) 0 var(--space-4);
+				border-bottom: 1px solid var(--panel-border);
+				padding-bottom: var(--space-2);
+			}
+
+			.subtab {
+				border-radius: var(--radius-pill);
+				padding: 8px 14px;
+				background: rgba(148, 163, 184, 0.1);
+				color: var(--text);
+				font-weight: 600;
+			}
+
+			.subtab[aria-selected='true'],
+			.subtab.is-active {
+				background: var(--panel-strong);
+				border: 1px solid var(--panel-border-strong);
+				color: var(--text-strong);
+			}
+
 			.toolbar {
 				display: flex;
 				justify-content: space-between;

@@ -1,0 +1,247 @@
+				<section id="page-findings">
+					<h2 class="section-group-heading" id="section-findings">
+						<span>Findings</span>
+						<span class="section-group-hint">Search findings, watch live activity, and moderate public publications.</span>
+					</h2>
+
+					<div
+						class="subtabs"
+						role="tablist"
+						aria-label="Findings sub-sections"
+						id="findings-subtabs"
+					>
+						<button
+							type="button"
+							role="tab"
+							class="subtab"
+							id="findings-subtab-search"
+							data-subtab="search"
+							aria-controls="findings-pane-search"
+							aria-selected="true"
+						>
+							Search
+						</button>
+						<button
+							type="button"
+							role="tab"
+							class="subtab"
+							id="findings-subtab-live"
+							data-subtab="live"
+							aria-controls="findings-pane-live"
+							aria-selected="false"
+						>
+							Live
+						</button>
+						<button
+							type="button"
+							role="tab"
+							class="subtab"
+							id="findings-subtab-publications"
+							data-subtab="publications"
+							aria-controls="findings-pane-publications"
+							aria-selected="false"
+						>
+							Publications
+						</button>
+					</div>
+
+					<section
+						id="findings-pane-search"
+						class="subtab-pane"
+						role="tabpanel"
+						aria-labelledby="findings-subtab-search"
+					>
+						<article class="card wide-card">
+							<h2>Findings</h2>
+							<p
+								id="findings-publication-access-note"
+								class="management-note"
+							>
+								Search redacted findings and review public
+								publication state.
+							</p>
+							<form id="findings-search-form">
+								<label>
+									Free-text query
+									<input
+										id="findings-query"
+										placeholder="prod admin github"
+									/>
+								</label>
+								<label>
+									Severity
+									<select id="findings-severity">
+										<option value="">Any severity</option>
+										<option value="critical">Critical</option>
+										<option value="high">High</option>
+										<option value="medium">Medium</option>
+										<option value="low">Low</option>
+										<option value="info">Info</option>
+									</select>
+								</label>
+								<label>
+									Confidence
+									<select id="findings-confidence">
+										<option value="">Any confidence</option>
+										<option value="high">High</option>
+										<option value="medium">Medium</option>
+										<option value="low">Low</option>
+									</select>
+								</label>
+								<label>
+									Detector
+									<input
+										id="findings-detector"
+										placeholder="github_pat"
+									/>
+								</label>
+								<label>
+									Plugin ID
+									<input
+										id="findings-plugin-id"
+										placeholder="GrafanaOpenPlugin"
+									/>
+								</label>
+								<label>
+									Plugin family
+									<select id="findings-plugin-family">
+										<option value="">Any family</option>
+										<option value="ai_llm_vector">AI / LLM / vector</option>
+										<option value="databases_search">Databases / search</option>
+										<option value="enterprise_web_apps">Enterprise / web apps</option>
+										<option value="infra_platform_data">Infra / platform / data</option>
+										<option value="leakage_debug_config">Leakage / debug / config</option>
+										<option value="network_security_appliances">Network / security appliances</option>
+										<option value="ot_ics_iot">OT / ICS / IoT</option>
+										<option value="ops_observability">Ops / observability</option>
+										<option value="exposure_vulnerability_misc">Exposure / vulnerability misc</option>
+									</select>
+								</label>
+								<label>
+									Execution mode
+									<select id="findings-execution-mode">
+										<option value="">Any mode</option>
+										<option value="passive_http">Passive HTTP</option>
+										<option value="authless_protocol">Authless protocol</option>
+										<option value="version_correlation">Version correlation</option>
+										<option value="active_authorized">Active authorized</option>
+									</select>
+								</label>
+								<label>
+									LeakIX label
+									<select id="findings-leakix-label">
+										<option value="">Any label</option>
+										<option value="public">Public</option>
+										<option value="trusted_pro">Trusted / Pro</option>
+									</select>
+								</label>
+								<label>
+									Path prefix
+									<input
+										id="findings-path-prefix"
+										placeholder="/admin"
+									/>
+								</label>
+								<label>
+									Tags (comma separated)
+									<input
+										id="findings-tags"
+										placeholder="prod, internal"
+									/>
+								</label>
+								<label>
+									Review labels (comma separated)
+									<input
+										id="findings-review-labels"
+										placeholder="best_effort, rce_surface"
+									/>
+								</label>
+								<label>
+									Run ID
+									<input
+										id="findings-run-id"
+										type="number"
+										min="1"
+										step="1"
+										placeholder="42"
+									/>
+								</label>
+								<label>
+									Target ID
+									<input
+										id="findings-target-id"
+										type="number"
+										min="1"
+										step="1"
+										placeholder="12"
+									/>
+								</label>
+								<label>
+									Limit
+									<input
+										id="findings-limit"
+										type="number"
+										min="1"
+										max="250"
+										step="1"
+										placeholder="50"
+									/>
+								</label>
+								<div class="actions">
+									<button type="submit">Search findings</button>
+									<button
+										id="findings-reset-button"
+										type="button"
+									>
+										Clear filters
+									</button>
+								</div>
+								<small id="findings-search-status" class="muted"
+									>Showing recent findings from the latest
+									dashboard snapshot.</small
+								>
+								<p
+									id="findings-search-error"
+									class="error hidden"
+								></p>
+							</form>
+							<ul id="findings-list" class="list"></ul>
+							<p id="findings-empty" class="empty hidden">
+								No redacted findings recorded yet.
+							</p>
+						</article>
+					</section>
+
+					<section
+						id="findings-pane-live"
+						class="subtab-pane hidden"
+						role="tabpanel"
+						aria-labelledby="findings-subtab-live"
+					>
+						<article class="card wide-card">
+							<h2>Live activity</h2>
+							<ul id="events-list" class="list"></ul>
+							<p id="events-empty" class="empty">
+								Waiting for streamed events.
+							</p>
+						</article>
+					</section>
+
+					<section
+						id="findings-pane-publications"
+						class="subtab-pane hidden"
+						role="tabpanel"
+						aria-labelledby="findings-subtab-publications"
+					>
+						<article class="card wide-card">
+							<h2>Public finding publications</h2>
+							<p id="publication-records-note" class="management-note">
+								Published and suppressed records across the public measurement surface.
+							</p>
+							<ul id="publication-records-list" class="list"></ul>
+							<p id="publication-records-empty" class="empty hidden">
+								No public publication decisions recorded yet.
+							</p>
+						</article>
+					</section>
+				</section>

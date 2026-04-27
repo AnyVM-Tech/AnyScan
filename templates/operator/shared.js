@@ -4080,7 +4080,8 @@
 					const session = await request('/api/me', { method: 'GET' });
 					setAuthenticated(session);
 					await loadDashboard();
-					connectEvents();
+					// EventSource is opened lazily by the Findings page when the
+					// Live sub-tab becomes active. Do not auto-connect here.
 				} catch (error) {
 					if (error.status === 401) {
 						setUnauthenticated();
@@ -5366,7 +5367,8 @@
 					});
 					setAuthenticated(session);
 					await loadDashboard();
-					connectEvents();
+					// EventSource is opened lazily by the Findings page when the
+					// Live sub-tab becomes active. Do not auto-connect here.
 					elements.loginForm.reset();
 				} catch (error) {
 					elements.authError.textContent =

@@ -55,6 +55,14 @@ pub async fn operator_workers() -> Html<String> {
     )
 }
 
+pub async fn operator_findings() -> Html<String> {
+    render_page(
+        "findings",
+        include_str!("../templates/operator/findings.html"),
+        include_str!("../templates/operator/findings.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +200,55 @@ mod tests {
         assert!(
             body.contains("id=\"bootstrap-jobs-list\""),
             "rendered body should contain the bootstrap-jobs-list container"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_findings_serves_shell_and_findings_ids() {
+        let app = Router::new().route("/app/findings", get(operator_findings));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator findings test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator findings test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator findings test server should stay available");
+        });
+
+        let url = format!("http://{}/app/findings", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/findings should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator findings body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("id=\"findings-search-form\""),
+            "rendered body should contain the findings search form"
+        );
+        assert!(
+            body.contains("id=\"events-list\""),
+            "rendered body should contain the live events list"
+        );
+        assert!(
+            body.contains("id=\"publication-records-list\""),
+            "rendered body should contain the publication records list"
         );
 
         server.abort();
