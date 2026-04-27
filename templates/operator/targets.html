@@ -1,0 +1,167 @@
+				<h2 class="section-group-heading" id="section-targets">
+					<span>Targets</span>
+					<span class="section-group-hint">Owned-asset inventory, run history, repository links, and BIN data.</span>
+				</h2>
+
+				<section id="page-targets">
+					<nav
+						class="subtab-bar"
+						aria-label="Targets sub-sections"
+					>
+						<button
+							type="button"
+							class="subtab"
+							data-subtab="targets-inventory"
+							aria-current="page"
+						>
+							Inventory
+						</button>
+						<button
+							type="button"
+							class="subtab"
+							data-subtab="targets-bin"
+						>
+							BIN tools
+						</button>
+					</nav>
+
+					<div
+						class="subtab-pane"
+						id="targets-inventory"
+						data-subtab-pane="targets-inventory"
+					>
+						<section class="grid two-up">
+							<article class="card wide-card">
+								<h2>Targets</h2>
+								<div class="table-scroll">
+									<table>
+										<thead>
+											<tr>
+												<th>Label</th>
+												<th>Base URL</th>
+												<th>Scope / discovery</th>
+												<th>Status</th>
+											</tr>
+										</thead>
+										<tbody id="targets-body"></tbody>
+									</table>
+								</div>
+								<p id="targets-empty" class="empty hidden">
+									No targets have been registered yet.
+								</p>
+							</article>
+							<article class="card wide-card">
+								<h2>Recent runs</h2>
+								<label>
+									Filter by worker pool
+									<input
+										id="runs-worker-pool-filter"
+										placeholder="edge-scanners or unassigned"
+									/>
+								</label>
+								<ul id="runs-list" class="list"></ul>
+								<p id="runs-empty" class="empty hidden">
+									No scan runs recorded yet.
+								</p>
+							</article>
+						</section>
+
+						<section class="grid">
+							<article class="card wide-card">
+								<h2>Repositories</h2>
+								<ul id="repositories-list" class="list"></ul>
+								<p id="repositories-empty" class="empty hidden">
+									No repositories are being tracked yet.
+								</p>
+							</article>
+						</section>
+					</div>
+
+					<div
+						class="subtab-pane"
+						id="targets-bin"
+						data-subtab-pane="targets-bin"
+						hidden
+					>
+						<section class="grid two-up">
+							<article class="card wide-card">
+								<h2>BIN dataset</h2>
+								<ul id="bin-dataset-status-list" class="list"></ul>
+								<p id="bin-dataset-status-empty" class="empty hidden">
+									No BIN dataset has been imported yet.
+								</p>
+								<form id="bin-dataset-import-form">
+									<label>
+										Repository ID (optional)
+										<input
+											id="bin-dataset-repository-id"
+											type="number"
+											min="1"
+											step="1"
+											placeholder="2"
+										/>
+									</label>
+									<label>
+										Local path (optional)
+										<input
+											id="bin-dataset-local-path"
+											placeholder="/root/AnyGPT/bin-list-data"
+										/>
+									</label>
+									<label>
+										CSV path override (optional)
+										<input
+											id="bin-dataset-csv-path"
+											placeholder="bin-list-data.csv"
+										/>
+									</label>
+									<div class="subtle-note">
+										Imports BIN/IIN metadata into Dragonfly. Local
+										lookups retain only the first 6 digits from each
+										candidate line and discard the rest.
+									</div>
+									<button type="submit">Import BIN dataset</button>
+									<p
+										id="bin-dataset-import-error"
+										class="error hidden"
+									></p>
+								</form>
+							</article>
+							<article class="card wide-card">
+								<h2>BIN lookup</h2>
+								<form id="bin-lookup-form">
+									<label>
+										Noisy text input
+										<textarea
+											id="bin-lookup-text"
+											placeholder="Card: 4640182140904099|08|27|371"
+										></textarea>
+									</label>
+									<label>
+										Match limit
+										<input
+											id="bin-lookup-limit"
+											type="number"
+											min="1"
+											max="500"
+											step="1"
+											placeholder="100"
+										/>
+									</label>
+									<div class="subtle-note">
+										Common card labels like “Card:” are supported.
+										Matched line previews are redacted so only the
+										BIN/IIN remains visible; PAN, expiry, and CVV
+										digits are masked.
+									</div>
+									<button type="submit">Lookup BINs</button>
+									<p id="bin-lookup-error" class="error hidden"></p>
+								</form>
+								<ul id="bin-lookup-results" class="list"></ul>
+								<p id="bin-lookup-results-empty" class="empty">
+									No BIN lookups have been run yet.
+								</p>
+							</article>
+						</section>
+					</div>
+				</section>

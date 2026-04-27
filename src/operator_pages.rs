@@ -39,6 +39,14 @@ pub async fn operator_overview() -> Html<String> {
     )
 }
 
+pub async fn operator_targets() -> Html<String> {
+    render_page(
+        "targets",
+        include_str!("../templates/operator/targets.html"),
+        include_str!("../templates/operator/targets.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +90,51 @@ mod tests {
         assert!(
             body.contains("id=\"summary-metrics\""),
             "rendered body should contain the overview summary-metrics container"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_targets_serves_shell_and_targets_ids() {
+        let app = Router::new().route("/app/targets", get(operator_targets));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator targets test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator targets test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator targets test server should stay available");
+        });
+
+        let url = format!("http://{}/app/targets", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/targets should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator targets body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("id=\"targets-body\""),
+            "rendered body should contain the targets-body table tbody"
+        );
+        assert!(
+            body.contains("id=\"bin-lookup-form\""),
+            "rendered body should contain the bin-lookup-form"
         );
 
         server.abort();
