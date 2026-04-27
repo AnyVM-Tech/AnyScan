@@ -517,7 +517,13 @@ main() {
     strip_binary "$bundle_root/bin/agentd"
 
     if [ -z "$SCANNER_SOURCE_BIN" ]; then
-        if [ -x "$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner" ]; then
+        # Prefer the AnyVM-Tech fork of the scanner C source (anyscan-engine-c)
+        # which carries the AF_XDP integration patches; fall back to the legacy
+        # upstream-clone path and the system-installed binary.
+        # See plans/2026-04-27-portscan-afxdp-plan-v1.md §9.1.
+        if [ -x "$SCRIPT_DIR/../../anyscan-engine-c/scanner" ]; then
+            SCANNER_SOURCE_BIN="$SCRIPT_DIR/../../anyscan-engine-c/scanner"
+        elif [ -x "$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner" ]; then
             SCANNER_SOURCE_BIN="$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner"
         elif [ -x /opt/anyscan/bin/scanner ]; then
             SCANNER_SOURCE_BIN="/opt/anyscan/bin/scanner"
