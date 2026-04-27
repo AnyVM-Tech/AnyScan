@@ -6598,4 +6598,75 @@ paths:
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn mlops_tech_fingerprint_emits_mlflow_paths_through_fetcher() {
+        // Spin up a minimal Axum server whose root document advertises
+        // MLflow via its <title>. The fetcher with discovery enabled should
+        // run tech-fingerprint detection over the response and surface the
+        // curated MLflow probe paths (e.g. /api/2.0/mlflow/runs/search) as
+        // discovered candidates.
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                Html(
+                    "<html><head><title>MLflow</title></head><body>Tracking UI</body></html>",
+                )
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mlflow test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("mlflow test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mlflow test server should stay available")
+        });
+        let base_url = format!("http://{}", address);
+
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 1;
+        config.scan.enable_path_discovery = true;
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 51,
+            label: "mlflow-fingerprint".to_string(),
+            base_url,
+            paths: vec!["/".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("mlflow target fetch should succeed");
+
+        assert!(
+            report
+                .discovered_paths
+                .iter()
+                .any(|candidate| candidate.path.starts_with("/api/2.0/mlflow/")),
+            "expected at least one /api/2.0/mlflow/... candidate from MLflow \
+             tech fingerprint, got {:?}",
+            report
+                .discovered_paths
+                .iter()
+                .map(|candidate| candidate.path.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
 }
