@@ -1,3 +1,30 @@
+			// Skip a renderer when its target DOM is missing on the current
+			// page. Each operator page renders only its own section's ids; the
+			// shared dashboard refresh fans out to every renderer regardless,
+			// so renderers that touch other sections' ids would otherwise
+			// throw on null and abort the rest of the refresh.
+			function safeRender(label, fn) {
+				try {
+					fn();
+				} catch (error) {
+					if (error instanceof TypeError) {
+						return;
+					}
+					console.error('renderer failed', label, error);
+				}
+			}
+
+			async function safeAsync(label, fn) {
+				try {
+					await fn();
+				} catch (error) {
+					if (error instanceof TypeError) {
+						return;
+					}
+					console.error('async loader failed', label, error);
+				}
+			}
+
 			const state = {
 				eventSource: null,
 				refreshTimer: null,
@@ -322,12 +349,14 @@
 			function setAuthenticated(session) {
 				state.authenticated = true;
 				state.session = session || null;
-				elements.sessionUser.textContent = session
-					? `Signed in as ${session.username} • ${formatHumanLabel(session.role, 'Unknown role')}`
-					: 'Signed in';
-				elements.authCard.classList.add('hidden');
-				elements.app.classList.remove('hidden');
-				elements.authError.classList.add('hidden');
+				if (elements.sessionUser) {
+					elements.sessionUser.textContent = session
+						? `Signed in as ${session.username} • ${formatHumanLabel(session.role, 'Unknown role')}`
+						: 'Signed in';
+				}
+				if (elements.authCard) elements.authCard.classList.add('hidden');
+				if (elements.app) elements.app.classList.remove('hidden');
+				if (elements.authError) elements.authError.classList.add('hidden');
 				applyWorkerManagementVisibility();
 				syncActiveAuthorizedGateUi();
 				startLiveDashboardRefresh();
@@ -342,34 +371,41 @@
 				state.pluginCatalogQuery = null;
 				state.findingPublications = [];
 				state.session = null;
-				renderFindings([]);
-				renderPluginCatalog(null);
-				renderFindingPublications([]);
-				syncActiveAuthorizedGateUi();
+				safeRender('findings (logout)', () => renderFindings([]));
+				safeRender('pluginCatalog (logout)', () => renderPluginCatalog(null));
+				safeRender('findingPublications (logout)', () => renderFindingPublications([]));
+				safeRender('activeAuthorizedGateUi (logout)', syncActiveAuthorizedGateUi);
 				closeEvents();
 				stopLiveDashboardRefresh();
-				elements.app.classList.add('hidden');
-				elements.authCard.classList.remove('hidden');
-				if (message) {
-					elements.authError.textContent = message;
-					elements.authError.classList.remove('hidden');
-				} else {
-					elements.authError.classList.add('hidden');
+				if (elements.app) elements.app.classList.add('hidden');
+				if (elements.authCard) elements.authCard.classList.remove('hidden');
+				if (elements.authError) {
+					if (message) {
+						elements.authError.textContent = message;
+						elements.authError.classList.remove('hidden');
+					} else {
+						elements.authError.classList.add('hidden');
+					}
 				}
-				elements.findingsQueryForm.reset();
-				elements.findingsQueryError.classList.add('hidden');
-				elements.findingsQueryStatus.textContent =
-					'Showing recent findings from the latest dashboard snapshot.';
-				elements.pluginQueryForm.reset();
-				elements.pluginQueryError.classList.add('hidden');
-				elements.pluginQueryStatus.textContent =
-					'Loading plugin catalog.';
-				elements.connectionState.textContent =
-					'Sign in to view dashboard data.';
-				elements.workerTokenForm.reset();
-				elements.bootstrapApprovalForm.reset();
-				elements.runForm.reset();
-				elements.scheduleForm.reset();
+				elements.findingsQueryForm?.reset();
+				elements.findingsQueryError?.classList.add('hidden');
+				if (elements.findingsQueryStatus) {
+					elements.findingsQueryStatus.textContent =
+						'Showing recent findings from the latest dashboard snapshot.';
+				}
+				elements.pluginQueryForm?.reset();
+				elements.pluginQueryError?.classList.add('hidden');
+				if (elements.pluginQueryStatus) {
+					elements.pluginQueryStatus.textContent = 'Loading plugin catalog.';
+				}
+				if (elements.connectionState) {
+					if (elements.connectionState) elements.connectionState.textContent =
+						'Sign in to view dashboard data.';
+				}
+				elements.workerTokenForm?.reset();
+				elements.bootstrapApprovalForm?.reset();
+				elements.runForm?.reset();
+				elements.scheduleForm?.reset();
 				elements.portScanForm?.reset();
 				resetWorkerTokenFormDefaults();
 				resetBootstrapApprovalFormDefaults();
@@ -1138,7 +1174,7 @@
 					records.unshift(nextRecord);
 				}
 				state.findingPublications = records;
-				renderFindingPublications(records);
+				safeRender('findingPublications (upsert)', () => renderFindingPublications(records));
 			}
 
 			function describeFindingPublication(record) {
@@ -1166,7 +1202,9 @@
 				state.findingPublications = Array.isArray(records)
 					? records
 					: [];
-				renderFindingPublications(state.findingPublications);
+				safeRender('findingPublications (load)', () =>
+					renderFindingPublications(state.findingPublications)
+				);
 			}
 
 			function renderFindingPublications(records) {
@@ -1284,8 +1322,10 @@
 						}
 					);
 					upsertFindingPublicationRecord(record);
-					renderFindings(state.visibleFindings || []);
-					elements.findingsQueryStatus.textContent = `${describeFindingsQuery(state.findingsQuery)} Public publication updated for finding #${finding.id}.`;
+					safeRender('findings (publication update)', () => renderFindings(state.visibleFindings || []));
+					if (elements.findingsQueryStatus) {
+						elements.findingsQueryStatus.textContent = `${describeFindingsQuery(state.findingsQuery)} Public publication updated for finding #${finding.id}.`;
+					}
 					feedbackElement.textContent = `Saved ${status} publication for finding #${finding.id}.`;
 					feedbackElement.className = 'muted';
 				} catch (error) {
@@ -3887,7 +3927,7 @@
 				}
 				if (event.type === 'public_finding_moderated' && event.finding) {
 					upsertFindingPublicationRecord(event.finding);
-					renderFindings(state.visibleFindings || []);
+					safeRender('findings (event stream)', () => renderFindings(state.visibleFindings || []));
 				}
 			}
 
@@ -3979,44 +4019,46 @@
 					state.dashboardSnapshot = snapshot;
 					syncBootstrapProvisionerOptions(snapshot);
 					applyWorkerManagementVisibility();
-					renderSummary(snapshot.latest_run, snapshot.latest_summary);
-					renderWorkerMetrics(snapshot);
-					renderWorkerPools(snapshot.worker_pools || []);
-					renderPortScans(snapshot.recent_port_scans || []);
-					renderWorkers(snapshot.workers || []);
-					renderWorkerRemoteCommands(
+					safeRender('summary', () => renderSummary(snapshot.latest_run, snapshot.latest_summary));
+					safeRender('workerMetrics', () => renderWorkerMetrics(snapshot));
+					safeRender('workerPools', () => renderWorkerPools(snapshot.worker_pools || []));
+					safeRender('portScans', () => renderPortScans(snapshot.recent_port_scans || []));
+					safeRender('workers', () => renderWorkers(snapshot.workers || []));
+					safeRender('workerRemoteCommands', () => renderWorkerRemoteCommands(
 						snapshot.recent_worker_remote_commands || []
-					);
-					renderWorkerEnrollmentTokens(
+					));
+					safeRender('workerEnrollmentTokens', () => renderWorkerEnrollmentTokens(
 						snapshot.worker_enrollment_tokens || []
-					);
-					renderBootstrapCandidates(snapshot.bootstrap_candidates || []);
-					renderBootstrapJobs(snapshot.bootstrap_jobs || []);
-					syncBootstrapCandidateOptions(
+					));
+					safeRender('bootstrapCandidates', () => renderBootstrapCandidates(snapshot.bootstrap_candidates || []));
+					safeRender('bootstrapJobs', () => renderBootstrapJobs(snapshot.bootstrap_jobs || []));
+					safeRender('bootstrapCandidateOptions', () => syncBootstrapCandidateOptions(
 						snapshot.bootstrap_candidates || []
-					);
-					renderTargets(snapshot.targets || []);
-					renderRepositories(
+					));
+					safeRender('targets', () => renderTargets(snapshot.targets || []));
+					safeRender('repositories', () => renderRepositories(
 						snapshot.repositories || [],
 						snapshot.targets || []
-					);
-					renderRuns(snapshot.recent_runs || []);
-					renderSchedules(snapshot.schedules || []);
-					renderFailedTargets(snapshot.latest_failed_targets || []);
-					renderDetectorDistribution(
+					));
+					safeRender('runs', () => renderRuns(snapshot.recent_runs || []));
+					safeRender('schedules', () => renderSchedules(snapshot.schedules || []));
+					safeRender('failedTargets', () => renderFailedTargets(snapshot.latest_failed_targets || []));
+					safeRender('detectorDistribution', () => renderDetectorDistribution(
 						snapshot.latest_detector_distribution || []
-					);
-					renderCoverageSources(
+					));
+					safeRender('coverageSources', () => renderCoverageSources(
 						snapshot.latest_summary?.coverage_sources || []
-					);
-					renderGobusterDefaults(snapshot.scan_defaults || {});
-					renderBinDatasetStatus(snapshot.bin_dataset_status || null);
-					renderArchiveStatus(snapshot.archive_status || null);
-					await loadFindings();
-					await loadPluginCatalog();
-					syncActiveAuthorizedGateUi();
-					elements.connectionState.textContent =
-						'Dashboard updated successfully.';
+					));
+					safeRender('gobusterDefaults', () => renderGobusterDefaults(snapshot.scan_defaults || {}));
+					safeRender('binDatasetStatus', () => renderBinDatasetStatus(snapshot.bin_dataset_status || null));
+					safeRender('archiveStatus', () => renderArchiveStatus(snapshot.archive_status || null));
+					await safeAsync('findings', loadFindings);
+					await safeAsync('pluginCatalog', loadPluginCatalog);
+					safeRender('activeAuthorizedGateUi', syncActiveAuthorizedGateUi);
+					if (elements.connectionState) {
+						if (elements.connectionState) elements.connectionState.textContent =
+							'Dashboard updated successfully.';
+					}
 				} finally {
 					state.dashboardLoading = false;
 				}
@@ -4044,6 +4086,10 @@
 				if (!state.authenticated || state.eventSource) {
 					return;
 				}
+				// Pages without an events sink don't need a live activity stream.
+				if (!elements.eventsList) {
+					return;
+				}
 
 				const source = new EventSource('/api/events/stream');
 				source.addEventListener('api_event', message => {
@@ -4051,20 +4097,22 @@
 						const payload = JSON.parse(message.data);
 						applyApiEvent(payload);
 						prependEvent(describeEvent(payload));
-						elements.connectionState.textContent =
-							'Live event stream connected.';
+						if (elements.connectionState) {
+							if (elements.connectionState) elements.connectionState.textContent =
+								'Live event stream connected.';
+						}
 						scheduleRefresh();
 					} catch (error) {
 						console.error('Failed to decode event payload', error);
 					}
 				});
 				source.addEventListener('keepalive', () => {
-					elements.connectionState.textContent =
+					if (elements.connectionState) elements.connectionState.textContent =
 						'Live event stream connected.';
 				});
 				source.onerror = async () => {
 					closeEvents();
-					elements.connectionState.textContent =
+					if (elements.connectionState) elements.connectionState.textContent =
 						'Live event stream reconnecting.';
 					try {
 						await request('/api/me', { method: 'GET' });
@@ -4717,6 +4765,7 @@
 			}
 
 			async function loadPluginCatalog() {
+				if (!elements.pluginCatalogList && !elements.pluginQueryForm) return;
 				const params = pluginCatalogQueryToSearchParams(
 					state.pluginCatalogQuery
 				);
@@ -4724,26 +4773,28 @@
 				const response = await request(`/api/plugins${suffix}`, {
 					method: 'GET'
 				});
-				elements.pluginQueryError.classList.add('hidden');
-				renderPluginCatalog(response);
+				if (elements.pluginQueryError) elements.pluginQueryError.classList.add('hidden');
+				safeRender('pluginCatalog (load)', () => renderPluginCatalog(response));
 			}
 
 			async function resetPluginCatalogSearch() {
 				state.pluginCatalogQuery = null;
-				elements.pluginQueryForm.reset();
-				elements.pluginQueryError.classList.add('hidden');
+				if (elements.pluginQueryForm) elements.pluginQueryForm.reset();
+				if (elements.pluginQueryError) elements.pluginQueryError.classList.add('hidden');
 				await loadPluginCatalog();
 			}
 
 			async function loadFindings() {
+				if (!elements.findingsList && !elements.findingsQueryForm) return;
 				await loadFindingPublications();
 				if (!hasActiveFindingsQuery(state.findingsQuery)) {
-					elements.findingsQueryError.classList.add('hidden');
-					renderFindings(
-						state.dashboardSnapshot?.recent_findings || []
+					if (elements.findingsQueryError) elements.findingsQueryError.classList.add('hidden');
+					safeRender('findings (loadFindings, no query)', () =>
+						renderFindings(state.dashboardSnapshot?.recent_findings || [])
 					);
-					elements.findingsQueryStatus.textContent =
-						describeFindingsQuery(null);
+					if (elements.findingsQueryStatus) {
+						elements.findingsQueryStatus.textContent = describeFindingsQuery(null);
+					}
 					return;
 				}
 
@@ -4752,20 +4803,24 @@
 					`/api/findings?${params.toString()}`,
 					{ method: 'GET' }
 				);
-				elements.findingsQueryError.classList.add('hidden');
-				renderFindings(findings || []);
-				elements.findingsQueryStatus.textContent =
-					describeFindingsQuery(state.findingsQuery);
+				if (elements.findingsQueryError) elements.findingsQueryError.classList.add('hidden');
+				safeRender('findings (loadFindings, queried)', () => renderFindings(findings || []));
+				if (elements.findingsQueryStatus) {
+					elements.findingsQueryStatus.textContent = describeFindingsQuery(state.findingsQuery);
+				}
 			}
 
 			async function resetFindingsSearch() {
 				state.findingsQuery = null;
-				elements.findingsQueryForm.reset();
-				elements.findingsQueryError.classList.add('hidden');
+				if (elements.findingsQueryForm) elements.findingsQueryForm.reset();
+				if (elements.findingsQueryError) elements.findingsQueryError.classList.add('hidden');
 				await loadFindingPublications();
-				renderFindings(state.dashboardSnapshot?.recent_findings || []);
-				elements.findingsQueryStatus.textContent =
-					describeFindingsQuery(null);
+				safeRender('findings (resetSearch)', () =>
+					renderFindings(state.dashboardSnapshot?.recent_findings || [])
+				);
+				if (elements.findingsQueryStatus) {
+					elements.findingsQueryStatus.textContent = describeFindingsQuery(null);
+				}
 			}
 
 			function buildRunScope(
@@ -5189,7 +5244,7 @@
 					setUnauthenticated('Session expired. Sign in again.');
 					return;
 				}
-				elements.connectionState.textContent =
+				if (elements.connectionState) elements.connectionState.textContent =
 					error.message || fallbackMessage;
 			}
 
@@ -5234,22 +5289,28 @@
 				}
 			);
 
-			elements.runsWorkerPoolFilter.addEventListener('input', () => {
+			elements.runsWorkerPoolFilter?.addEventListener('input', () => {
 				state.runWorkerPoolFilter =
 					elements.runsWorkerPoolFilter.value || '';
-				renderRuns(state.dashboardSnapshot?.recent_runs || []);
+				safeRender('runs (filter)', () =>
+					renderRuns(state.dashboardSnapshot?.recent_runs || [])
+				);
 			});
 
-			elements.workersWorkerPoolFilter.addEventListener('input', () => {
+			elements.workersWorkerPoolFilter?.addEventListener('input', () => {
 				state.workerPoolFilter =
 					elements.workersWorkerPoolFilter.value || '';
-				renderWorkers(state.dashboardSnapshot?.workers || []);
+				safeRender('workers (pool filter)', () =>
+					renderWorkers(state.dashboardSnapshot?.workers || [])
+				);
 			});
 
 			elements.workersHealthFilter?.addEventListener('change', () => {
 				state.workerHealthFilter =
 					elements.workersHealthFilter.value || 'all';
-				renderWorkers(state.dashboardSnapshot?.workers || []);
+				safeRender('workers (health filter)', () =>
+					renderWorkers(state.dashboardSnapshot?.workers || [])
+				);
 			});
 
 			elements.pluginQueryForm.addEventListener('submit', async event => {
@@ -5338,7 +5399,7 @@
 						}
 						renderGobusterDefaults(saved || {});
 						prependEvent('Updated global scan settings.');
-						elements.connectionState.textContent =
+						if (elements.connectionState) elements.connectionState.textContent =
 							'Global scan settings updated.';
 					} catch (error) {
 						elements.scanSettingsError.textContent =
@@ -5368,7 +5429,7 @@
 						}
 						renderBinDatasetStatus(status || null);
 						prependEvent('Imported BIN dataset into Dragonfly.');
-						elements.connectionState.textContent =
+						if (elements.connectionState) elements.connectionState.textContent =
 							'BIN dataset imported successfully.';
 					} catch (error) {
 						elements.binDatasetImportError.textContent =
@@ -5391,7 +5452,7 @@
 						body: JSON.stringify(payload)
 					});
 					renderBinLookupResults(response || null);
-					elements.connectionState.textContent =
+					if (elements.connectionState) elements.connectionState.textContent =
 						'BIN lookup completed.';
 				} catch (error) {
 					elements.binLookupError.textContent =
