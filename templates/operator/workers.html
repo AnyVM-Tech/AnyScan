@@ -1,0 +1,462 @@
+				<section id="page-workers">
+					<h2 class="section-group-heading" id="section-workers">
+						<span>Workers</span>
+						<span class="section-group-hint">Fleet overview, enrollment tokens, bootstrap candidates and approvals.</span>
+					</h2>
+
+					<nav
+						class="workers-subnav"
+						aria-label="Workers sub-sections"
+						role="tablist"
+					>
+						<button
+							type="button"
+							class="workers-subnav__tab"
+							role="tab"
+							aria-selected="true"
+							aria-controls="workers-pane-fleet"
+							data-workers-tab="fleet"
+						>
+							Fleet
+						</button>
+						<button
+							type="button"
+							class="workers-subnav__tab"
+							role="tab"
+							aria-selected="false"
+							aria-controls="workers-pane-tokens"
+							data-workers-tab="tokens"
+						>
+							Tokens
+						</button>
+						<button
+							type="button"
+							class="workers-subnav__tab"
+							role="tab"
+							aria-selected="false"
+							aria-controls="workers-pane-bootstrap"
+							data-workers-tab="bootstrap"
+						>
+							Bootstrap
+						</button>
+					</nav>
+
+					<div
+						id="workers-pane-fleet"
+						class="workers-pane"
+						role="tabpanel"
+						aria-labelledby="workers-tab-fleet"
+						data-workers-pane="fleet"
+					>
+						<section class="grid three-up">
+							<article class="card wide-card">
+								<h2>Worker fleet overview</h2>
+								<div id="worker-metrics" class="metrics"></div>
+								<p id="worker-fleet-note" class="subtle-note">
+									Worker registration, lifecycle, enrollment tokens,
+									and bootstrap approvals update through the live
+									event stream.
+								</p>
+							</article>
+							<article class="card wide-card">
+								<h2>Worker pools</h2>
+								<ul id="worker-pools-list" class="list"></ul>
+								<p id="worker-pools-empty" class="empty hidden">
+									No worker pools recorded yet.
+								</p>
+							</article>
+							<article class="card wide-card">
+								<h2>Recent port scans</h2>
+								<ul id="port-scans-list" class="list"></ul>
+								<p id="port-scans-empty" class="empty hidden">
+									No port scans recorded yet.
+								</p>
+							</article>
+						</section>
+
+						<section class="grid">
+							<article class="card wide-card">
+								<div class="section-heading">
+									<h2>Workers</h2>
+									<button
+										id="workers-remote-update-all"
+										type="button"
+										class="hidden"
+									>
+										Update all
+									</button>
+								</div>
+								<p class="subtle-note">
+									Remote debug commands run as the worker service user
+									and capture recent stdout/stderr for review. Use the
+									health filter to isolate workers that are online but
+									not consuming queued control actions.
+								</p>
+								<label>
+									Filter by worker pool
+									<input
+										id="workers-worker-pool-filter"
+										placeholder="edge-scanners or unassigned"
+									/>
+								</label>
+								<label>
+									Filter by worker health
+									<select id="workers-health-filter">
+										<option value="all" selected>All workers</option>
+										<option value="healthy">Healthy only</option>
+										<option value="unhealthy">Needs attention</option>
+									</select>
+								</label>
+								<ul id="workers-list" class="list"></ul>
+								<p id="workers-empty" class="empty hidden">
+									No workers have registered yet.
+								</p>
+								<h3>Recent remote debug</h3>
+								<ul id="worker-remote-commands-list" class="list"></ul>
+								<p id="worker-remote-commands-empty" class="empty hidden">
+									No remote debug commands have been queued yet.
+								</p>
+							</article>
+						</section>
+					</div>
+
+					<div
+						id="workers-pane-tokens"
+						class="workers-pane hidden"
+						role="tabpanel"
+						aria-labelledby="workers-tab-tokens"
+						data-workers-pane="tokens"
+					>
+						<section class="grid">
+							<article class="card wide-card">
+								<div class="section-heading">
+									<h2>Enrollment tokens</h2>
+									<span
+										id="worker-token-access-note"
+										class="subtle-note"
+										>Read-only visibility</span
+									>
+								</div>
+								<p
+									id="worker-token-readonly-note"
+									class="management-note hidden"
+								>
+									Your role can review issued enrollment tokens but
+									cannot issue or revoke them.
+								</p>
+								<form
+									id="worker-token-form"
+									class="compact-form hidden"
+								>
+									<div class="grid two-up">
+										<label>
+											Label
+											<input
+												id="worker-token-label"
+												required
+												placeholder="scanner-pool-join"
+											/>
+										</label>
+										<label>
+											Worker pool (optional)
+											<input
+												id="worker-token-pool"
+												placeholder="edge-scanners"
+											/>
+										</label>
+										<label>
+											Tags (comma separated)
+											<input
+												id="worker-token-tags"
+												placeholder="scanner, edge"
+											/>
+										</label>
+										<label>
+											Expires in seconds (optional)
+											<input
+												id="worker-token-expiry"
+												type="number"
+												min="60"
+												step="60"
+												placeholder="86400"
+											/>
+										</label>
+									</div>
+									<div class="grid two-up">
+										<label class="toggle">
+											<input
+												id="worker-token-allow-runs"
+												type="checkbox"
+												checked
+											/>
+											Allow scan runs
+										</label>
+										<label class="toggle">
+											<input
+												id="worker-token-allow-port-scans"
+												type="checkbox"
+												checked
+											/>
+											Allow port scans
+										</label>
+										<label class="toggle">
+											<input
+												id="worker-token-allow-bootstrap"
+												type="checkbox"
+											/>
+											Allow bootstrap jobs
+										</label>
+										<label class="toggle">
+											<input
+												id="worker-token-single-use"
+												type="checkbox"
+												checked
+											/>
+											Single use token
+										</label>
+									</div>
+									<div class="actions">
+										<button type="submit">
+											Issue enrollment token
+										</button>
+									</div>
+									<p id="worker-token-error" class="error hidden"></p>
+								</form>
+								<div
+									id="worker-token-secret-panel"
+									class="secret-panel hidden"
+								>
+									<strong id="worker-token-secret-title"
+										>Enrollment token issued</strong
+									>
+									<p class="muted">
+										Copy this token now. It is only returned once.
+									</p>
+									<code id="worker-token-secret-value"></code>
+								</div>
+								<ul id="worker-tokens-list" class="list"></ul>
+								<p id="worker-tokens-empty" class="empty hidden">
+									No enrollment tokens issued yet.
+								</p>
+							</article>
+						</section>
+					</div>
+
+					<div
+						id="workers-pane-bootstrap"
+						class="workers-pane hidden"
+						role="tabpanel"
+						aria-labelledby="workers-tab-bootstrap"
+						data-workers-pane="bootstrap"
+					>
+						<section class="grid two-up">
+							<article class="card wide-card">
+								<h2>Bootstrap candidates</h2>
+								<ul id="bootstrap-candidates-list" class="list"></ul>
+								<p id="bootstrap-candidates-empty" class="empty hidden">
+									No bootstrap candidates recorded yet.
+								</p>
+							</article>
+							<article class="card wide-card">
+								<div class="section-heading">
+									<h2>Candidate approvals</h2>
+									<span
+										id="bootstrap-approval-access-note"
+										class="subtle-note"
+										>Read-only visibility</span
+									>
+								</div>
+								<p
+									id="bootstrap-approval-readonly-note"
+									class="management-note hidden"
+								>
+									Your role can review candidate state but cannot
+									approve or reject bootstrap candidates.
+								</p>
+								<form
+									id="bootstrap-approval-form"
+									class="compact-form hidden"
+								>
+									<label>
+										Pending candidate
+										<select id="bootstrap-candidate-id"></select>
+									</label>
+									<div class="grid two-up">
+										<label>
+											Token label override (optional)
+											<input
+												id="bootstrap-label"
+												placeholder="bootstrap-10-10-0-42"
+											/>
+										</label>
+										<label>
+											Worker pool override (optional)
+											<input
+												id="bootstrap-pool"
+												placeholder="branch-office"
+											/>
+										</label>
+										<label>
+											Tags override (comma separated)
+											<input
+												id="bootstrap-tags"
+												placeholder="branch, linux"
+											/>
+										</label>
+										<label>
+											Expires in seconds
+											<input
+												id="bootstrap-expiry"
+												type="number"
+												min="60"
+												step="60"
+												placeholder="86400"
+											/>
+										</label>
+									</div>
+									<div class="grid two-up">
+										<label class="toggle">
+											<input
+												id="bootstrap-allow-runs"
+												type="checkbox"
+												checked
+											/>
+											Allow scan runs
+										</label>
+										<label class="toggle">
+											<input
+												id="bootstrap-allow-port-scans"
+												type="checkbox"
+												checked
+											/>
+											Allow port scans
+										</label>
+										<label class="toggle">
+											<input
+												id="bootstrap-allow-bootstrap"
+												type="checkbox"
+											/>
+											Allow bootstrap jobs
+										</label>
+										<label class="toggle">
+											<input
+												id="bootstrap-single-use"
+												type="checkbox"
+												checked
+											/>
+											Single use token
+										</label>
+									</div>
+									<div class="subform">
+										<div class="section-heading">
+											<h3>Bootstrap job dispatch</h3>
+											<span class="subtle-note"
+												>Approval-gated worker-to-worker
+												enrollment</span
+											>
+										</div>
+										<label class="toggle">
+											<input
+												id="bootstrap-dispatch-enabled"
+												type="checkbox"
+												checked
+											/>
+											Queue a bootstrap job after approval
+										</label>
+										<div
+											id="bootstrap-dispatch-fields"
+											class="grid two-up"
+										>
+											<label>
+												Provisioner
+												<input
+													id="bootstrap-dispatch-provisioner"
+													list="bootstrap-provisioner-options"
+													placeholder="ssh-enroll"
+												/>
+											</label>
+											<label>
+												Executor worker pool (optional)
+												<input
+													id="bootstrap-dispatch-executor-pool"
+													placeholder="bootstrap-executors"
+												/>
+											</label>
+											<label>
+												Executor tags (comma separated)
+												<input
+													id="bootstrap-dispatch-executor-tags"
+													placeholder="provisioner, linux"
+												/>
+											</label>
+											<label>
+												Dispatch notes (optional)
+												<textarea
+													id="bootstrap-dispatch-notes"
+													placeholder="Use the standard branch enrollment workflow for this host."
+												></textarea>
+											</label>
+										</div>
+										<datalist
+											id="bootstrap-provisioner-options"
+										></datalist>
+										<p class="subtle-note">
+											Dispatch controls decide which
+											provisioner-capable worker can claim the
+											queued bootstrap job.
+										</p>
+									</div>
+									<label>
+										Approval or rejection notes (optional)
+										<textarea
+											id="bootstrap-notes"
+											placeholder="Approved for owned branch edge node deployment."
+										></textarea>
+									</label>
+									<div class="actions">
+										<button
+											id="bootstrap-approve-button"
+											type="submit"
+											class="primary"
+										>
+											Approve candidate
+										</button>
+										<button
+											id="bootstrap-reject-button"
+											type="button"
+											class="danger"
+										>
+											Reject candidate
+										</button>
+									</div>
+									<p
+										id="bootstrap-approval-error"
+										class="error hidden"
+									></p>
+								</form>
+								<div
+									id="bootstrap-token-secret-panel"
+									class="secret-panel hidden"
+								>
+									<strong id="bootstrap-token-secret-title"
+										>Bootstrap enrollment token issued</strong
+									>
+									<p class="muted">
+										Copy this token now. It is only returned once.
+									</p>
+									<code id="bootstrap-token-secret-value"></code>
+								</div>
+							</article>
+						</section>
+
+						<section class="grid">
+							<article class="card wide-card">
+								<h2>Bootstrap jobs</h2>
+								<ul id="bootstrap-jobs-list" class="list"></ul>
+								<p id="bootstrap-jobs-empty" class="empty hidden">
+									No bootstrap jobs have been queued yet.
+								</p>
+							</article>
+						</section>
+					</div>
+				</section>
