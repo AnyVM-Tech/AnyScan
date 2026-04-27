@@ -47,6 +47,14 @@ pub async fn operator_targets() -> Html<String> {
     )
 }
 
+pub async fn operator_workers() -> Html<String> {
+    render_page(
+        "workers",
+        include_str!("../templates/operator/workers.html"),
+        include_str!("../templates/operator/workers.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +143,55 @@ mod tests {
         assert!(
             body.contains("id=\"bin-lookup-form\""),
             "rendered body should contain the bin-lookup-form"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_workers_serves_shell_and_workers_ids() {
+        let app = Router::new().route("/app/workers", get(operator_workers));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator workers test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator workers test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator workers test server should stay available");
+        });
+
+        let url = format!("http://{}/app/workers", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/workers should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator workers body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("id=\"workers-list\""),
+            "rendered body should contain the workers-list container"
+        );
+        assert!(
+            body.contains("id=\"worker-tokens-list\""),
+            "rendered body should contain the worker-tokens-list container"
+        );
+        assert!(
+            body.contains("id=\"bootstrap-jobs-list\""),
+            "rendered body should contain the bootstrap-jobs-list container"
         );
 
         server.abort();

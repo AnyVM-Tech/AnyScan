@@ -1134,6 +1134,30 @@
 				color: var(--text-strong);
 			}
 
+			/* Workers page sub-tab nav (Fleet / Tokens / Bootstrap). */
+			.workers-subnav {
+				display: flex;
+				gap: var(--space-2);
+				flex-wrap: wrap;
+				margin: var(--space-4) 0 var(--space-2);
+				padding-bottom: var(--space-3);
+				border-bottom: 1px solid var(--panel-border);
+			}
+
+			.workers-subnav__tab {
+				background: rgba(148, 163, 184, 0.08);
+				color: var(--muted-soft);
+				font-size: 0.85rem;
+				font-weight: 600;
+				padding: 8px 14px;
+				border-radius: var(--radius-pill);
+			}
+
+			.workers-subnav__tab:hover {
+				background: rgba(148, 163, 184, 0.16);
+				color: var(--text-strong);
+			}
+
 			.subtab[aria-current='page'] {
 				background: rgba(56, 189, 248, 0.14);
 				color: var(--text-strong);
@@ -1142,6 +1166,11 @@
 
 			.subtab-pane[hidden] {
 				display: none;
+			}
+
+			.workers-subnav__tab[aria-selected='true'] {
+				background: rgba(96, 165, 250, 0.18);
+				color: var(--text-strong);
 			}
 
 			/* Reduced motion */
