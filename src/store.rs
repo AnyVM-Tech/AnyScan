@@ -687,6 +687,17 @@ impl AnyScanStore {
             .mark_run_finished_if_owned(run_id, worker_id, notes)
     }
 
+    pub fn finalize_completed_runs(&self) -> Result<Vec<ScanRunRecord>> {
+        self.inner.finalize_completed_runs()
+    }
+
+    pub fn release_stale_claims(
+        &self,
+        max_stale: chrono::Duration,
+    ) -> Result<(Vec<i64>, Vec<i64>)> {
+        self.inner.release_stale_claims(max_stale)
+    }
+
     pub fn stop_run(&self, run_id: i64, notes: Option<&str>) -> Result<ScanRunRecord> {
         self.inner.stop_run(run_id, notes)
     }
