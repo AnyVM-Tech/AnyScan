@@ -259,6 +259,7 @@ pub enum WorkerControlRequest {
         repository: RepositoryDefinition,
     },
     LoadScanSettings,
+    LoadInventoryPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,6 +331,9 @@ pub enum WorkerControlResponse {
     },
     ActiveJobCount {
         active_jobs: u64,
+    },
+    InventoryPolicy {
+        policy: crate::core::InventoryPolicySnapshot,
     },
 }
 
@@ -890,6 +894,13 @@ impl AnyScanWorkerApiClient {
             other => Err(unexpected_worker_response("optional scan settings", &other)),
         }
     }
+
+    pub fn load_inventory_policy(&self) -> Result<crate::core::InventoryPolicySnapshot> {
+        match self.request(WorkerControlRequest::LoadInventoryPolicy)? {
+            WorkerControlResponse::InventoryPolicy { policy } => Ok(policy),
+            other => Err(unexpected_worker_response("inventory policy", &other)),
+        }
+    }
 }
 
 fn decode_worker_response(response: reqwest::blocking::Response) -> Result<WorkerControlResponse> {
@@ -1128,7 +1139,40 @@ fn first_nonempty_env(names: &[&str]) -> Option<String> {
 mod tests {
     use std::{fs, time::{SystemTime, UNIX_EPOCH}};
 
-    use super::{default_worker_api_proxy_url_for_base_url, load_env_value_from_file};
+    use super::{
+        default_worker_api_proxy_url_for_base_url, load_env_value_from_file,
+        WorkerControlRequest, WorkerControlResponse,
+    };
+    use crate::core::InventoryPolicySnapshot;
+
+    #[test]
+    fn worker_control_request_load_inventory_policy_serializes_to_snake_case_tag() {
+        let request = WorkerControlRequest::LoadInventoryPolicy;
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert_eq!(json, "{\"type\":\"load_inventory_policy\"}");
+    }
+
+    #[test]
+    fn worker_control_response_inventory_policy_round_trips() {
+        let snapshot = InventoryPolicySnapshot {
+            allowed_host_suffixes: vec!["example.com".to_string()],
+            allowed_hosts: vec![],
+            allowed_cidrs: vec!["10.0.0.0/8".to_string()],
+            allowed_ports: vec![443, 80],
+        };
+        let response = WorkerControlResponse::InventoryPolicy {
+            policy: snapshot.clone(),
+        };
+        let json = serde_json::to_string(&response).expect("serialize");
+        let decoded: WorkerControlResponse =
+            serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            WorkerControlResponse::InventoryPolicy { policy } => {
+                assert_eq!(policy, snapshot);
+            }
+            other => panic!("expected InventoryPolicy variant, got {other:?}"),
+        }
+    }
 
     #[test]
     fn onion_worker_api_defaults_to_tor_socks_proxy() {
