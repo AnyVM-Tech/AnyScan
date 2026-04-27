@@ -330,6 +330,259 @@ class ConvergenceSmokeTests(unittest.TestCase):
             self.assertGreaterEqual(entry.learned_rate, 900_000)
 
 
+class NicStatsAvailabilityTests(unittest.TestCase):
+    """Regression coverage for PR #58 review feedback (P2).
+
+    When /sys/class/net is unreadable the runner reports zero deltas; the
+    classifier must NOT treat that as throttle, otherwise every non-final
+    window classifies SLIP and the controller hammers down to the floor.
+    """
+
+    def test_unavailable_nic_skips_dropped_check(self) -> None:
+        measurement = make_measurement(
+            set_rate=1_000_000,
+            achieved_pps=0,
+            tx_dropped_delta=999,  # bogus: nic counters aren't real
+        )
+        measurement = rc.WindowMeasurement(
+            set_rate=measurement.set_rate,
+            elapsed_seconds=measurement.elapsed_seconds,
+            tx_packets_delta=measurement.tx_packets_delta,
+            tx_dropped_delta=measurement.tx_dropped_delta,
+            heartbeat_max_latency_ms=measurement.heartbeat_max_latency_ms,
+            nic_stats_available=False,
+        )
+        self.assertEqual(rc.classify_window(measurement, rc.AimdPolicy()), rc.CLEAN)
+
+    def test_unavailable_nic_skips_achieved_ratio_check(self) -> None:
+        measurement = rc.WindowMeasurement(
+            set_rate=1_000_000,
+            elapsed_seconds=30.0,
+            tx_packets_delta=0,
+            tx_dropped_delta=0,
+            heartbeat_max_latency_ms=100,
+            nic_stats_available=False,
+        )
+        # achieved_pps == 0 would normally trip the 0.9 ratio floor → SLIP.
+        # With nic_stats_available=False, we skip the check.
+        self.assertEqual(rc.classify_window(measurement, rc.AimdPolicy()), rc.CLEAN)
+
+    def test_unavailable_nic_still_respects_heartbeat_slip(self) -> None:
+        measurement = rc.WindowMeasurement(
+            set_rate=1_000_000,
+            elapsed_seconds=30.0,
+            tx_packets_delta=0,
+            tx_dropped_delta=0,
+            heartbeat_max_latency_ms=8_000,
+            nic_stats_available=False,
+        )
+        # Heartbeat-jitter is the only remaining signal. Honor it.
+        self.assertEqual(rc.classify_window(measurement, rc.AimdPolicy()), rc.SLIP)
+
+    def test_controller_does_not_pin_to_floor_without_nic(self) -> None:
+        """End-to-end: an environment without NIC stats should still ramp."""
+
+        class NoNicRunner(rc.WindowRunner):
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def run(
+                self, *, rate: int, window_seconds: float, is_first_window: bool
+            ) -> rc.WindowMeasurement:
+                self.calls += 1
+                # Synthetic environment with no NIC counters and a
+                # well-behaved scheduler.
+                return rc.WindowMeasurement(
+                    set_rate=rate,
+                    elapsed_seconds=window_seconds,
+                    tx_packets_delta=0,
+                    tx_dropped_delta=0,
+                    heartbeat_max_latency_ms=80,
+                    nic_stats_available=False,
+                )
+
+        runner = NoNicRunner()
+        controller = rc.RateController(
+            options=rc.ControllerOptions(
+                policy=rc.AimdPolicy(window_seconds=30),
+                window_seconds=30.0,
+                interface=None,
+                starting_rate=500_000,
+                calibration=None,
+                persist_on_clean=False,
+            ),
+            runner=runner,
+            log_sink=io.StringIO(),
+            max_windows=5,
+        )
+        reports = controller.run()
+        rates = [r.set_rate for r in reports]
+        # Should bump every window since heartbeat is fine and the NIC
+        # signal is correctly excluded from the classification.
+        self.assertEqual(rates, [500_000, 700_000, 900_000, 1_100_000, 1_300_000])
+        self.assertTrue(all(r.classification == rc.CLEAN for r in reports))
+
+
+class WindowBoundaryTimingTests(unittest.TestCase):
+    """Regression coverage for PR #58 review feedback (P1).
+
+    SubprocessWindowRunner must use the active-send interval as the
+    achieved-pps denominator, not the spawn->teardown wall time. If the
+    SIGINT graceful-shutdown wait was included, a healthy 30s window with
+    a slow tear-down could fall below the 0.9 ratio floor and force a
+    spurious SLIP.
+    """
+
+    class _FakeChild:
+        def __init__(
+            self,
+            *,
+            window_seconds: float,
+            teardown_delay: float,
+            tx_packets_total: int,
+        ) -> None:
+            import time as _time
+
+            self._time = _time
+            self._spawn_time = _time.monotonic()
+            self._window_seconds = window_seconds
+            self._teardown_delay = teardown_delay
+            self._tx_packets_total = tx_packets_total
+            self._returncode: int | None = None
+            self.pid = os.getpid()  # not used; killpg is mocked
+
+        def wait(self, timeout: float | None = None) -> int:
+            import subprocess as _sp
+
+            if timeout is None or timeout >= self._window_seconds + self._teardown_delay:
+                # Simulating natural completion would be fine; we never use
+                # this branch in this test.
+                self._returncode = 0
+                return 0
+            elapsed = self._time.monotonic() - self._spawn_time
+            remaining = timeout - elapsed
+            if remaining > 0:
+                self._time.sleep(remaining)
+            raise _sp.TimeoutExpired(cmd="fake", timeout=timeout)
+
+        def poll(self) -> int | None:
+            return self._returncode
+
+        def kill(self) -> None:
+            self._returncode = -9
+
+        def terminate(self) -> None:
+            self._returncode = -15
+
+        @property
+        def returncode(self) -> int | None:
+            return self._returncode
+
+    def test_send_elapsed_does_not_include_teardown(self) -> None:
+        import subprocess as _sp
+        import time as _time
+
+        window_seconds = 0.2
+        teardown_delay = 0.5
+
+        fake_child = self._FakeChild(
+            window_seconds=window_seconds,
+            teardown_delay=teardown_delay,
+            tx_packets_total=int(950_000 * window_seconds),
+        )
+
+        nic_state = {"tx_packets": 0, "tx_dropped": 0}
+
+        class FakeNicReader:
+            def read(self_inner) -> rc.NicCounters:
+                # Snapshot whatever the test has poked into nic_state.
+                return rc.NicCounters(
+                    tx_packets=nic_state["tx_packets"],
+                    tx_dropped=nic_state["tx_dropped"],
+                )
+
+        def fake_spawn(_command: list[str]):
+            # Mark the start of the "send" interval and the teardown delay
+            # we'll inject after the timeout expires.
+            nic_state["tx_packets"] = 0
+            return fake_child
+
+        def fake_terminate(child, grace_seconds):
+            # Simulate a slow SIGINT handshake. Crucially we ALSO push
+            # the NIC counter forward during this time — if the runner is
+            # snapshotting AFTER the teardown, the achieved-pps denominator
+            # will balloon.
+            _time.sleep(teardown_delay)
+            nic_state["tx_packets"] += 100_000
+            child._returncode = -2
+
+        # When window expires (at window_seconds), the scanner has sent
+        # ~950k pps × window_seconds packets. Push counters at that point
+        # by patching FakeChild.wait to bump nic_state when it raises.
+        original_wait = fake_child.wait
+
+        def patched_wait(timeout=None):
+            try:
+                return original_wait(timeout=timeout)
+            finally:
+                # When wait raises TimeoutExpired we've reached the window
+                # boundary. Update the counter at that exact instant so the
+                # runner's "snapshot before teardown" sees the boundary
+                # value, not the post-teardown value.
+                if fake_child.returncode is None:
+                    nic_state["tx_packets"] = int(950_000 * window_seconds)
+
+        fake_child.wait = patched_wait  # type: ignore[method-assign]
+
+        jitter = rc.JitterMonitor(interval_seconds=0.05)
+        jitter.start()
+        try:
+            runner = rc.SubprocessWindowRunner(
+                command_for_rate=lambda rate, first: ["fake"],
+                nic_reader=FakeNicReader(),
+                jitter_monitor=jitter,
+                terminate_grace_seconds=teardown_delay + 1.0,
+                spawn=fake_spawn,
+            )
+            # Patch _terminate_process_tree on the controller module for
+            # this test only — the real implementation calls os.killpg.
+            original_terminate = rc._terminate_process_tree
+            rc._terminate_process_tree = fake_terminate  # type: ignore[assignment]
+            try:
+                measurement = runner.run(
+                    rate=1_000_000,
+                    window_seconds=window_seconds,
+                    is_first_window=True,
+                )
+            finally:
+                rc._terminate_process_tree = original_terminate  # type: ignore[assignment]
+        finally:
+            jitter.stop()
+
+        # The reported elapsed must be the active-send window, not
+        # window+teardown. Allow a small scheduler tolerance.
+        self.assertLess(
+            measurement.elapsed_seconds,
+            window_seconds + teardown_delay,
+            "elapsed_seconds includes teardown latency, which would inflate "
+            "the achieved-pps denominator and cause spurious SLIPs",
+        )
+        self.assertAlmostEqual(measurement.elapsed_seconds, window_seconds, delta=0.15)
+        # And the achieved pps should reflect the window-boundary snapshot,
+        # not include the teardown-time bump.
+        self.assertAlmostEqual(
+            measurement.achieved_pps,
+            950_000.0,
+            delta=200_000.0,
+        )
+        # The classification must be CLEAN — that's the whole point of this
+        # regression test.
+        self.assertEqual(
+            rc.classify_window(measurement, rc.AimdPolicy()),
+            rc.CLEAN,
+        )
+
+
 class ScannerFailureTests(unittest.TestCase):
     def test_mid_window_failure_aborts_loop(self) -> None:
         class CrashingRunner(rc.WindowRunner):

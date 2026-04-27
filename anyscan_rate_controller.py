@@ -84,6 +84,13 @@ class WindowMeasurement:
     heartbeat_max_latency_ms: int
     scanner_finished_naturally: bool = False
     scanner_exit_code: int = 0
+    # When False, tx_packets_delta/tx_dropped_delta are not real
+    # measurements (NIC counters were unavailable, e.g. /sys/class/net was
+    # masked or the interface couldn't be detected). The classifier must
+    # not gate on the achieved-ratio or drops when this is False or every
+    # window will be marked SLIP and the controller will hammer down to
+    # the floor rate.
+    nic_stats_available: bool = True
 
     @property
     def achieved_pps(self) -> float:
@@ -116,13 +123,20 @@ def classify_window(
     actually consuming the rate budget we set. The achieved-rate floor is
     skipped when the scanner finished naturally inside the window because
     that means it ran out of targets, not throttle.
+
+    When ``nic_stats_available`` is False the NIC counter deltas carry no
+    information, so we skip the drops check and the achieved-ratio check
+    and rely on the scheduler-jitter signal alone — otherwise zero-deltas
+    would force every window to SLIP.
     """
 
-    if measurement.tx_dropped_delta > 0:
+    if measurement.nic_stats_available and measurement.tx_dropped_delta > 0:
         return SLIP
     if measurement.heartbeat_max_latency_ms > policy.heartbeat_latency_threshold_ms:
         return SLIP
     if measurement.scanner_finished_naturally:
+        return CLEAN
+    if not measurement.nic_stats_available:
         return CLEAN
     threshold = policy.achieved_ratio_floor * float(measurement.set_rate)
     if measurement.achieved_pps + 1e-9 < threshold:
@@ -547,7 +561,8 @@ class SubprocessWindowRunner(WindowRunner):
         is_first_window: bool,
     ) -> WindowMeasurement:
         command = self._command_for_rate(rate, is_first_window)
-        nic_before = self._nic_reader.read() if self._nic_reader is not None else NicCounters(0, 0)
+        nic_available = self._nic_reader is not None
+        nic_before = self._nic_reader.read() if nic_available else NicCounters(0, 0)
         self._jitter_monitor.reset()
         start_time = time.monotonic()
         child = self._spawn(command)
@@ -556,25 +571,40 @@ class SubprocessWindowRunner(WindowRunner):
         try:
             try:
                 child.wait(timeout=window_seconds)
+                # Snapshot the active-send window AT exit time, not after
+                # teardown — _terminate_process_tree's SIGINT grace period
+                # would otherwise inflate the achieved-pps denominator and
+                # falsely fail the achieved-ratio check.
+                send_elapsed = time.monotonic() - start_time
+                nic_after = (
+                    self._nic_reader.read() if nic_available else NicCounters(0, 0)
+                )
                 finished_naturally = True
             except subprocess.TimeoutExpired:
+                # Same reasoning: snapshot at the deadline before we begin
+                # graceful shutdown, not after the SIGINT/SIGTERM handshake
+                # completes. window_seconds is the rate budget we gave the
+                # scanner; teardown isn't part of it.
+                send_elapsed = time.monotonic() - start_time
+                nic_after = (
+                    self._nic_reader.read() if nic_available else NicCounters(0, 0)
+                )
                 _terminate_process_tree(child, self._terminate_grace_seconds)
         finally:
             self._on_child(None)
-        elapsed = time.monotonic() - start_time
-        nic_after = self._nic_reader.read() if self._nic_reader is not None else NicCounters(0, 0)
         tx_packets_delta = max(0, nic_after.tx_packets - nic_before.tx_packets)
         tx_dropped_delta = max(0, nic_after.tx_dropped - nic_before.tx_dropped)
         heartbeat_latency_ms = self._jitter_monitor.max_gap_ms()
         exit_code = child.returncode if child.returncode is not None else 0
         return WindowMeasurement(
             set_rate=rate,
-            elapsed_seconds=elapsed,
+            elapsed_seconds=send_elapsed,
             tx_packets_delta=tx_packets_delta,
             tx_dropped_delta=tx_dropped_delta,
             heartbeat_max_latency_ms=heartbeat_latency_ms,
             scanner_finished_naturally=finished_naturally and exit_code == 0,
             scanner_exit_code=exit_code,
+            nic_stats_available=nic_available,
         )
 
 

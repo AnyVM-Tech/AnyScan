@@ -504,8 +504,21 @@ def run_dynamic_scanner(
             "window_seconds": policy.window_seconds,
             "heartbeat_threshold_ms": policy.heartbeat_latency_threshold_ms,
             "calibration_path": str(calibration.path),
+            "nic_stats_available": nic_reader is not None,
         },
     )
+    if nic_reader is None:
+        # Degraded mode: no /sys/class/net/<iface>/statistics access. AIMD
+        # falls back to the heartbeat-jitter signal alone. The classifier
+        # treats this case explicitly (see classify_window) so windows
+        # don't get pinned to SLIP from zero NIC deltas.
+        rate_controller.emit_metric(
+            "controller_no_nic_signal",
+            {
+                "interface": interface,
+                "reason": "interface_unresolved" if interface is None else "stats_unreadable",
+            },
+        )
 
     last_stderr_buffer = bytearray()
     stderr_thread_holder: dict[str, threading.Thread] = {}
