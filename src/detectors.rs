@@ -7636,6 +7636,72 @@ mod tests {
         );
     }
 
+    /// Plugins whose entire signature *is* a short JSON body must opt out of
+    /// the 50-byte default floor with `min_body_bytes: 0`. A 28-byte GraphQL
+    /// error envelope and a 25-byte WordPress user enum response are both
+    /// valid concise signatures that the floor would otherwise drop.
+    #[test]
+    fn bundled_http_rules_short_signature_rules_opt_out_of_body_floor() {
+        let manifest = http_pack_manifest();
+
+        let graphql_error = super::run_external_detector_pack(
+            &document(
+                "/api/graphql",
+                "{\"errors\":[{\"message\":\"x\"}]}",
+            ),
+            &manifest,
+        )
+        .expect("graphql error envelope run");
+        assert!(
+            graphql_error
+                .iter()
+                .any(|finding| finding.detector == "GraphQLErrorEnvelopePlugin"),
+            "GraphQLErrorEnvelopePlugin must fire on a 28-byte error envelope: {:?}",
+            graphql_error
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let graphql_introspection = super::run_external_detector_pack(
+            &document(
+                "/api/graphql",
+                "{\"data\":{\"__schema\":{}}}",
+            ),
+            &manifest,
+        )
+        .expect("graphql introspection run");
+        assert!(
+            graphql_introspection
+                .iter()
+                .any(|finding| finding.detector == "GraphQLIntrospectionResponsePlugin"),
+            "GraphQLIntrospectionResponsePlugin must fire on a 24-byte schema response: {:?}",
+            graphql_introspection
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let wp_user_enum = super::run_external_detector_pack(
+            &document(
+                "/wp-json/wp/v2/users",
+                "[{\"id\":1,\"slug\":\"admin\"}]",
+            ),
+            &manifest,
+        )
+        .expect("wp user enum run");
+        assert!(
+            wp_user_enum
+                .iter()
+                .any(|finding| finding.detector == "wordpress_user_enumeration_best_effort"),
+            "WpUserEnumHttp must fire on a 25-byte user-enum JSON: {:?}",
+            wp_user_enum
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// `min_body_bytes` is documented in bytes, not Unicode code points. A
     /// non-ASCII Node-RED admin body that is 33 characters but 55 UTF-8 bytes
     /// must clear the 50-byte default floor — measuring it by `len()` would

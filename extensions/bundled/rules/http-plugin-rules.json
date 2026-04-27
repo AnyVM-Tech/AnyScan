@@ -204,6 +204,7 @@
     "evidence": "GraphQL introspection response markers were observed in a public response.",
     "aliases": [],
     "body_regex": "(?:\"__schema\"\\s*:\\s*\\{|\"types\"\\s*:\\s*\\[\\s*\\{\\s*\"kind\"\\s*:\\s*\"OBJECT\")",
+    "min_body_bytes": 0,
     "product_name": "graphql"
   },
   {
@@ -224,6 +225,7 @@
     "evidence": "GraphQL error envelope markers were observed in a public response.",
     "aliases": [],
     "body_regex": "\\{\\s*\"errors\"\\s*:\\s*\\[\\s*\\{\\s*\"message\"\\s*:",
+    "min_body_bytes": 0,
     "product_name": "graphql"
   },
   {
@@ -528,6 +530,7 @@
       "/cgi-bin/",
       ".php"
     ],
+    "min_body_bytes": 0,
     "product_name": "PhpCgiRcePlugin"
   },
   {
@@ -547,6 +550,7 @@
     "aliases": [],
     "detector": "php_stdin_best_effort",
     "body_regex": "(?i)(?:php://input|stdin|auto_prepend_file)",
+    "min_body_bytes": 0,
     "product_name": "PhpStdinPlugin"
   },
   {
@@ -841,6 +845,7 @@
     "detector": "wordpress_user_enumeration_best_effort",
     "path_regex": "(?i)(?:/wp-json/wp/v2/users|[?&]author=\\d+)",
     "body_regex": "(?i)\"slug\"\\s*:\\s*\"[^\"]+\"",
+    "min_body_bytes": 0,
     "product_name": "WpUserEnumHttp"
   }
 ]
