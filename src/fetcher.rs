@@ -6488,4 +6488,114 @@ paths:
 
         server.abort();
     }
+
+    #[derive(Clone, Default)]
+    struct CloudStorageCapture {
+        requests: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn spawn_cloud_storage_listing_test_server()
+    -> (JoinHandle<()>, String, CloudStorageCapture) {
+        async fn handler(
+            State(capture): State<CloudStorageCapture>,
+            uri: axum::http::Uri,
+        ) -> (StatusCode, [(header::HeaderName, &'static str); 1], &'static str) {
+            let path_and_query = uri
+                .path_and_query()
+                .map(|value| value.as_str().to_string())
+                .unwrap_or_else(|| uri.path().to_string());
+            capture.requests.lock().await.push(path_and_query);
+            let query = uri.query().unwrap_or_default();
+            if query.contains("list-type=2") {
+                (
+                    StatusCode::OK,
+                    [(CONTENT_TYPE, "application/xml")],
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n  <Name>example-bucket</Name>\n  <Contents><Key>secret.txt</Key></Contents>\n</ListBucketResult>",
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    [(CONTENT_TYPE, "text/plain")],
+                    "not found",
+                )
+            }
+        }
+
+        let capture = CloudStorageCapture::default();
+        let app = Router::new()
+            .fallback(get(handler))
+            .with_state(capture.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cloud storage listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("cloud storage listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("cloud storage server should stay available")
+        });
+
+        (handle, format!("http://{}", address), capture)
+    }
+
+    #[tokio::test]
+    async fn cloud_storage_listing_profile_probes_bucket_listing_through_fetcher() {
+        let (server, base_url, capture) = spawn_cloud_storage_listing_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.inventory.path_profiles = vec!["cloud-storage-listing".to_string()];
+        config.inventory.default_paths.clear();
+        config
+            .validate()
+            .expect("cloud-storage-listing profile should validate");
+        let expanded_paths = config
+            .resolved_default_paths()
+            .expect("cloud-storage-listing profile should expand");
+        assert!(
+            expanded_paths
+                .iter()
+                .any(|path| path.contains("list-type=2")),
+            "expanded paths should include list-type=2 probes"
+        );
+
+        config.scan.max_paths_per_target = expanded_paths.len();
+        config.scan.max_parallel_paths_per_target = 4;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 42,
+            label: "cloud-storage-listing".to_string(),
+            base_url,
+            paths: expanded_paths,
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        fetcher
+            .fetch_target(&target)
+            .await
+            .expect("cloud-storage-listing fetch should succeed");
+
+        let observed = capture.requests.lock().await;
+        assert!(
+            observed
+                .iter()
+                .any(|request| request.contains("list-type=2")),
+            "expected at least one list-type=2 probe to reach the test server, observed: {:?}",
+            observed
+        );
+
+        server.abort();
+    }
 }
