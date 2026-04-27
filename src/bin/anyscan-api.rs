@@ -428,12 +428,12 @@ async fn main() -> Result<()> {
         .route("/app/findings", get(operator_pages::operator_findings))
         .route("/app/coverage", get(operator_pages::operator_coverage))
         .route("/app/catalog", get(operator_pages::operator_catalog))
-        .route("/scanning-policy", get(public_page))
-        .route("/scanner-identity", get(public_page))
+        .route("/scanning-policy", get(public_policy))
+        .route("/scanner-identity", get(public_policy))
         .route("/opt-out", get(public_page))
         .route("/claim", get(public_page))
         .route("/abuse", get(public_page))
-        .route("/data-policy", get(public_page))
+        .route("/data-policy", get(public_policy))
         .route("/.well-known/security.txt", get(security_txt))
         .route("/api/public/profile", get(public_profile))
         .route("/api/public/findings", get(list_public_findings))
@@ -617,6 +617,10 @@ async fn public_page() -> Html<&'static str> {
 
 async fn public_about() -> Html<&'static str> {
     Html(include_str!("../../templates/public/about.html"))
+}
+
+async fn public_policy() -> Html<&'static str> {
+    Html(include_str!("../../templates/public/policy.html"))
 }
 
 async fn enforce_worker_only_host_routes(
@@ -4520,5 +4524,51 @@ mod tests {
                 || body.contains("Workflows"),
             "about page should expose at least one detail-card anchor or the workflows heading"
         );
+    }
+
+    #[tokio::test]
+    async fn public_policy_routes_serve_policy_content() {
+        let app = Router::new()
+            .route("/scanning-policy", get(public_policy))
+            .route("/scanner-identity", get(public_policy))
+            .route("/data-policy", get(public_policy));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve policy app");
+        });
+
+        let client = reqwest::Client::new();
+        for path in ["/scanning-policy", "/scanner-identity", "/data-policy"] {
+            let url = format!("http://{}{}", addr, path);
+            let response = client.get(&url).send().await.expect("send request");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "{} should return 200",
+                path
+            );
+            let body = response.text().await.expect("read body");
+            assert!(
+                body.contains(r#"id="scanning-policy""#),
+                "{} body missing scanning-policy section",
+                path
+            );
+            assert!(
+                body.contains(r#"id="scanner-identity""#),
+                "{} body missing scanner-identity section",
+                path
+            );
+            assert!(
+                body.contains(r#"id="data-policy""#),
+                "{} body missing data-policy section",
+                path
+            );
+        }
+
+        server.abort();
     }
 }
