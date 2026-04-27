@@ -71,6 +71,14 @@ pub async fn operator_coverage() -> Html<String> {
     )
 }
 
+pub async fn operator_catalog() -> Html<String> {
+    render_page(
+        "catalog",
+        include_str!("../templates/operator/catalog.html"),
+        include_str!("../templates/operator/catalog.js"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +321,51 @@ mod tests {
         assert!(
             body.contains("id=\"coverage-sources-list\""),
             "rendered body should contain the coverage-sources-list container"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_catalog_serves_shell_and_catalog_ids() {
+        let app = Router::new().route("/app/catalog", get(operator_catalog));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator catalog test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator catalog test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator catalog test server should stay available");
+        });
+
+        let url = format!("http://{}/app/catalog", address);
+        let response = reqwest::get(&url)
+            .await
+            .expect("GET /app/catalog should succeed");
+        assert_eq!(response.status(), 200);
+        let body = response
+            .text()
+            .await
+            .expect("operator catalog body should be utf-8");
+
+        assert!(
+            body.contains("id=\"appbar-nav\""),
+            "rendered body should contain the appbar nav (shell scaffolding)"
+        );
+        assert!(
+            body.contains("aria-current=\"page\""),
+            "rendered body should mark the active nav link with aria-current"
+        );
+        assert!(
+            body.contains("id=\"plugins-search-form\""),
+            "rendered body should contain the plugin catalog search form"
+        );
+        assert!(
+            body.contains("id=\"plugin-catalog-list\""),
+            "rendered body should contain the plugin catalog list container"
         );
 
         server.abort();

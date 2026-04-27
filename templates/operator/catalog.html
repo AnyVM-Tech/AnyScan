@@ -1,0 +1,106 @@
+				<section id="page-catalog">
+					<h2 class="section-group-heading" id="section-catalog">
+						<span>Catalog</span>
+						<span class="section-group-hint">LeakIX-style plugin registry with phase, lane, and metadata search.</span>
+					</h2>
+
+					<section class="grid">
+						<article class="card wide-card">
+							<h2>LeakIX-style plugin catalog</h2>
+							<p id="plugin-catalog-note" class="management-note">
+								Modeled AnyScan plugin registry with phase-1 implementation status and execution-lane metadata.
+							</p>
+							<p
+								id="plugin-catalog-gate-note"
+								class="management-note"
+							>
+								Active-authorized gate state pending server support.
+							</p>
+							<form id="plugins-search-form">
+								<label>
+									Free-text query
+									<input
+										id="plugins-query"
+										placeholder="jenkins passive_http public"
+									/>
+								</label>
+								<label>
+									Family
+									<select id="plugins-family">
+										<option value="">Any family</option>
+										<option value="ai_llm_vector">AI / LLM / vector</option>
+										<option value="databases_search">Databases / search</option>
+										<option value="enterprise_web_apps">Enterprise / web apps</option>
+										<option value="infra_platform_data">Infra / platform / data</option>
+										<option value="leakage_debug_config">Leakage / debug / config</option>
+										<option value="network_security_appliances">Network / security appliances</option>
+										<option value="ot_ics_iot">OT / ICS / IoT</option>
+										<option value="ops_observability">Ops / observability</option>
+										<option value="exposure_vulnerability_misc">Exposure / vulnerability misc</option>
+									</select>
+								</label>
+								<label>
+									LeakIX label
+									<select id="plugins-label">
+										<option value="">Any label</option>
+										<option value="public">Public</option>
+										<option value="trusted_pro">Trusted / Pro</option>
+									</select>
+								</label>
+								<label>
+									Execution mode
+									<select id="plugins-execution-mode">
+										<option value="">Any mode</option>
+										<option value="passive_http">Passive HTTP</option>
+										<option value="authless_protocol">Authless protocol</option>
+										<option value="version_correlation">Version correlation</option>
+										<option value="active_authorized">Active authorized</option>
+									</select>
+								</label>
+								<label>
+									Status
+									<select id="plugins-status">
+										<option value="">Any status</option>
+										<option value="implemented">Implemented</option>
+										<option value="planned">Planned</option>
+										<option value="not_supported">Not supported</option>
+									</select>
+								</label>
+								<label>
+									Coverage
+									<select id="plugins-coverage-status">
+										<option value="">Any coverage</option>
+										<option value="first_class">First class</option>
+										<option value="external_scanner_only">External scanner only</option>
+										<option value="declared_but_inactive">Declared but inactive</option>
+									</select>
+								</label>
+								<label>
+									Limit
+									<input
+										id="plugins-limit"
+										type="number"
+										min="1"
+										max="500"
+										step="1"
+										placeholder="250"
+									/>
+								</label>
+								<div class="actions">
+									<button type="submit">Filter catalog</button>
+									<button id="plugins-reset-button" type="button">
+										Clear filters
+									</button>
+								</div>
+								<small id="plugins-search-status" class="muted"
+									>Loading plugin catalog.</small
+								>
+								<p id="plugins-search-error" class="error hidden"></p>
+							</form>
+							<ul id="plugin-catalog-list" class="list"></ul>
+							<p id="plugin-catalog-empty" class="empty hidden">
+								No plugin entries matched the current filters.
+							</p>
+						</article>
+					</section>
+				</section>
