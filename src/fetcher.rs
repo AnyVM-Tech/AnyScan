@@ -7070,4 +7070,209 @@ paths:
 
         server.abort();
     }
+
+    async fn spawn_throughput_bench_server(
+        latency_ms: u64,
+    ) -> (JoinHandle<()>, String, Arc<AtomicUsize>) {
+        async fn catch_all(
+            State(probe): State<ParallelismProbe>,
+            Path(path): Path<String>,
+        ) -> (StatusCode, [(&'static str, &'static str); 1], String) {
+            let request_path = format!("/{path}");
+            // Anyscan injects a random `anyscan-control-...` probe to detect
+            // catch-all hosts; if that returns 200 the real-paths loop is
+            // short-circuited. Return 404 so the bench actually exercises
+            // the per-target path loop.
+            if request_path.contains("anyscan-control-") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    [("content-type", "text/plain")],
+                    String::new(),
+                );
+            }
+            let current = probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            record_max_parallelism(&probe.max_in_flight, current);
+            tokio::time::sleep(Duration::from_millis(probe.latency_ms)).await;
+            probe.in_flight.fetch_sub(1, Ordering::SeqCst);
+            (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                format!("{{\"path\":\"{}\"}}", path.replace('/', "_")),
+            )
+        }
+
+        #[derive(Clone)]
+        struct ParallelismProbe {
+            in_flight: Arc<AtomicUsize>,
+            max_in_flight: Arc<AtomicUsize>,
+            latency_ms: u64,
+        }
+
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/{*path}", get(catch_all))
+            .with_state(ParallelismProbe {
+                in_flight: Arc::new(AtomicUsize::new(0)),
+                max_in_flight: Arc::clone(&max_in_flight),
+                latency_ms,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bench listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("bench listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("bench server should stay available")
+        });
+        (handle, format!("http://{}", address), max_in_flight)
+    }
+
+    async fn bench_one_config(
+        base_url: &str,
+        max_in_flight: &Arc<AtomicUsize>,
+        max_parallel_paths_per_target: usize,
+        max_concurrent_requests_per_host: usize,
+        deep_max_concurrent_requests_per_host: usize,
+        path_count: usize,
+        repeat: usize,
+    ) -> (Duration, u64, usize) {
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+        config.scan.max_paths_per_target = path_count;
+        config.scan.max_parallel_paths_per_target = max_parallel_paths_per_target;
+        config.scan.max_concurrent_requests_per_host = max_concurrent_requests_per_host;
+        config.scan.deep_max_concurrent_requests_per_host = deep_max_concurrent_requests_per_host;
+        let paths: Vec<String> = (0..path_count).map(|i| format!("/p{i}")).collect();
+        let target = TargetRecord {
+            id: 1,
+            label: "bench".to_string(),
+            base_url: base_url.to_string(),
+            paths: paths.clone(),
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        max_in_flight.store(0, Ordering::SeqCst);
+        let mut total_requests = 0u64;
+        let started = Instant::now();
+        for _ in 0..repeat {
+            let fetcher = Fetcher::new(&config).expect("fetcher should build");
+            let report = fetcher
+                .fetch_target(&target)
+                .await
+                .expect("bench fetch should succeed");
+            total_requests += report.telemetry.request_count;
+        }
+        let elapsed = started.elapsed();
+        let observed_max = max_in_flight.load(Ordering::SeqCst);
+        (elapsed, total_requests, observed_max)
+    }
+
+    #[test]
+    fn default_scan_config_per_host_caps_match_per_target_parallelism() {
+        // Regression guard: the per-host throttle clamps in-flight HEAD/GET
+        // to `min(probe_max, global)` and `min(deep_max, global)`. If
+        // `max_concurrent_requests_per_host` shrinks below
+        // `max_parallel_paths_per_target`, the per-target loop will queue
+        // paths it can never run, and bumping `max_parallel_paths_per_target`
+        // becomes a no-op (the bug this PR fixes — see PR description).
+        let scan = crate::config::ScanConfig::default();
+        assert!(
+            scan.max_concurrent_requests_per_host >= scan.max_parallel_paths_per_target,
+            "max_concurrent_requests_per_host ({}) must be >= max_parallel_paths_per_target ({}) \
+             so the per-target path loop is not silently capped by the global per-host throttle",
+            scan.max_concurrent_requests_per_host,
+            scan.max_parallel_paths_per_target,
+        );
+        assert!(
+            scan.deep_max_concurrent_requests_per_host >= scan.max_parallel_paths_per_target,
+            "deep_max_concurrent_requests_per_host ({}) must be >= max_parallel_paths_per_target ({}) \
+             so deep GETs are not the binding cap on per-target parallelism",
+            scan.deep_max_concurrent_requests_per_host,
+            scan.max_parallel_paths_per_target,
+        );
+    }
+
+    /// Throughput micro-bench for the per-target host-scan loop. Run with:
+    ///
+    ///   cargo test --release --lib host_scan_throughput_bench -- --ignored --nocapture
+    ///
+    /// Compares three knob configurations against a localhost server that
+    /// sleeps `LATENCY_MS` per request (default 50 ms — a stand-in for
+    /// open-internet RTT). All three configs use `DeepOnly` so only the deep
+    /// stage's per-host throttle is exercised.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn host_scan_throughput_bench() {
+        let latency_ms: u64 = std::env::var("ANYSCAN_BENCH_LATENCY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let path_count: usize = std::env::var("ANYSCAN_BENCH_PATHS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let repeat: usize = std::env::var("ANYSCAN_BENCH_REPEAT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        let (server, base_url, max_in_flight) = spawn_throughput_bench_server(latency_ms).await;
+
+        // Warm-up: pulls a connection into the pool so connect cost
+        // doesn't pollute the first measured config.
+        let _ = bench_one_config(&base_url, &max_in_flight, 4, 4, 4, 4, 1).await;
+
+        struct Row {
+            label: &'static str,
+            ppt: usize,
+            global: usize,
+            deep: usize,
+        }
+        let configs = [
+            Row { label: "baseline-default-4/4/4", ppt: 4, global: 4, deep: 4 },
+            Row { label: "prod-bumped-8/4/4",      ppt: 8, global: 4, deep: 4 },
+            Row { label: "proposed-16/16/16",      ppt: 16, global: 16, deep: 16 },
+            Row { label: "proposed-32/16/16",      ppt: 32, global: 16, deep: 16 },
+        ];
+
+        eprintln!(
+            "=== host-scan throughput bench: latency_ms={latency_ms} paths={path_count} repeat={repeat} ==="
+        );
+        eprintln!("{:<28} {:>10} {:>14} {:>14} {:>16}", "config", "elapsed_s", "requests", "req/s", "max_in_flight");
+        for cfg in &configs {
+            let (elapsed, total, observed) = bench_one_config(
+                &base_url,
+                &max_in_flight,
+                cfg.ppt,
+                cfg.global,
+                cfg.deep,
+                path_count,
+                repeat,
+            )
+            .await;
+            let rps = total as f64 / elapsed.as_secs_f64();
+            eprintln!(
+                "{:<28} {:>10.3} {:>14} {:>14.1} {:>16}",
+                cfg.label,
+                elapsed.as_secs_f64(),
+                total,
+                rps,
+                observed,
+            );
+        }
+
+        server.abort();
+    }
 }
