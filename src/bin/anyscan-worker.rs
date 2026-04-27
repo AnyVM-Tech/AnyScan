@@ -5278,11 +5278,20 @@ fn top_level_task_kind_label(kind: TopLevelTaskKind) -> &'static str {
     }
 }
 
+// Multiplier on `redis_run_lease_seconds` used to derive how long the control
+// plane will keep this worker on /api/workers without a successful heartbeat.
+// Bumped from 4 → 6 after the scan #16 incident where a saturated NIC starved
+// heartbeats long enough for the registry lease to expire and drop the worker
+// mid-scan. The reserve-control-bandwidth.sh ExecStartPre is the primary fix;
+// the extra 50% of grace here is defense-in-depth for cases where the qdisc
+// reservation can't be installed (e.g. policy or kernel-module issues).
+const WORKER_REGISTRATION_TTL_MULTIPLIER: u64 = 6;
+
 fn worker_registration_ttl_seconds(config: &AppConfig) -> u64 {
     config
         .storage
         .redis_run_lease_seconds
-        .saturating_mul(4)
+        .saturating_mul(WORKER_REGISTRATION_TTL_MULTIPLIER)
         .max(config.scan.poll_interval_seconds.saturating_mul(2))
         .max(30)
 }
@@ -5502,18 +5511,22 @@ fn load_effective_runtime_config(
 mod tests {
     use super::{
         DiscoveredEndpoint, PortScanFollowOnSelectionMode, ReportedProtocolPluginFinding,
-        ScannerOutputCounter, apply_follow_on_selection_mode_to_targets,
+        ScannerOutputCounter, WORKER_REGISTRATION_TTL_MULTIPLIER,
+        apply_follow_on_selection_mode_to_targets,
         derive_protocol_plugin_findings_with_active_mode, endpoint_cache_key,
         filter_endpoints_excluding_streamed, normalize_platform_architecture,
         normalize_platform_operating_system, parse_endpoint_token, parse_ip_addr_show_output,
         parse_json_endpoint_lines, scanner_target_range_for_adapter, should_push_resume_state,
         streaming_followon_should_flush, validated_target_tag,
+        worker_registration_refresh_interval, worker_registration_ttl_seconds,
     };
+    use anyscan::config::AppConfig;
     use anyscan::core::TargetDefinition;
     use std::collections::HashSet;
     use std::fs;
     use std::io::Write;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn endpoint(
         host: &str,
@@ -5644,6 +5657,42 @@ mod tests {
             Some("validated-https")
         );
         assert_eq!(validated_target_tag("ftp://example.com"), None);
+    }
+
+    #[test]
+    fn worker_registration_ttl_uses_six_times_lease_for_extra_grace() {
+        // Regression coverage for the scan #16 NIC-saturation incident: the
+        // registration TTL must give heartbeats enough headroom to weather
+        // network congestion while the scanner is running.
+        assert_eq!(WORKER_REGISTRATION_TTL_MULTIPLIER, 6);
+
+        let mut config = AppConfig::default();
+        config.storage.redis_run_lease_seconds = 120;
+        config.scan.poll_interval_seconds = 15;
+        let ttl = worker_registration_ttl_seconds(&config);
+        assert_eq!(ttl, 720, "120s lease * 6 = 720s of registration grace");
+    }
+
+    #[test]
+    fn worker_registration_ttl_respects_floors_when_lease_is_tiny() {
+        let mut config = AppConfig::default();
+        config.storage.redis_run_lease_seconds = 1;
+        config.scan.poll_interval_seconds = 200;
+        let ttl = worker_registration_ttl_seconds(&config);
+        // poll_interval_seconds * 2 = 400 should win over both 1*6 and the 30s
+        // floor — the helper takes the max of all three terms.
+        assert_eq!(ttl, 400);
+    }
+
+    #[test]
+    fn worker_registration_refresh_interval_caps_to_poll_interval() {
+        let mut config = AppConfig::default();
+        config.storage.redis_run_lease_seconds = 120;
+        config.scan.poll_interval_seconds = 15;
+        let ttl = worker_registration_ttl_seconds(&config);
+        let interval = worker_registration_refresh_interval(&config, ttl);
+        // With poll=15, ttl/3=240; min picks the poll interval to keep cadence frequent.
+        assert_eq!(interval, Duration::from_secs(15));
     }
 
     #[test]

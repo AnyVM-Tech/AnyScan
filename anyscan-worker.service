@@ -9,6 +9,11 @@ User=anyscan
 Group=anyscan
 WorkingDirectory=/opt/anyscan
 EnvironmentFile=-/etc/anyscan/runtime.env
+# Reserve egress bandwidth for control-plane heartbeats; see
+# reserve-control-bandwidth.sh for the qdisc/iptables design. The `+` prefix
+# runs the helper as root regardless of User=. The script fails-open.
+ExecStartPre=+/opt/anyscan/bin/reserve-control-bandwidth.sh apply
+ExecStopPost=+/opt/anyscan/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/anyscan/bin/anyscan-worker daemon
 Restart=always
 RestartSec=5
