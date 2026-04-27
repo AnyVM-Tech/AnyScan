@@ -420,6 +420,7 @@ async fn main() -> Result<()> {
     });
     let app = Router::new()
         .route("/", get(public_index))
+        .route("/about", get(public_about))
         .route("/app", get(operator_app))
         .route("/app/overview", get(operator_pages::operator_overview))
         .route("/app/targets", get(operator_pages::operator_targets))
@@ -612,6 +613,10 @@ async fn operator_app() -> Html<&'static str> {
 
 async fn public_page() -> Html<&'static str> {
     Html(include_str!("../../public-site.html"))
+}
+
+async fn public_about() -> Html<&'static str> {
+    Html(include_str!("../../templates/public/about.html"))
 }
 
 async fn enforce_worker_only_host_routes(
@@ -4492,5 +4497,28 @@ mod tests {
         assert!(resolved.global_gate_enabled);
         assert!(resolved.request_opt_in_enabled);
         assert!(resolved.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn public_about_route_serves_about_content() {
+        let response = public_about().await.into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("about page body should read");
+        let body = std::str::from_utf8(&body_bytes).expect("about page body should be utf-8");
+
+        assert!(
+            body.contains(r#"id="about""#),
+            "about page should contain the original #about section anchor"
+        );
+        assert!(
+            body.contains(r#"id="scanning-policy""#)
+                || body.contains(r#"id="responsible-disclosure""#)
+                || body.contains("Workflows"),
+            "about page should expose at least one detail-card anchor or the workflows heading"
+        );
     }
 }
