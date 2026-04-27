@@ -151,6 +151,96 @@ class CalibrationStoreTests(unittest.TestCase):
             store.store("eth0", -100)
             self.assertFalse(path.exists())
 
+    def test_concurrent_writes_from_multiple_processes_all_persist(self) -> None:
+        """Multi-NIC parent spawns N shard children; each child's controller
+        writes to the SAME calibration file when it converges. Pre-fix the
+        children clobbered each other (shared tmp filename + read-modify-write
+        race) so only one shard's calibration survived. Post-fix all shards'
+        entries land.
+        """
+
+        import multiprocessing as mp
+
+        def _store_in_subprocess(path_str: str, interface: str, rate: int) -> None:
+            # Re-import inside the worker so the subprocess has a clean
+            # module state (no shared file handles across fork).
+            from pathlib import Path as _Path
+            import anyscan_rate_controller as _rc
+
+            store = _rc.RateCalibrationStore(_Path(path_str))
+            store.store(interface, rate, now_iso="2026-04-27T12:00:00Z")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rate-calibration.json"
+            # Six shards, fired simultaneously. Each writes a distinct
+            # interface; the per-interface rate value is the rate the
+            # synthetic AIMD loop "converged" to.
+            interfaces = [(f"eth{i}", 1_000_000 + i * 100_000) for i in range(6)]
+            ctx = mp.get_context("fork")
+            workers = [
+                ctx.Process(
+                    target=_store_in_subprocess,
+                    args=(str(path), iface, rate),
+                )
+                for iface, rate in interfaces
+            ]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join(timeout=10)
+                self.assertEqual(w.exitcode, 0, msg=f"worker {w.pid} failed")
+
+            store = rc.RateCalibrationStore(path)
+            entries = store.load()
+            # Pre-fix: only one entry survived (last-writer-wins on the
+            # shared tmp + clobbered .json). Post-fix: all six landed.
+            self.assertEqual(
+                set(entries.keys()),
+                {iface for iface, _ in interfaces},
+                msg=f"expected all 6 interfaces persisted, got {list(entries.keys())}",
+            )
+            for iface, rate in interfaces:
+                self.assertEqual(entries[iface].learned_rate, rate)
+
+    def test_concurrent_writes_leave_no_dangling_tmp_files(self) -> None:
+        """The pre-fix race left orphan .tmp files on disk when the second
+        os.replace failed (source already moved). Post-fix every writer
+        cleans up its own per-pid tmp regardless of outcome.
+        """
+
+        import multiprocessing as mp
+
+        def _store_in_subprocess(path_str: str, interface: str, rate: int) -> None:
+            from pathlib import Path as _Path
+            import anyscan_rate_controller as _rc
+
+            store = _rc.RateCalibrationStore(_Path(path_str))
+            store.store(interface, rate)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rate-calibration.json"
+            ctx = mp.get_context("fork")
+            workers = [
+                ctx.Process(
+                    target=_store_in_subprocess,
+                    args=(str(path), f"eth{i}", 500_000 + i * 100_000),
+                )
+                for i in range(8)
+            ]
+            for w in workers:
+                w.start()
+            for w in workers:
+                w.join(timeout=10)
+                self.assertEqual(w.exitcode, 0)
+
+            # No stray .tmp.* files: success and failure paths both clean
+            # up after themselves.
+            stray = list(Path(tmpdir).glob("rate-calibration.json.tmp*"))
+            self.assertEqual(stray, [], msg=f"orphan tmp files left: {stray}")
+            # The final file is valid JSON we can round-trip.
+            store = rc.RateCalibrationStore(path)
+            self.assertEqual(len(store.load()), 8)
+
 
 @dataclass
 class StubWindow:
@@ -852,6 +942,58 @@ class PartialWindowCalibrationTests(unittest.TestCase):
             entry = calib.lookup("eth0")
             self.assertIsNotNone(entry)
             self.assertEqual(entry.learned_rate, 1_500_000)  # untouched
+
+    def test_persists_when_interrupted_by_systemexit_mid_loop(self) -> None:
+        """Signal-handler exit path: SIGTERM/SIGINT in the adapter raises
+        SystemExit (handle_termination in vulnscanner-zmap-adapter.py).
+        That exception unwinds through SubprocessWindowRunner.run() and
+        out of RateController.run()'s while loop. The controller's
+        try/finally must still persist max_clean_rate so the calibration
+        learned in the windows that DID complete is not lost on a SIGTERM
+        from the multi-NIC parent or agentd.
+        """
+
+        class InterruptingRunner(rc.WindowRunner):
+            def __init__(self) -> None:
+                self._idx = 0
+
+            def run(self, *, rate, window_seconds, is_first_window):
+                self._idx += 1
+                if self._idx == 1:
+                    return make_measurement(set_rate=rate, achieved_pps=rate * 0.97)
+                if self._idx == 2:
+                    return make_measurement(
+                        set_rate=rate, achieved_pps=rate * 0.97
+                    )
+                # Window 3: simulate the adapter's SIGTERM handler which
+                # raises SystemExit(128 + signum). Real signal handlers
+                # cannot raise during a child.wait() syscall reliably,
+                # but the exception path the controller has to survive
+                # is identical to the one a Python-level handler would
+                # produce.
+                raise SystemExit(143)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calib = rc.RateCalibrationStore(Path(tmpdir) / "rate-calibration.json")
+            policy = rc.AimdPolicy(window_seconds=30)
+            controller = rc.RateController(
+                options=rc.ControllerOptions(
+                    policy=policy,
+                    window_seconds=float(policy.window_seconds),
+                    interface="eth2",
+                    starting_rate=500_000,
+                    calibration=calib,
+                ),
+                runner=InterruptingRunner(),
+                log_sink=io.StringIO(),
+            )
+            with self.assertRaises(SystemExit):
+                controller.run()
+            entry = calib.lookup("eth2")
+            self.assertIsNotNone(entry, "SystemExit must not bypass terminal persist")
+            # Highest CLEAN rate observed before the interrupt was 700k
+            # (window 2 ran at 700k after window 1's clean@500k bumped it).
+            self.assertEqual(entry.learned_rate, 700_000)
 
     def test_persists_after_natural_finish(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

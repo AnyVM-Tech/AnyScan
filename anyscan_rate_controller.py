@@ -19,6 +19,7 @@ flow. PR #28's tc reservation guarantees the control plane keeps a
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -26,9 +27,10 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Iterable, Iterator, Mapping, Optional
 
 
 DEFAULT_FLOOR = 100_000
@@ -251,8 +253,13 @@ class RateCalibrationStore:
     """Thin JSON-on-disk persistence for per-interface learned rates.
 
     Keeps state across scans so a freshly dispatched worker doesn't have to
-    re-discover its ceiling on every job. Writes go through a tempfile +
-    atomic rename so a half-written file can never be observed.
+    re-discover its ceiling on every job. Writes go through a per-pid
+    tempfile + atomic rename so a half-written file can never be observed,
+    and the read-modify-write cycle is serialized across processes via
+    fcntl.flock on a sibling lockfile so the multi-NIC parent's concurrent
+    shards don't clobber each other (each shard converges on its own
+    interface; pre-lock the last writer's view of {interfaces: {iface_X:
+    ...}} silently wiped every other shard's entry).
     """
 
     SCHEMA_VERSION = 1
@@ -263,6 +270,10 @@ class RateCalibrationStore:
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def _lock_path(self) -> Path:
+        return self._path.with_suffix(self._path.suffix + ".lock")
 
     def load(self) -> dict[str, CalibrationEntry]:
         try:
@@ -296,27 +307,74 @@ class RateCalibrationStore:
     def store(self, interface: str, learned_rate: int, *, now_iso: Optional[str] = None) -> None:
         if learned_rate <= 0:
             return
-        entries = self.load()
-        timestamp = now_iso if now_iso is not None else _utc_now_iso()
-        entries[interface] = CalibrationEntry(learned_rate, timestamp)
-        payload = {
-            "version": self.SCHEMA_VERSION,
-            "interfaces": {
-                key: {"learned_rate": entry.learned_rate, "updated_at": entry.updated_at}
-                for key, entry in entries.items()
-            },
-        }
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
         except OSError:
             return
-        tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
-        try:
-            tmp_path.write_text(json.dumps(payload, sort_keys=True))
-            os.replace(tmp_path, self._path)
-        except OSError:
+        timestamp = now_iso if now_iso is not None else _utc_now_iso()
+        with self._locked_for_write():
+            # Re-read inside the lock so concurrent shards observe each
+            # other's entries instead of clobbering with a stale view.
+            entries = self.load()
+            entries[interface] = CalibrationEntry(learned_rate, timestamp)
+            payload = {
+                "version": self.SCHEMA_VERSION,
+                "interfaces": {
+                    key: {"learned_rate": entry.learned_rate, "updated_at": entry.updated_at}
+                    for key, entry in entries.items()
+                },
+            }
+            # Per-pid tmp filename so concurrent shards don't overwrite
+            # each other's pre-rename payloads. The flock above already
+            # serializes them, but per-pid tmp keeps cleanup well-defined
+            # if a shard dies between write and rename.
+            tmp_path = self._path.with_suffix(
+                self._path.suffix + f".tmp.{os.getpid()}"
+            )
             try:
-                tmp_path.unlink()
+                tmp_path.write_text(json.dumps(payload, sort_keys=True))
+                os.replace(tmp_path, self._path)
+            except OSError:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+    @contextmanager
+    def _locked_for_write(self) -> Iterator[None]:
+        """Hold an exclusive flock for the lifetime of a read-modify-write.
+
+        On hosts where flock is unsupported (rare; most filesystems with a
+        Linux kernel grant it) the lock acquisition is best-effort — we
+        fall through to the unprotected write rather than blocking
+        calibration entirely. Contention is bounded: the held interval is
+        a few millis (json.dumps + tempfile write + rename).
+        """
+
+        lock_handle = None
+        try:
+            lock_handle = open(self._lock_path, "w")
+        except OSError:
+            yield
+            return
+        try:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            except OSError:
+                # Filesystem refused the lock; proceed unprotected so a
+                # missing lock primitive doesn't drop calibration entirely.
+                yield
+                return
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+        finally:
+            try:
+                lock_handle.close()
             except OSError:
                 pass
 
