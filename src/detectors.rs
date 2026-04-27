@@ -297,6 +297,35 @@ static FRAGMENT_BLOB_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r#"(?i)(?:https?://[^\s"'<>`]+)?#(?P<fragment>[A-Za-z0-9_=%&./:+-]{8,})"#)
         .expect("valid regex")
 });
+// Detects verbose server-side error pages and stack traces leaked in HTTP
+// response bodies. Combines fingerprints for Java, Python, .NET (YSOD),
+// Rails, and Node.js stack traces into a single alternation so a single
+// finding category covers the family of disclosures.
+static VERBOSE_STACK_TRACE_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r#"(?x)
+        # Java: at com.foo.Bar(Bar.java:42)
+        \bat\s+(?:com|org|net|io)\.[\w$.]+\([\w$.]+\.java:\d+\)
+        |
+        # Python: Traceback (most recent call last):\n  File "..."
+        Traceback\ \(most\ recent\ call\ last\):\s*\n\s*File\ "
+        |
+        # .NET YSOD title or framework exception type marker
+        <title>Server\ Error\ in\ '/'\ Application
+        |
+        \[(?:NullReferenceException|InvalidOperationException|ArgumentException)
+        |
+        # Rails diagnostic title or ActiveRecord exception
+        <title>Action\ Controller:\ Exception\ caught
+        |
+        ActiveRecord::(?:RecordNotFound|StatementInvalid)
+        |
+        # Node.js: TypeError: msg\n    at fn (file.js:LINE:COL)
+        \b(?:TypeError|ReferenceError|SyntaxError):\s+.+\n\s+at\s+.+\s+\(.+\.js:\d+:\d+\)
+        "#,
+    )
+    .expect("valid regex")
+});
 
 fn exact_detector(
     name: &'static str,
@@ -852,6 +881,7 @@ impl DetectorEngine {
         let mut seen = HashSet::new();
 
         scan_detectors(document, &mut seen, &mut findings);
+        scan_verbose_stack_traces(document, &mut seen, &mut findings);
         scan_contextual_assignments(document, &mut seen, &mut findings);
         scan_structured_contextual_assignments(document, &mut seen, &mut findings);
         scan_response_header_contextual_assignments(document, &mut seen, &mut findings);
@@ -906,6 +936,56 @@ fn scan_detectors(
                 }
             }
         }
+    }
+}
+
+// Verbose error pages and stack traces in HTTP response bodies leak server
+// internals (file paths, framework versions, query fragments). The detector
+// is gated by a tight set of literal substrings so the regex only runs on
+// bodies that already look like an error disclosure, and emits one finding
+// per matching location with evidence truncated to ~200 characters.
+const VERBOSE_STACK_TRACE_PREFILTER: &[&str] = &[
+    "Traceback (most recent call last)",
+    "at com.",
+    "at org.",
+    "at net.",
+    "at io.",
+    "Server Error in",
+    "Action Controller",
+    "ActiveRecord::",
+    "TypeError:",
+    "ReferenceError:",
+    "SyntaxError:",
+];
+
+const VERBOSE_STACK_TRACE_EVIDENCE_CHARS: usize = 200;
+
+fn scan_verbose_stack_traces(
+    document: &FetchedDocument,
+    seen: &mut HashSet<String>,
+    findings: &mut Vec<FindingCandidate>,
+) {
+    if !VERBOSE_STACK_TRACE_PREFILTER
+        .iter()
+        .any(|literal| document.body.contains(literal))
+    {
+        return;
+    }
+
+    for matched in VERBOSE_STACK_TRACE_RE.find_iter(&document.body) {
+        let snippet = abbreviate_prefix(matched.as_str().trim(), VERBOSE_STACK_TRACE_EVIDENCE_CHARS);
+        push_metadata_secret_finding_candidate(
+            findings,
+            seen,
+            document,
+            "verbose_stack_trace_disclosure",
+            &Severity::Low,
+            &snippet,
+            &snippet,
+            Some(FindingConfidence::High),
+            vec!["stack_trace_disclosure".to_string()],
+            vec!["verbose_error_disclosure".to_string()],
+        );
     }
 }
 
@@ -5875,7 +5955,7 @@ fn fingerprint(value: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use crate::core::Severity;
+    use crate::core::{FindingCandidate, FindingConfidence, Severity};
     use crate::fetcher::FetchedDocument;
 
     use super::{DetectorEngine, candidate_detectors, compare_numeric_versions};
@@ -8322,5 +8402,170 @@ mod tests {
 
         assert!(candidates.contains("npm_registry_auth"));
         assert!(!candidates.contains("kubeconfig_embedded_credential"));
+    }
+
+    const PYTHON_TRACEBACK: &str = concat!(
+        "Traceback (most recent call last):\n",
+        "  File \"/srv/app/views.py\", line 42, in handle_request\n",
+        "    user = User.objects.get(pk=request.GET['id'])\n",
+        "  File \"/srv/app/.venv/lib/python3.11/site-packages/django/db/models/manager.py\", line 85, in manager_method\n",
+        "    return getattr(self.get_queryset(), name)(*args, **kwargs)\n",
+        "django.core.exceptions.ObjectDoesNotExist: User matching query does not exist.\n"
+    );
+
+    const JAVA_STACK_TRACE: &str = concat!(
+        "java.lang.NullPointerException: Cannot invoke \"User.getId()\" because \"user\" is null\n",
+        "\tat com.example.app.UserController.show(UserController.java:128)\n",
+        "\tat org.springframework.web.method.support.InvocableHandlerMethod.doInvoke(InvocableHandlerMethod.java:205)\n",
+        "\tat io.netty.handler.codec.http.HttpServerCodec.callDecode(HttpServerCodec.java:64)\n"
+    );
+
+    const DOTNET_YSOD: &str = concat!(
+        "<html>\n",
+        "  <head>\n",
+        "    <title>Server Error in '/' Application.</title>\n",
+        "  </head>\n",
+        "  <body bgcolor=\"white\">\n",
+        "    <span><h1>Server Error in '/' Application.<hr width=100% size=1 color=silver></h1>\n",
+        "    <h2>[NullReferenceException: Object reference not set to an instance of an object.]</h2>\n",
+        "  </body>\n",
+        "</html>\n"
+    );
+
+    const RAILS_DIAGNOSTIC: &str = concat!(
+        "<!DOCTYPE html>\n",
+        "<html>\n",
+        "<head>\n",
+        "  <title>Action Controller: Exception caught</title>\n",
+        "</head>\n",
+        "<body>\n",
+        "  <h1>ActiveRecord::RecordNotFound in UsersController#show</h1>\n",
+        "  <p>Couldn't find User with 'id'=99</p>\n",
+        "</body>\n",
+        "</html>\n"
+    );
+
+    const NODE_JS_ERROR: &str = concat!(
+        "TypeError: Cannot read properties of undefined (reading 'name')\n",
+        "    at Object.handle (/srv/api/handlers/user.js:42:18)\n",
+        "    at processTicksAndRejections (node:internal/process/task_queues:96:5)\n"
+    );
+
+    fn verbose_stack_trace_findings(body: &str) -> Vec<FindingCandidate> {
+        let engine = DetectorEngine::new();
+        engine
+            .scan_document(&document("/error", body))
+            .into_iter()
+            .filter(|finding| finding.detector == "verbose_stack_trace_disclosure")
+            .collect()
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_fires_on_python_traceback() {
+        let findings = verbose_stack_trace_findings(PYTHON_TRACEBACK);
+        let finding = findings
+            .first()
+            .expect("python traceback should fire detector");
+        assert_eq!(finding.severity, Severity::Low);
+        assert_eq!(finding.confidence, Some(FindingConfidence::High));
+        assert!(finding.evidence.starts_with("Traceback (most recent call last):"));
+        assert!(finding.evidence.chars().count() <= 201, "evidence over budget: {}", finding.evidence);
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_fires_on_java_stack_trace() {
+        let findings = verbose_stack_trace_findings(JAVA_STACK_TRACE);
+        assert!(
+            findings.len() >= 2,
+            "expected multiple Java frames to fire, got {}",
+            findings.len()
+        );
+        for finding in &findings {
+            assert_eq!(finding.severity, Severity::Low);
+            assert_eq!(finding.confidence, Some(FindingConfidence::High));
+        }
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_fires_on_dotnet_ysod() {
+        let findings = verbose_stack_trace_findings(DOTNET_YSOD);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.evidence.contains("Server Error in")
+                    || finding.evidence.contains("NullReferenceException")),
+            "expected .NET YSOD finding, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_fires_on_rails_diagnostic_page() {
+        let findings = verbose_stack_trace_findings(RAILS_DIAGNOSTIC);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.evidence.contains("Action Controller")
+                    || finding.evidence.contains("ActiveRecord::RecordNotFound")),
+            "expected Rails finding, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_fires_on_node_type_error() {
+        let findings = verbose_stack_trace_findings(NODE_JS_ERROR);
+        let finding = findings
+            .first()
+            .expect("node TypeError should fire detector");
+        assert!(
+            finding.evidence.starts_with("TypeError:"),
+            "expected TypeError prefix, got {:?}",
+            finding.evidence
+        );
+        assert_eq!(finding.confidence, Some(FindingConfidence::High));
+    }
+
+    #[test]
+    fn verbose_stack_trace_detector_does_not_fire_on_benign_html() {
+        let benign = concat!(
+            "<!DOCTYPE html>\n",
+            "<html>\n",
+            "  <head><title>Welcome</title></head>\n",
+            "  <body>\n",
+            "    <h1>Hello, world!</h1>\n",
+            "    <p>This is a normal landing page describing our company at example.com.</p>\n",
+            "    <p>We use Java for our backend (compiled at com pile time) but no traces here.</p>\n",
+            "  </body>\n",
+            "</html>\n"
+        );
+        let findings = verbose_stack_trace_findings(benign);
+        assert!(
+            findings.is_empty(),
+            "benign HTML should not produce findings: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn verbose_stack_trace_evidence_is_truncated_to_two_hundred_characters() {
+        // The Node.js alternation matches a span that includes the error
+        // message, so a long message lets us exercise truncation.
+        let long_message = "x".repeat(400);
+        let body = format!(
+            "TypeError: {long_message}\n    at handler (/srv/api/handler.js:42:18)\n",
+        );
+        let findings = verbose_stack_trace_findings(&body);
+        let finding = findings
+            .first()
+            .expect("long type error should still fire detector");
+        assert!(
+            finding.evidence.ends_with('…'),
+            "expected truncation marker, evidence={}",
+            finding.evidence
+        );
+        // 200 ASCII bytes + 1 ellipsis char = 201 chars maximum.
+        assert!(
+            finding.evidence.chars().count() <= 201,
+            "evidence over budget: {} chars",
+            finding.evidence.chars().count()
+        );
     }
 }
