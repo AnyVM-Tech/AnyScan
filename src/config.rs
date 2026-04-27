@@ -489,6 +489,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "dependency-manifests",
     "container-orchestration",
     "cicd-configs",
+    "mobile-artifacts",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -1027,6 +1028,33 @@ const CONTAINER_ORCHESTRATION_PATHS: &[&str] = &[
     "/manifests/deployment.yaml",
     "/devcontainer.json",
     "/.devcontainer/devcontainer.json",
+];
+
+const MOBILE_ARTIFACT_PATHS: &[&str] = &[
+    "/.well-known/apple-app-site-association",
+    "/apple-app-site-association",
+    "/.well-known/assetlinks.json",
+    "/assetlinks.json",
+    "/AndroidManifest.xml",
+    "/Manifest.xml",
+    "/Info.plist",
+    "/iTunesArtwork",
+    "/iTunesArtwork@2x",
+    "/.well-known/appspecific/com.chrome.devtools.json",
+    "/.well-known/com.apple.deviceenrollment",
+    "/profile.mobileconfig",
+    "/enroll.mobileconfig",
+    "/airwatch.mobileconfig",
+    "/jamfagent.mobileconfig",
+    "/com.apple.profile",
+    "/manifest.plist",
+    "/IPAExport.plist",
+    "/google-services.json",
+    "/GoogleService-Info.plist",
+    "/firebase.json",
+    "/.firebaserc",
+    "/expo-go.json",
+    "/app.json",
 ];
 
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
@@ -1575,6 +1603,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "dependency-manifests" => Some(DEPENDENCY_MANIFEST_PATHS),
         "container-orchestration" => Some(CONTAINER_ORCHESTRATION_PATHS),
         "cicd-configs" => Some(CICD_CONFIG_PATHS),
+        "mobile-artifacts" => Some(MOBILE_ARTIFACT_PATHS),
         _ => None,
     }
 }
