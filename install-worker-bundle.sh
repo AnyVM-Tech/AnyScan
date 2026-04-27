@@ -54,6 +54,8 @@ AGENT_BINARY_SOURCE_FILE="${AGENT_BINARY_SOURCE_FILE:-$BUNDLE_ROOT/bin/agentd}"
 AGENT_BINARY_DEST_FILE="${AGENT_BINARY_DEST_FILE:-$BIN_DIR/agentd}"
 REMOTE_UPDATE_HELPER_SOURCE_FILE="${REMOTE_UPDATE_HELPER_SOURCE_FILE:-$BUNDLE_ROOT/bin/agentd-remote-update.sh}"
 REMOTE_UPDATE_HELPER_DEST_FILE="${REMOTE_UPDATE_HELPER_DEST_FILE:-$BIN_DIR/agentd-remote-update.sh}"
+RESERVE_BANDWIDTH_HELPER_SOURCE_FILE="${RESERVE_BANDWIDTH_HELPER_SOURCE_FILE:-$BUNDLE_ROOT/bin/reserve-control-bandwidth.sh}"
+RESERVE_BANDWIDTH_HELPER_DEST_FILE="${RESERVE_BANDWIDTH_HELPER_DEST_FILE:-$BIN_DIR/reserve-control-bandwidth.sh}"
 DEFAULT_REMOTE_UPDATE_INSTALLER_URL="${DEFAULT_REMOTE_UPDATE_INSTALLER_URL:-}"
 INSTALL_CONTROL_URL_OVERRIDE="${INSTALL_CONTROL_URL_OVERRIDE:-}"
 INSTALL_MANAGEMENT_URL_OVERRIDE="${INSTALL_MANAGEMENT_URL_OVERRIDE:-}"
@@ -173,8 +175,13 @@ apply_host_resource_defaults() {
     fi
 
     if [ -x "$VULNSCANNER_BIN_DEST" ]; then
+        # Cap zmap at ~100k pps by default. With 60-byte SYN probes that is
+        # about 50 Mbit/s — well under a 1 Gbit NIC ceiling, leaving plenty
+        # of headroom for the agentd control plane even if the tc reservation
+        # below fails to install. Operators can raise or remove the cap by
+        # editing SCANNER_DEFAULT_RATE in the runtime env.
         if [ -z "$(env_value "SCANNER_DEFAULT_RATE" "$RUNTIME_ENV_FILE" || true)" ]; then
-            upsert_env_value "SCANNER_DEFAULT_RATE" "0" "$RUNTIME_ENV_FILE"
+            upsert_env_value "SCANNER_DEFAULT_RATE" "100000" "$RUNTIME_ENV_FILE"
         fi
         if [ -z "$(env_value "SCANNER_SENDER_THREADS" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "SCANNER_SENDER_THREADS" "$cpu_threads" "$RUNTIME_ENV_FILE"
@@ -188,6 +195,18 @@ apply_host_resource_defaults() {
         if [ -z "$(env_value "SCANNER_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
             upsert_env_value "SCANNER_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
         fi
+    fi
+
+    # Defaults for the egress bandwidth reservation that ExecStartPre installs.
+    # These can all be overridden in /etc/agentd/runtime.env after install.
+    if [ -z "$(env_value "ANYSCAN_RESERVE_BANDWIDTH_BPS" "$RUNTIME_ENV_FILE" || true)" ]; then
+        upsert_env_value "ANYSCAN_RESERVE_BANDWIDTH_BPS" "5000000" "$RUNTIME_ENV_FILE"
+    fi
+    if [ -z "$(env_value "ANYSCAN_RESERVE_LINK_RATE_BPS" "$RUNTIME_ENV_FILE" || true)" ]; then
+        upsert_env_value "ANYSCAN_RESERVE_LINK_RATE_BPS" "1000000000" "$RUNTIME_ENV_FILE"
+    fi
+    if [ -z "$(env_value "ANYSCAN_RESERVE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
+        upsert_env_value "ANYSCAN_RESERVE_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
     fi
 }
 
@@ -417,6 +436,9 @@ main() {
     install -m 0755 "$AGENT_BINARY_SOURCE_FILE" "$AGENT_BINARY_DEST_FILE"
     if [ -f "$REMOTE_UPDATE_HELPER_SOURCE_FILE" ]; then
         install -m 0755 "$REMOTE_UPDATE_HELPER_SOURCE_FILE" "$REMOTE_UPDATE_HELPER_DEST_FILE"
+    fi
+    if [ -f "$RESERVE_BANDWIDTH_HELPER_SOURCE_FILE" ]; then
+        install -m 0755 "$RESERVE_BANDWIDTH_HELPER_SOURCE_FILE" "$RESERVE_BANDWIDTH_HELPER_DEST_FILE"
     fi
 
     printf '[*] Installing extension assets...\n'

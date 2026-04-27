@@ -10,6 +10,12 @@ Group=agentd
 WorkingDirectory=/opt/agentd
 EnvironmentFile=-/etc/agentd/runtime.env
 EnvironmentFile=-/var/lib/agentd/agent.env
+# Reserve egress bandwidth for control-plane heartbeats so a saturated zmap
+# scan cannot starve agentd off the worker registry. Runs as root (the `+`
+# prefix bypasses User=/AmbientCapabilities=) and fails-open: the script
+# itself returns 0 even if tc/iptables policy rejects the change.
+ExecStartPre=+/opt/agentd/bin/reserve-control-bandwidth.sh apply
+ExecStopPost=+/opt/agentd/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/agentd/bin/agentd daemon
 Restart=always
 RestartSec=5
