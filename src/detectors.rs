@@ -3519,6 +3519,45 @@ fn push_plugin_finding_candidate(
     service_protocol: Option<&str>,
     service_port: Option<u16>,
 ) {
+    push_plugin_finding_candidate_with_signals(
+        findings,
+        seen,
+        document,
+        plugin_id,
+        detector_name,
+        severity,
+        redacted_value,
+        evidence,
+        product_name,
+        product_version,
+        cpe,
+        cve_ids,
+        kev_matched,
+        service_protocol,
+        service_port,
+        Vec::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_plugin_finding_candidate_with_signals(
+    findings: &mut Vec<FindingCandidate>,
+    seen: &mut HashSet<String>,
+    document: &FetchedDocument,
+    plugin_id: &str,
+    detector_name: &str,
+    severity: Severity,
+    redacted_value: &str,
+    evidence: &str,
+    product_name: Option<&str>,
+    product_version: Option<&str>,
+    cpe: Option<&str>,
+    cve_ids: &[&str],
+    kev_matched: Option<bool>,
+    service_protocol: Option<&str>,
+    service_port: Option<u16>,
+    matched_signals: Vec<String>,
+) {
     let redacted_value = redacted_value.trim();
     if redacted_value.is_empty() {
         return;
@@ -3542,7 +3581,7 @@ fn push_plugin_finding_candidate(
         evidence: evidence.trim().to_string(),
         fingerprint,
         confidence: None,
-        matched_signals: Vec::new(),
+        matched_signals,
         review_labels: Vec::new(),
         plugin_metadata: build_plugin_metadata(
             plugin_id,
@@ -4887,16 +4926,14 @@ fn scan_phase_one_passive_http_plugins(
         }
     }
 
-    if lowered_path.contains("swagger")
-        || lowered_path.contains("openapi")
-        || lowered_path.contains("api-docs")
-        || lowered_body.contains("swagger-ui")
-        || lowered_body.contains("\"openapi\"")
-        || lowered_body.contains("\"swagger\"")
-        || lowered_body.contains("openapi:")
-        || lowered_body.contains("swagger:")
-    {
-        push_plugin_finding_candidate(
+    if let Some(swagger_match) = match_swagger_ui_signal(document) {
+        let evidence = build_plugin_evidence(
+            document,
+            swagger_match.start,
+            swagger_match.end,
+            &swagger_match.matched,
+        );
+        push_plugin_finding_candidate_with_signals(
             findings,
             seen,
             document,
@@ -4904,7 +4941,7 @@ fn scan_phase_one_passive_http_plugins(
             "swagger_api_description_public",
             Severity::Medium,
             "swagger/openapi description",
-            "Swagger or OpenAPI markers were observed in a public response.",
+            &evidence,
             Some("OpenAPI"),
             None,
             None,
@@ -4912,6 +4949,7 @@ fn scan_phase_one_passive_http_plugins(
             None,
             Some("http"),
             infer_service_port(document),
+            vec![swagger_match.matched],
         );
     }
 
@@ -6212,7 +6250,262 @@ fn unique_char_count(value: &str) -> usize {
     value.chars().collect::<HashSet<_>>().len()
 }
 
+struct SwaggerSignal {
+    matched: String,
+    start: usize,
+    end: usize,
+}
+
+static SWAGGER_JSON_KEY_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#""(?:openapi|swagger)"\s*:"#).expect("valid regex")
+});
+
+fn match_swagger_ui_signal(document: &FetchedDocument) -> Option<SwaggerSignal> {
+    if !(200..300).contains(&document.status) {
+        return None;
+    }
+
+    let body = &document.body;
+    if body.len() < 50 {
+        return None;
+    }
+
+    let lowered_path = document.path.to_ascii_lowercase();
+    // Strip query string and fragment before suffix matching: paths like
+    // `/v3/api-docs?group=internal` are common grouped-spec routes and would
+    // otherwise fail every suffix check below.
+    let path_without_query = lowered_path
+        .split_once('?')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(&lowered_path);
+    let path_without_fragment = path_without_query
+        .split_once('#')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(path_without_query);
+    let normalized_path = path_without_fragment.trim_end_matches('/');
+    let content_type = document
+        .content_type
+        .as_deref()
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let json_spec_path = matches_path_suffix(
+        normalized_path,
+        &[
+            "/openapi.json",
+            "/swagger.json",
+            "/v2/api-docs",
+            "/v3/api-docs",
+            "/api-docs.json",
+            "/openapi/v2",
+            "/openapi/v3",
+            "/openapi/v2.json",
+            "/openapi/v3.json",
+            // /api-docs is ambiguous — many servers serve raw Swagger/OpenAPI
+            // JSON here while others serve the UI page; content-type below
+            // decides which validator actually runs.
+            "/api-docs",
+        ],
+    );
+    let yaml_spec_path = matches_path_suffix(
+        normalized_path,
+        &[
+            "/openapi.yml",
+            "/openapi.yaml",
+            "/swagger.yml",
+            "/swagger.yaml",
+        ],
+    );
+    let ui_path = lowered_path.contains("/swagger-ui")
+        || matches_path_suffix(
+            normalized_path,
+            &[
+                "/swagger",
+                "/api-docs",
+                "/swagger/index.html",
+                "/swagger/index.htm",
+            ],
+        );
+
+    if json_spec_path && content_type_compatible(&content_type, &["json"]) {
+        if let Some(signal) = validate_swagger_json_spec(body) {
+            return Some(signal);
+        }
+    }
+
+    if yaml_spec_path && content_type_compatible(&content_type, &["yaml", "yml", "text/plain"]) {
+        if let Some(signal) = validate_swagger_yaml_spec(body) {
+            return Some(signal);
+        }
+    }
+
+    if ui_path && content_type_compatible(&content_type, &["html"]) {
+        if let Some(signal) = validate_swagger_ui_html(body) {
+            return Some(signal);
+        }
+    }
+
+    if !json_spec_path
+        && !yaml_spec_path
+        && !ui_path
+        && content_type_compatible(&content_type, &["html"])
+    {
+        if let Some(signal) = validate_swagger_ui_html(body) {
+            return Some(signal);
+        }
+    }
+
+    None
+}
+
+fn matches_path_suffix(normalized_path: &str, suffixes: &[&str]) -> bool {
+    suffixes
+        .iter()
+        .any(|candidate| normalized_path == *candidate || normalized_path.ends_with(*candidate))
+}
+
+fn content_type_compatible(content_type: &str, expected_fragments: &[&str]) -> bool {
+    if content_type.is_empty() {
+        return true;
+    }
+    expected_fragments
+        .iter()
+        .any(|fragment| content_type.contains(fragment))
+}
+
+fn validate_swagger_json_spec(body: &str) -> Option<SwaggerSignal> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+
+    let scan_len = clamp_to_char_boundary(body, 4096);
+    let lowered = body[..scan_len].to_ascii_lowercase();
+
+    let mat = SWAGGER_JSON_KEY_RE.find(&lowered)?;
+    let start = mat.start();
+    let end = mat.end();
+    Some(SwaggerSignal {
+        matched: body[start..end].to_string(),
+        start,
+        end,
+    })
+}
+
+fn validate_swagger_yaml_spec(body: &str) -> Option<SwaggerSignal> {
+    // Walk lines from the top, skipping YAML prologue (directives `%...`,
+    // document markers `---`/`...`, comment lines `#...`, blanks). The first
+    // real content line must start with `openapi:` or `swagger:`.
+    let bytes = body.as_bytes();
+    let mut cursor = 0usize;
+    let mut iterations = 0usize;
+
+    while cursor < body.len() && iterations < 64 {
+        iterations += 1;
+
+        let line_end = body[cursor..]
+            .find('\n')
+            .map(|offset| cursor + offset)
+            .unwrap_or(body.len());
+        let trimmed_line_end = if line_end > cursor && bytes[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line = &body[cursor..trimmed_line_end];
+        let trimmed_line = line.trim_start();
+        let content_start = cursor + (line.len() - trimmed_line.len());
+
+        let is_blank = trimmed_line.is_empty();
+        let is_comment = trimmed_line.starts_with('#');
+        let is_directive = trimmed_line.starts_with('%');
+        let is_doc_marker = trimmed_line == "---"
+            || trimmed_line == "..."
+            || (trimmed_line.starts_with("---")
+                && trimmed_line
+                    .as_bytes()
+                    .get(3)
+                    .copied()
+                    .is_some_and(|b| b == b' ' || b == b'\t' || b == b'#'));
+
+        if !(is_blank || is_comment || is_directive || is_doc_marker) {
+            let lowered = trimmed_line.to_ascii_lowercase();
+            for prefix in ["openapi:", "swagger:"] {
+                if lowered.starts_with(prefix) {
+                    let start = content_start;
+                    let end = content_start + prefix.len();
+                    return Some(SwaggerSignal {
+                        matched: body[start..end].to_string(),
+                        start,
+                        end,
+                    });
+                }
+            }
+            return None;
+        }
+
+        if line_end >= body.len() {
+            break;
+        }
+        cursor = line_end + 1;
+    }
+
+    None
+}
+
+fn validate_swagger_ui_html(body: &str) -> Option<SwaggerSignal> {
+    let scan_len = clamp_to_char_boundary(body, 16_384);
+    let lowered = body[..scan_len].to_ascii_lowercase();
+
+    for candidate in [
+        "swagger-ui-bundle.js",
+        "swagger-ui-standalone-preset",
+        "swagger-ui-dist",
+        "swagger-ui.css",
+    ] {
+        if let Some(start) = lowered.find(candidate) {
+            let end = start + candidate.len();
+            return Some(SwaggerSignal {
+                matched: body[start..end].to_string(),
+                start,
+                end,
+            });
+        }
+    }
+    None
+}
+
+fn clamp_to_char_boundary(body: &str, max_bytes: usize) -> usize {
+    if body.len() <= max_bytes {
+        return body.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !body.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
 fn build_evidence(document: &FetchedDocument, start: usize, end: usize, matched: &str) -> String {
+    build_evidence_with_render(document, start, end, matched, &redact_secret(matched))
+}
+
+fn build_plugin_evidence(
+    document: &FetchedDocument,
+    start: usize,
+    end: usize,
+    matched: &str,
+) -> String {
+    build_evidence_with_render(document, start, end, matched, matched)
+}
+
+fn build_evidence_with_render(
+    document: &FetchedDocument,
+    start: usize,
+    end: usize,
+    matched: &str,
+    rendered_match: &str,
+) -> String {
     let line_number = document.body[..start]
         .bytes()
         .filter(|byte| *byte == b'\n')
@@ -6232,7 +6525,7 @@ fn build_evidence(document: &FetchedDocument, start: usize, end: usize, matched:
 
     let prefix = abbreviate_suffix(&line[..match_start_in_line], 48);
     let suffix = abbreviate_prefix(&line[match_end_in_line..], 48);
-    let excerpt = format!("{prefix}{}{suffix}", redact_secret(matched));
+    let excerpt = format!("{prefix}{rendered_match}{suffix}");
     let content_type = document.content_type.as_deref().unwrap_or("unknown");
     let truncated = if document.truncated {
         ", truncated"
@@ -9235,6 +9528,539 @@ mod tests {
             !findings
                 .iter()
                 .any(|finding| finding.detector == "weak_csp_unsafe_directives")
+        );
+    }
+
+    fn swagger_document(
+        path: &str,
+        status: u16,
+        content_type: Option<&str>,
+        body: &str,
+    ) -> FetchedDocument {
+        FetchedDocument {
+            path: path.to_string(),
+            url: format!("https://example.test{path}"),
+            status,
+            content_type: content_type.map(|value| value.to_string()),
+            headers: vec![("Strict-Transport-Security".to_string(), "max-age=31536000".to_string())],
+            body: body.to_string(),
+            truncated: false,
+            coverage_source: "test-seed".to_string(),
+        }
+    }
+
+    fn has_swagger_ui_finding(findings: &[FindingCandidate]) -> bool {
+        findings.iter().any(|finding| {
+            finding
+                .plugin_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.plugin_id == "SwaggerUIPlugin")
+        })
+    }
+
+    fn find_swagger_ui_finding(findings: &[FindingCandidate]) -> Option<&FindingCandidate> {
+        findings.iter().find(|finding| {
+            finding
+                .plugin_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.plugin_id == "SwaggerUIPlugin")
+        })
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_non_2xx_spec_paths() {
+        let engine = DetectorEngine::new();
+        let body = "<html><title>403 Forbidden</title>nothing here</html>";
+        for status in [400_u16, 403, 404, 500, 502] {
+            let findings = engine.scan_document(&swagger_document(
+                "/openapi.json",
+                status,
+                Some("text/html"),
+                body,
+            ));
+            assert!(
+                !has_swagger_ui_finding(&findings),
+                "SwaggerUIPlugin should not fire on HTTP {status} response"
+            );
+        }
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_html_without_swagger_ui_keywords() {
+        let engine = DetectorEngine::new();
+        let body = "<html><body>Welcome to a parked domain.</body></html>";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "SwaggerUIPlugin must require swagger/openapi structural evidence on JSON spec paths"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_json_lacking_openapi_or_swagger_keys() {
+        let engine = DetectorEngine::new();
+        let body = "{\"hello\":\"world\",\"items\":[1,2,3,4,5,6,7,8,9,10,11,12]}";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "SwaggerUIPlugin must require an openapi/swagger top-level key on JSON spec paths"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_tiny_bodies() {
+        let engine = DetectorEngine::new();
+        let body = "{}";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "SwaggerUIPlugin must ignore bodies under 50 bytes"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_openapi_3_json_spec() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Example API", "version": "1.0.0" },
+  "paths": { "/widgets": { "get": { "summary": "List widgets" } } }
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        let finding =
+            find_swagger_ui_finding(&findings).expect("OpenAPI 3.x JSON spec should match");
+        let signal = finding
+            .matched_signals
+            .iter()
+            .find(|s| s.contains("openapi"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "matched_signals must record the matched substring, got {:?}",
+                    finding.matched_signals
+                )
+            });
+        assert!(
+            signal.contains(':'),
+            "matched_signal must include the JSON key colon, got {signal:?}"
+        );
+        assert!(
+            finding.evidence.contains("status=200"),
+            "evidence should include status code, got {:?}",
+            finding.evidence
+        );
+        assert!(
+            !finding.evidence.contains("****"),
+            "evidence must not redact non-secret swagger markers, got {:?}",
+            finding.evidence
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_swagger_2_json_spec() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Legacy API", "version": "0.0.1" },
+  "host": "example.test",
+  "basePath": "/v1",
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/v2/api-docs",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        let finding =
+            find_swagger_ui_finding(&findings).expect("Swagger 2.0 JSON spec should match");
+        assert!(
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal.contains("swagger")),
+            "matched_signals must record the matched substring, got {:?}",
+            finding.matched_signals
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_swagger_ui_html() {
+        let engine = DetectorEngine::new();
+        let body = r#"<!doctype html>
+<html>
+  <head><title>Swagger UI</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="./swagger-ui-bundle.js"></script>
+  </body>
+</html>"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger-ui/",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        let finding =
+            find_swagger_ui_finding(&findings).expect("swagger-ui HTML page should match");
+        assert!(
+            finding
+                .matched_signals
+                .iter()
+                .any(|signal| signal == "swagger-ui-bundle.js"),
+            "matched_signals must capture the swagger-ui bundle reference, got {:?}",
+            finding.matched_signals
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_yaml_spec_without_openapi_prefix() {
+        let engine = DetectorEngine::new();
+        let body = "title: Some Document\nversion: 1.0\ndescription: not actually a spec\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("text/yaml"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "YAML spec path requires the body to start with openapi: or swagger:"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_json_with_swagger_only_in_string_value() {
+        let engine = DetectorEngine::new();
+        let body = r#"{"message":"swagger is great","detail":"this is not an openapi spec at all, just a regular response payload"}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "JSON value containing the word `swagger` is not a key and must not match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_json_spec_path_with_html_content_type() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Example API", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("text/html; charset=utf-8"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "JSON spec path with text/html content-type must not match (content-type gate)"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_yaml_spec_path_with_json_content_type() {
+        let engine = DetectorEngine::new();
+        let body =
+            "openapi: 3.0.3\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "YAML spec path with application/json content-type must not match (content-type gate)"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_captures_exact_case_of_matched_substring() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "OpenAPI": "3.0.3",
+  "info": { "title": "Example API", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        let finding = find_swagger_ui_finding(&findings)
+            .expect("mixed-case OpenAPI key should still match");
+        let signal = finding
+            .matched_signals
+            .first()
+            .expect("matched_signals must be populated");
+        assert!(
+            signal.contains("OpenAPI"),
+            "matched_signal must preserve the original body casing, got {signal:?}"
+        );
+        assert!(
+            finding.evidence.contains("OpenAPI"),
+            "evidence snippet must preserve original casing, got {:?}",
+            finding.evidence
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_kubernetes_openapi_v2_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Kubernetes", "version": "v1.28.0" },
+  "paths": { "/api/v1/namespaces": { "get": { "summary": "List namespaces" } } }
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi/v2",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Kubernetes /openapi/v2 returning Swagger 2.0 JSON must match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_kubernetes_openapi_v3_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.0",
+  "info": { "title": "Kubernetes", "version": "v1.28.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi/v3",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Kubernetes /openapi/v3 returning OpenAPI 3.x JSON must match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_dotnet_swagger_v1_json_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Example .NET API", "version": "v1" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger/v1/swagger.json",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/swagger/v1/swagger.json must reach the JSON validator (matches /swagger.json suffix)"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_api_docs_serving_raw_json() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Express API", "version": "1.0.0" },
+  "paths": { "/users": { "get": { "summary": "List users" } } }
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/api-docs",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/api-docs serving raw OpenAPI JSON must reach the JSON validator"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_still_matches_api_docs_serving_html_ui() {
+        let engine = DetectorEngine::new();
+        let body = r#"<!doctype html>
+<html>
+  <head><title>API Docs</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="./swagger-ui-bundle.js"></script>
+  </body>
+</html>"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/api-docs",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/api-docs serving HTML swagger-ui page must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_document_marker_prologue() {
+        let engine = DetectorEngine::new();
+        let body =
+            "---\nopenapi: 3.0.3\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with leading `---` document marker must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_comment_prologue() {
+        let engine = DetectorEngine::new();
+        let body = "# Generated from internal source\n# Do not edit by hand\nopenapi: 3.0.3\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with leading comment lines must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_yaml_spec_with_directive_and_marker_prologue() {
+        let engine = DetectorEngine::new();
+        let body = "%YAML 1.2\n---\n# Generated\nswagger: \"2.0\"\ninfo:\n  title: Example API\n  version: 1.0.0\npaths: {}\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "YAML spec with directive + document marker + comment prologue must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_skips_yaml_when_first_real_line_is_not_openapi_key() {
+        let engine = DetectorEngine::new();
+        let body =
+            "---\ntitle: Some YAML doc\nopenapi: 3.0.3\ninfo:\n  title: Example API\n";
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.yaml",
+            200,
+            Some("application/yaml"),
+            body,
+        ));
+        assert!(
+            !has_swagger_ui_finding(&findings),
+            "YAML where openapi: is not the FIRST content key must not match (the spec key must be at the document root)"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_grouped_spec_path_with_query_string() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "openapi": "3.0.3",
+  "info": { "title": "Grouped Spec", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/v3/api-docs?group=internal",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Grouped-spec route /v3/api-docs?group=internal must reach the JSON validator"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_spec_path_with_fragment() {
+        let engine = DetectorEngine::new();
+        let body = r#"{
+  "swagger": "2.0",
+  "info": { "title": "Fragmented", "version": "1.0.0" },
+  "paths": {}
+}"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/openapi.json#section",
+            200,
+            Some("application/json"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "Spec path with URL fragment must still match"
+        );
+    }
+
+    #[test]
+    fn swagger_ui_plugin_matches_swagger_index_html_ui_path() {
+        let engine = DetectorEngine::new();
+        let body = r#"<!doctype html>
+<html>
+  <head><title>Swagger</title></head>
+  <body>
+    <div id="swagger-ui"></div>
+    <link rel="stylesheet" href="./swagger-ui.css">
+  </body>
+</html>"#;
+        let findings = engine.scan_document(&swagger_document(
+            "/swagger/index.html",
+            200,
+            Some("text/html"),
+            body,
+        ));
+        assert!(
+            has_swagger_ui_finding(&findings),
+            "/swagger/index.html with swagger-ui assets must match"
         );
     }
 }
