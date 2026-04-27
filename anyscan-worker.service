@@ -15,9 +15,12 @@ EnvironmentFile=-/etc/anyscan/runtime.env
 ExecStartPre=+/opt/anyscan/bin/reserve-control-bandwidth.sh apply
 # Bump kernel queues + NIC txqueuelen so the scanner is not throttled by
 # default sysctl values. Companion to the bandwidth reservation above; the
-# helper is idempotent and fails open. `+` runs as root so sysctl writes
-# bypass ProtectKernelTunables=true on this unit.
-ExecStartPre=+/opt/anyscan/bin/tune-scanner-host.sh apply
+# helper is idempotent and fails open. `-+` runs as root (so sysctl writes
+# bypass ProtectKernelTunables=true) and tells systemd to ignore failures,
+# so partial upgrades that have not yet shipped the helper do not block
+# the worker from starting; the persistent /etc/sysctl.d drop-in still
+# gets reapplied at the next boot or remote update.
+ExecStartPre=-+/opt/anyscan/bin/tune-scanner-host.sh apply
 ExecStopPost=+/opt/anyscan/bin/reserve-control-bandwidth.sh release
 ExecStart=/opt/anyscan/bin/anyscan-worker daemon
 Restart=always
