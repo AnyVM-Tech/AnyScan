@@ -6848,4 +6848,79 @@ paths:
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn modern_token_detectors_fire_on_jwt_alg_none_through_fetcher() {
+        use crate::detectors::DetectorEngine;
+
+        let app = Router::new().route(
+            "/",
+            get(|| async {
+                let alg_none_jwt =
+                    "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIn0.";
+                Html(format!(
+                    "<html><body>session token={alg_none_jwt}</body></html>"
+                ))
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should report local addr");
+        let base_url = format!("http://{address}");
+        let server: JoinHandle<()> = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should stay available")
+        });
+
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 1;
+        config.scan.max_discovered_paths_per_target = 1;
+        config.scan.enable_path_discovery = false;
+        config
+            .validate()
+            .expect("test config should validate");
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 9_001,
+            label: "jwt-alg-none-live".to_string(),
+            base_url,
+            paths: vec!["/".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Hybrid,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("live fetch should succeed");
+        assert!(
+            !report.documents.is_empty(),
+            "expected at least one fetched document"
+        );
+
+        let engine = DetectorEngine::new();
+        let mut detectors = std::collections::HashSet::new();
+        for document in &report.documents {
+            for finding in engine.scan_document(document) {
+                detectors.insert(finding.detector);
+            }
+        }
+        assert!(
+            detectors.contains("jwt_alg_none"),
+            "live HTTP fetch did not surface jwt_alg_none finding; saw {detectors:?}"
+        );
+
+        server.abort();
+    }
 }

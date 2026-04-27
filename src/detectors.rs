@@ -162,6 +162,16 @@ static STRIPE_LIVE_KEY: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b").expect("valid regex"));
 static GITLAB_PAT: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\bglpat-[A-Za-z0-9_-]{20,}\b").expect("valid regex"));
+static GITHUB_PAT_FINE_GRAINED: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\bgithub_pat_[A-Za-z0-9_]{82}\b").expect("valid regex"));
+static CLOUDFLARE_API_TOKEN_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b[A-Za-z0-9_-]{40}\b").expect("valid regex"));
+static DATADOG_API_KEY_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b[a-f0-9]{32}\b").expect("valid regex"));
+static JWT_TOKEN_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+        .expect("valid regex")
+});
 static HUGGINGFACE_TOKEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\bhf_[A-Za-z0-9]{20,}\b").expect("valid regex"));
 static SENDGRID_KEY: Lazy<Regex> = Lazy::new(|| {
@@ -456,6 +466,12 @@ static DETECTORS: Lazy<Vec<DetectorDefinition>> = Lazy::new(|| {
             &["AKIA"],
         ),
         exact_detector(
+            "github_pat_fine_grained",
+            Severity::High,
+            &GITHUB_PAT_FINE_GRAINED,
+            &["github_pat_"],
+        ),
+        exact_detector(
             "github_personal_access_token",
             Severity::High,
             &GITHUB_PAT,
@@ -625,6 +641,37 @@ static DETECTORS: Lazy<Vec<DetectorDefinition>> = Lazy::new(|| {
                 ],
             },
             scan_kubeconfig_credentials,
+        ),
+        structured_detector(
+            "cloudflare_api_token",
+            Severity::High,
+            DetectorPrefilter::BodyContainsAny(&[
+                "cloudflare",
+                "Cloudflare",
+                "CLOUDFLARE",
+                "CF_API_TOKEN",
+                "X-Auth-Email",
+            ]),
+            scan_cloudflare_api_tokens,
+        ),
+        structured_detector(
+            "datadog_api_key",
+            Severity::High,
+            DetectorPrefilter::BodyContainsAny(&[
+                "datadog",
+                "Datadog",
+                "DATADOG",
+                "DD_API_KEY",
+                "DD_APP_KEY",
+                "dd-agent",
+            ]),
+            scan_datadog_api_keys,
+        ),
+        structured_detector(
+            "jwt_alg_none",
+            Severity::High,
+            DetectorPrefilter::BodyContainsAny(&["eyJ"]),
+            scan_jwt_alg_none_tokens,
         ),
     ]
 });
@@ -3030,6 +3077,98 @@ fn scan_kubeconfig_credentials(document: &FetchedDocument) -> Vec<StructuredMatc
 
     let mut matches = Vec::new();
     collect_kubeconfig_credentials(document, &yaml, &mut matches);
+    matches
+}
+
+const CONTEXT_WINDOW_CHARS: usize = 80;
+
+fn body_window_around<'a>(body: &'a str, start: usize, end: usize) -> &'a str {
+    let mut window_start = start.saturating_sub(CONTEXT_WINDOW_CHARS);
+    let mut window_end = end.saturating_add(CONTEXT_WINDOW_CHARS).min(body.len());
+    while window_start > 0 && !body.is_char_boundary(window_start) {
+        window_start -= 1;
+    }
+    while window_end < body.len() && !body.is_char_boundary(window_end) {
+        window_end += 1;
+    }
+    &body[window_start..window_end]
+}
+
+fn scan_contextual_token_matches<'a>(
+    document: &'a FetchedDocument,
+    regex: &Regex,
+    context_keywords: &[&str],
+) -> Vec<StructuredMatch> {
+    let mut matches = Vec::new();
+    let body = document.body.as_str();
+    for matched in regex.find_iter(body) {
+        let window = body_window_around(body, matched.start(), matched.end());
+        let lowered_window = window.to_ascii_lowercase();
+        let has_context = context_keywords
+            .iter()
+            .any(|keyword| lowered_window.contains(&keyword.to_ascii_lowercase()));
+        if !has_context {
+            continue;
+        }
+        let token = matched.as_str();
+        if looks_like_placeholder_secret(token) {
+            continue;
+        }
+        matches.push(StructuredMatch {
+            start: matched.start(),
+            end: matched.end(),
+            evidence_value: token.to_string(),
+            secret_value: token.to_string(),
+        });
+    }
+    matches
+}
+
+fn scan_cloudflare_api_tokens(document: &FetchedDocument) -> Vec<StructuredMatch> {
+    scan_contextual_token_matches(
+        document,
+        &CLOUDFLARE_API_TOKEN_RE,
+        &["cloudflare", "cf_api_token", "x-auth-email"],
+    )
+}
+
+fn scan_datadog_api_keys(document: &FetchedDocument) -> Vec<StructuredMatch> {
+    scan_contextual_token_matches(
+        document,
+        &DATADOG_API_KEY_RE,
+        &["datadog", "dd_api_key", "dd_app_key", "dd-agent"],
+    )
+}
+
+fn scan_jwt_alg_none_tokens(document: &FetchedDocument) -> Vec<StructuredMatch> {
+    let mut matches = Vec::new();
+    for matched in JWT_TOKEN_RE.find_iter(&document.body) {
+        let token = matched.as_str();
+        let Some(header_b64) = token.split('.').next() else {
+            continue;
+        };
+        let Ok(header_bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(header_b64)
+        else {
+            continue;
+        };
+        let Ok(header_json) = serde_json::from_slice::<JsonValue>(&header_bytes) else {
+            continue;
+        };
+        let alg_is_none = header_json
+            .get("alg")
+            .and_then(|value| value.as_str())
+            .map(|alg| alg.eq_ignore_ascii_case("none"))
+            .unwrap_or(false);
+        if !alg_is_none {
+            continue;
+        }
+        matches.push(StructuredMatch {
+            start: matched.start(),
+            end: matched.end(),
+            evidence_value: token.to_string(),
+            secret_value: token.to_string(),
+        });
+    }
     matches
 }
 
@@ -8567,5 +8706,116 @@ mod tests {
             "evidence over budget: {} chars",
             finding.evidence.chars().count()
         );
+    }
+
+    #[test]
+    fn modern_token_detector_fires_on_github_pat_fine_grained_format() {
+        let engine = DetectorEngine::new();
+        // 11 chars `github_pat_` + 82 alnum/_ chars
+        let token = format!(
+            "github_pat_{}",
+            "A1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zABCDE_FGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop"
+        );
+        assert_eq!(token.len() - "github_pat_".len(), 82);
+        let body = format!("const gh='{token}';\n");
+        let findings = engine.scan_document(&document("/config.js", &body));
+
+        let detectors: HashSet<_> = findings.iter().map(|f| f.detector.as_str()).collect();
+        assert!(detectors.contains("github_pat_fine_grained"));
+
+        // Near-miss: 81-char body must not fire the fine-grained detector.
+        let short = format!(
+            "github_pat_{}",
+            "A1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2xY3zABCDE_FGHIJKLMNOPQRSTUVWXYZabcdefghijklmno"
+        );
+        assert_eq!(short.len() - "github_pat_".len(), 81);
+        let findings_short = engine.scan_document(&document(
+            "/config.js",
+            &format!("const gh='{short}';\n"),
+        ));
+        assert!(
+            !findings_short
+                .iter()
+                .any(|f| f.detector == "github_pat_fine_grained")
+        );
+    }
+
+    #[test]
+    fn modern_token_detector_fires_on_cloudflare_api_token_with_context() {
+        let engine = DetectorEngine::new();
+        // 40-char [A-Za-z0-9_-] token (must end in word char so \b matches).
+        let token = "A1bC2dE3fG4hI5jK6lM7nO8pQ9rS0tU1vW2x-Y3z";
+        assert_eq!(token.len(), 40);
+
+        let with_context = format!("# Cloudflare API token\nCF_API_TOKEN={token}\n");
+        let findings = engine.scan_document(&document("/cloudflare.env", &with_context));
+        let detectors: HashSet<_> = findings.iter().map(|f| f.detector.as_str()).collect();
+        assert!(detectors.contains("cloudflare_api_token"));
+
+        // Near-miss: same token without any cloudflare/CF/X-Auth-Email context.
+        let without_context = format!("API_TOKEN={token}\n");
+        let findings_bare = engine.scan_document(&document("/notes.txt", &without_context));
+        assert!(
+            !findings_bare
+                .iter()
+                .any(|f| f.detector == "cloudflare_api_token"),
+            "cloudflare_api_token must require contextual keyword"
+        );
+    }
+
+    #[test]
+    fn modern_token_detector_fires_on_datadog_api_key_with_context() {
+        let engine = DetectorEngine::new();
+        let token = "0123456789abcdef0123456789abcdef";
+        assert_eq!(token.len(), 32);
+
+        let with_context = format!("# datadog agent config\nDD_API_KEY={token}\n");
+        let findings = engine.scan_document(&document("/datadog.yaml", &with_context));
+        let detectors: HashSet<_> = findings.iter().map(|f| f.detector.as_str()).collect();
+        assert!(detectors.contains("datadog_api_key"));
+
+        // Near-miss: a generic 32-char hex string with no datadog/DD_/dd-agent context.
+        let without_context = format!("checksum={token}\n");
+        let findings_bare = engine.scan_document(&document("/checksums.txt", &without_context));
+        assert!(
+            !findings_bare
+                .iter()
+                .any(|f| f.detector == "datadog_api_key")
+        );
+    }
+
+    #[test]
+    fn modern_token_detector_fires_on_jwt_alg_none_only() {
+        let engine = DetectorEngine::new();
+        // Header is `{"alg":"none","typ":"JWT"}` base64url-encoded; payload `{"sub":"1"}`; empty signature.
+        let alg_none = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIn0.";
+        let body_alg_none = format!("token={alg_none}\n");
+        let findings = engine.scan_document(&document("/login.html", &body_alg_none));
+        let detectors: HashSet<_> = findings.iter().map(|f| f.detector.as_str()).collect();
+        assert!(detectors.contains("jwt_alg_none"));
+
+        // Near-miss: alg:HS256 must NOT fire jwt_alg_none.
+        let alg_hs256 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlYWJjZGVmZw";
+        let body_hs256 = format!("token={alg_hs256}\n");
+        let findings_hs = engine.scan_document(&document("/login.html", &body_hs256));
+        assert!(!findings_hs.iter().any(|f| f.detector == "jwt_alg_none"));
+    }
+
+    #[test]
+    fn modern_token_detectors_redact_secret_values() {
+        let engine = DetectorEngine::new();
+        let alg_none = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJzdWIiOiIxIn0.";
+        let findings = engine.scan_document(&document(
+            "/login.html",
+            &format!("token={alg_none}\n"),
+        ));
+        let jwt = findings
+            .iter()
+            .find(|f| f.detector == "jwt_alg_none")
+            .expect("jwt_alg_none finding");
+        // redact_secret should mask the middle of the token.
+        assert!(jwt.redacted_value.contains("****"));
+        // The full token must not appear verbatim in redacted_value.
+        assert!(!jwt.redacted_value.contains(alg_none));
     }
 }
