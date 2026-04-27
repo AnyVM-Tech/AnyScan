@@ -4767,4 +4767,90 @@ mod tests {
 
         server.abort();
     }
+
+    // Guard against the recurring regression class where a new file is added to
+    // package-worker-bundle.sh's `install -m … "$SCRIPT_DIR/X" …` lines (or to
+    // `copy_tree "$SCRIPT_DIR/dir/" …`) without a matching EmbeddedBundleAsset
+    // entry above. The hosted bundle is built from in-memory bytes staged via
+    // HOSTED_AGENT_BUNDLE_ASSETS, so any unstaged source path produces a
+    // `cannot stat` failure at /api/agent/bundles build time.
+    #[test]
+    fn package_worker_bundle_install_lines_match_hosted_agent_bundle_assets() {
+        use regex::Regex;
+
+        const SCRIPT: &str = include_str!("../../package-worker-bundle.sh");
+        const SCRIPT_NAME: &str = "package-worker-bundle.sh";
+
+        let install_re =
+            Regex::new(r#"(?m)^\s*install\s+-m\s+\d+\s+"\$SCRIPT_DIR/([^"]+)"\s+"#).unwrap();
+        let copy_tree_re =
+            Regex::new(r#"(?m)^\s*copy_tree\s+"\$SCRIPT_DIR/([^"]+)"\s+"#).unwrap();
+
+        let mut script_install_paths: Vec<String> = install_re
+            .captures_iter(SCRIPT)
+            .map(|caps| caps[1].to_string())
+            .collect();
+        script_install_paths.sort();
+        script_install_paths.dedup();
+        assert!(
+            !script_install_paths.is_empty(),
+            "regex extracted zero install lines from package-worker-bundle.sh — \
+             the parser has drifted from the script's command shape"
+        );
+
+        let copy_tree_prefixes: Vec<String> = copy_tree_re
+            .captures_iter(SCRIPT)
+            .map(|caps| {
+                let mut dir = caps[1].to_string();
+                if !dir.ends_with('/') {
+                    dir.push('/');
+                }
+                dir
+            })
+            .collect();
+
+        let asset_paths: HashSet<&'static str> = HOSTED_AGENT_BUNDLE_ASSETS
+            .iter()
+            .map(|a| a.relative_path)
+            .collect();
+
+        let missing_from_assets: Vec<&str> = script_install_paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !asset_paths.contains(path))
+            .collect();
+        assert!(
+            missing_from_assets.is_empty(),
+            "package-worker-bundle.sh installs files that are NOT registered in \
+             HOSTED_AGENT_BUNDLE_ASSETS in src/bin/anyscan-api.rs. Every \
+             `install -m <mode> \"$SCRIPT_DIR/X\" \"$bundle_root/...\"` line must have a \
+             matching EmbeddedBundleAsset entry, otherwise hosted bundle builds via \
+             /api/agent/bundles fail with `install: cannot stat '$SCRIPT_DIR/X'`. \
+             Missing entries: {missing_from_assets:?}"
+        );
+
+        let install_set: HashSet<&str> =
+            script_install_paths.iter().map(String::as_str).collect();
+        let unreferenced_assets: Vec<&'static str> = HOSTED_AGENT_BUNDLE_ASSETS
+            .iter()
+            .map(|a| a.relative_path)
+            .filter(|path| {
+                *path != SCRIPT_NAME
+                    && !install_set.contains(*path)
+                    && !copy_tree_prefixes
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix.as_str()))
+            })
+            .collect();
+        assert!(
+            unreferenced_assets.is_empty(),
+            "HOSTED_AGENT_BUNDLE_ASSETS contains entries that package-worker-bundle.sh \
+             never stages. Each asset must be either the script itself \
+             ({SCRIPT_NAME:?}), the target of an `install -m … \"$SCRIPT_DIR/X\" …` line, \
+             or under a `copy_tree \"$SCRIPT_DIR/dir/\" …` source directory. \
+             Otherwise the asset is dead weight: it bloats the embedded payload and \
+             pollutes the source fingerprint without ever reaching the bundle. \
+             Unreferenced entries: {unreferenced_assets:?}"
+        );
+    }
 }
