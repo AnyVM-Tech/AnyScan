@@ -533,6 +533,25 @@ async fn run_daemon(
                 }
             }
 
+            // Refresh inventory policy at the very top of every iteration,
+            // before any of the work-claim arms below. Multiple branches in
+            // this loop (remote-debug commands, remote-update scheduling,
+            // bootstrap-job / port-scan / runnable-run claims, archive pass)
+            // each `continue` back to the loop top on success. If the
+            // refresh sat below any of them, a worker continuously feeding
+            // on that signal would never re-evaluate the refresh predicate
+            // and the control-plane allowlist changes would never propagate.
+            // Placing it above every `continue`-able branch guarantees it
+            // runs once per iteration regardless of which fast path fires.
+            if last_inventory_refresh_at.elapsed() >= inventory_refresh_interval {
+                if let Err(error) =
+                    refresh_inventory_policy_from_control_plane(&mut config, &store)
+                {
+                    warn!(%error, "inventory policy refresh failed; keeping prior policy");
+                }
+                last_inventory_refresh_at = Instant::now();
+            }
+
             if worker_runtime.registration.supports_remote_debug_commands {
                 if let Some(command) = store.claim_next_pending_remote_command()? {
                     info!(
@@ -561,21 +580,6 @@ async fn run_daemon(
             }
             if let Err(error) = queue_due_schedules_with_events(&store, 10) {
                 error!(%error, "failed to queue due schedules");
-            }
-
-            // Refresh inventory policy here — before any of the claim arms
-            // below, all of which `continue` back to the loop top. A busy
-            // worker keeps claiming tasks via those fast paths, so anything
-            // placed *after* them never runs while the worker is saturated.
-            // Putting the refresh here also means every claim immediately
-            // below operates against the freshest fetched policy.
-            if last_inventory_refresh_at.elapsed() >= inventory_refresh_interval {
-                if let Err(error) =
-                    refresh_inventory_policy_from_control_plane(&mut config, &store)
-                {
-                    warn!(%error, "inventory policy refresh failed; keeping prior policy");
-                }
-                last_inventory_refresh_at = Instant::now();
             }
 
             if active_tasks.len() < max_active_tasks
