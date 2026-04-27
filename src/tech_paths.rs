@@ -53,6 +53,12 @@ pub enum TechFingerprint {
     Kubernetes,
     Docker,
     DotNetMvc,
+    Mlflow,
+    JupyterHub,
+    TensorBoard,
+    Streamlit,
+    Gradio,
+    Airflow,
 }
 
 impl TechFingerprint {
@@ -88,6 +94,12 @@ impl TechFingerprint {
             Self::Kubernetes => "kubernetes",
             Self::Docker => "docker",
             Self::DotNetMvc => "aspnet-mvc",
+            Self::Mlflow => "mlflow",
+            Self::JupyterHub => "jupyterhub",
+            Self::TensorBoard => "tensorboard",
+            Self::Streamlit => "streamlit",
+            Self::Gradio => "gradio",
+            Self::Airflow => "airflow",
         }
     }
 
@@ -123,6 +135,12 @@ impl TechFingerprint {
             Self::Kubernetes => "tech-kubernetes",
             Self::Docker => "tech-docker",
             Self::DotNetMvc => "tech-aspnet-mvc",
+            Self::Mlflow => "tech-mlflow",
+            Self::JupyterHub => "tech-jupyterhub",
+            Self::TensorBoard => "tech-tensorboard",
+            Self::Streamlit => "tech-streamlit",
+            Self::Gradio => "tech-gradio",
+            Self::Airflow => "tech-airflow",
         }
     }
 }
@@ -471,6 +489,48 @@ pub fn detect_tech_fingerprints(
         push_unique(&mut fingerprints, TechFingerprint::Docker);
     }
 
+    // MLflow
+    if lowered_body.contains("<title>mlflow</title>")
+        || lowered_body.contains("mlflow-static/")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Mlflow);
+    }
+
+    // JupyterHub
+    if lowered_body.contains("<title>jupyterhub")
+        || lowered_body.contains("jupyterhub")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::JupyterHub);
+    }
+
+    // TensorBoard
+    if lowered_body.contains("<title>tensorboard</title>")
+        || lowered_body.contains("tf-tensorboard")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::TensorBoard);
+    }
+
+    // Streamlit
+    if lowered_body.contains("<title>streamlit</title>")
+        || lowered_body.contains("stapp")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Streamlit);
+    }
+
+    // Gradio
+    if lowered_body.contains("<gradio-app")
+        || lowered_body.contains("gradio-container")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Gradio);
+    }
+
+    // Airflow
+    if lowered_body.contains("<title>airflow</title>")
+        || lowered_body.contains("apache airflow")
+    {
+        push_unique(&mut fingerprints, TechFingerprint::Airflow);
+    }
+
     fingerprints
 }
 
@@ -584,6 +644,12 @@ fn paths_for_fingerprint(fingerprint: TechFingerprint) -> &'static [TechPathEntr
         TechFingerprint::Kubernetes => KUBERNETES_PATHS,
         TechFingerprint::Docker => DOCKER_PATHS,
         TechFingerprint::DotNetMvc => DOTNET_MVC_PATHS,
+        TechFingerprint::Mlflow => MLFLOW_PATHS,
+        TechFingerprint::JupyterHub => JUPYTERHUB_PATHS,
+        TechFingerprint::TensorBoard => TENSORBOARD_PATHS,
+        TechFingerprint::Streamlit => STREAMLIT_PATHS,
+        TechFingerprint::Gradio => GRADIO_PATHS,
+        TechFingerprint::Airflow => AIRFLOW_PATHS,
     }
 }
 
@@ -1159,6 +1225,68 @@ const DOTNET_MVC_PATHS: &[TechPathEntry] = &[
     entry("/Reserved.ReportViewerWebControl.axd", 880),
 ];
 
+const MLFLOW_PATHS: &[TechPathEntry] = &[
+    entry("/api/2.0/mlflow/runs/search", 880),
+    entry("/api/2.0/mlflow/experiments/list", 880),
+    entry("/api/2.0/mlflow/registered-models/search", 880),
+    entry("/get-artifact", 850),
+    entry("/ajax-api/2.0/preview/mlflow/artifacts/list", 850),
+    entry("/api/2.0/mlflow/experiments/search", 850),
+    entry("/api/2.0/mlflow/model-versions/search", 850),
+    entry("/api/2.0/mlflow/runs/get", 820),
+];
+
+const JUPYTERHUB_PATHS: &[TechPathEntry] = &[
+    entry("/hub/api", 880),
+    entry("/hub/api/info", 880),
+    entry("/hub/login", 880),
+    entry("/user/", 850),
+    entry("/services/", 850),
+    entry("/tree", 850),
+    entry("/api/contents", 820),
+    entry("/hub/admin", 880),
+];
+
+const TENSORBOARD_PATHS: &[TechPathEntry] = &[
+    entry("/data/runs", 880),
+    entry("/data/plugin/scalars/scalars", 850),
+    entry("/data/plugin/projector/runs", 850),
+    entry("/index.json", 820),
+    entry("/data/plugin/graphs/graph", 820),
+    entry("/data/plugin/text/text", 820),
+];
+
+const STREAMLIT_PATHS: &[TechPathEntry] = &[
+    entry("/_stcore/health", 880),
+    entry("/_stcore/host-config", 880),
+    entry("/_stcore/stream", 850),
+    entry("/static/static/", 820),
+    entry("/healthz", 850),
+    entry("/_stcore/allowed-message-origins", 820),
+];
+
+const GRADIO_PATHS: &[TechPathEntry] = &[
+    entry("/info", 880),
+    entry("/config", 880),
+    entry("/file=", 850),
+    entry("/gradio_api/", 850),
+    entry("/run/predict", 850),
+    entry("/queue/join", 820),
+    entry("/queue/data", 820),
+];
+
+const AIRFLOW_PATHS: &[TechPathEntry] = &[
+    entry("/api/v1/dags", 880),
+    entry("/api/v1/dagRuns", 880),
+    entry("/api/v1/connections", 880),
+    entry("/api/v1/variables", 880),
+    entry("/health", 850),
+    entry("/login/?next=/", 850),
+    entry("/admin/", 850),
+    entry("/api/v1/pools", 820),
+    entry("/api/v1/users", 880),
+];
+
 // =====================================================================
 // Sensitive backup / VCS leakage variant generator (path -> variants).
 //
@@ -1517,6 +1645,57 @@ mod tests {
         assert!(paths.contains(&"/actuator/env"));
         assert!(paths.contains(&"/actuator/jolokia"));
         assert!(paths.contains(&"/jolokia/list"));
+    }
+
+    #[test]
+    fn detects_mlflow_from_title() {
+        let body = "<html><head><title>MLflow</title></head><body>...</body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Mlflow));
+    }
+
+    #[test]
+    fn detects_jupyterhub_from_body() {
+        let body = "<html><head><title>JupyterHub</title></head><body>JupyterHub login</body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::JupyterHub));
+    }
+
+    #[test]
+    fn detects_tensorboard_from_body() {
+        let body = "<html><head><title>TensorBoard</title></head><body><tf-tensorboard></tf-tensorboard></body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::TensorBoard));
+    }
+
+    #[test]
+    fn detects_streamlit_from_body() {
+        let body = "<html><head><title>Streamlit</title></head><body><div class=\"stApp\"></div></body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Streamlit));
+    }
+
+    #[test]
+    fn detects_gradio_from_body() {
+        let body = "<html><body><gradio-app src=\"http://localhost:7860\"></gradio-app></body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Gradio));
+    }
+
+    #[test]
+    fn detects_airflow_from_body() {
+        let body = "<html><head><title>Airflow</title></head><body>Apache Airflow</body></html>";
+        let fps = body_only(body);
+        assert!(fps.contains(&TechFingerprint::Airflow));
+    }
+
+    #[test]
+    fn mlflow_paths_include_runs_search_and_artifacts_list() {
+        let candidates = candidates_for_fingerprints(&[TechFingerprint::Mlflow]);
+        let paths: Vec<&str> = candidates.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"/api/2.0/mlflow/runs/search"));
+        assert!(paths.contains(&"/api/2.0/mlflow/experiments/list"));
+        assert!(paths.contains(&"/ajax-api/2.0/preview/mlflow/artifacts/list"));
     }
 
     #[test]
