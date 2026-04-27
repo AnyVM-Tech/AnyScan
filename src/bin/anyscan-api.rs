@@ -604,7 +604,7 @@ async fn main() -> Result<()> {
 }
 
 async fn public_index() -> Html<&'static str> {
-    Html(include_str!("../../public-site.html"))
+    Html(include_str!("../../templates/public/search.html"))
 }
 
 async fn operator_app() -> Html<&'static str> {
@@ -4568,6 +4568,35 @@ mod tests {
                 path
             );
         }
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn public_search_route_serves_search_form() {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route("/", get(public_index));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let body = reqwest::get(format!("http://{addr}/"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+
+        assert!(body.contains(r#"id="public-findings-form""#));
+        assert!(body.contains(r#"id="public-findings-list""#));
+        assert!(body.contains(r#"aria-current="page""#));
+        // The slimmer search page must NOT carry the about/workflows sections.
+        assert!(!body.contains(r#"id="about""#));
+        assert!(!body.contains(r#"id="workflows""#));
 
         server.abort();
     }
