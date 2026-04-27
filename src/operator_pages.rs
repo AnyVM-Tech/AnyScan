@@ -79,10 +79,19 @@ pub async fn operator_catalog() -> Html<String> {
     )
 }
 
+/// The seven section slugs that make up the operator console nav. Kept here so
+/// tests (and any future helpers) share one source of truth — the rendered
+/// `templates/operator/nav.html` is the actual product of record.
+#[cfg(test)]
+pub(crate) const OPERATOR_NAV_SLUGS: &[&str] = &[
+    "overview", "targets", "runs", "workers", "findings", "catalog", "coverage",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::Router;
+    use axum::response::Redirect;
     use axum::routing::get;
     use tokio::net::TcpListener;
 
@@ -369,5 +378,92 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// `/app` is a stable bookmark; confirm the route handler issues an HTTP 307
+    /// redirect to `/app/overview` so legacy bookmarks land on the new section
+    /// page.
+    #[tokio::test]
+    async fn operator_app_redirects_to_overview() {
+        async fn operator_app() -> Redirect {
+            Redirect::temporary("/app/overview")
+        }
+
+        let app = Router::new()
+            .route("/app", get(operator_app))
+            .route("/app/overview", get(operator_overview));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("operator_app redirect test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("operator_app redirect test listener should report local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("operator_app redirect test server should stay available");
+        });
+
+        // Use a non-redirecting client so we can inspect the 307 itself rather
+        // than chase it.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("non-redirecting reqwest client should build");
+        let response = client
+            .get(format!("http://{}/app", address))
+            .send()
+            .await
+            .expect("GET /app should succeed");
+
+        assert_eq!(
+            response.status().as_u16(),
+            307,
+            "GET /app should issue a 307 redirect to /app/overview",
+        );
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .expect("redirect response should carry a Location header")
+            .to_str()
+            .expect("Location header should be ASCII");
+        assert_eq!(location, "/app/overview");
+
+        server.abort();
+    }
+
+    /// Every section page must expose the full nav so users can move between
+    /// sections without retyping URLs. Render the shell once per slug and
+    /// assert all seven hrefs appear AND exactly one link is marked
+    /// `aria-current="page"` (the active one for that page).
+    #[test]
+    fn operator_nav_links_to_all_seven_pages() {
+        let expected_hrefs: Vec<String> = OPERATOR_NAV_SLUGS
+            .iter()
+            .map(|slug| format!("href=\"/app/{}\"", slug))
+            .collect();
+
+        for active in OPERATOR_NAV_SLUGS {
+            // Body/page_js can be empty — we are only validating the nav scaffolding.
+            let Html(body) = render_page(active, "", "");
+
+            for expected in &expected_hrefs {
+                assert!(
+                    body.contains(expected),
+                    "rendered page for slug `{active}` should contain nav link `{expected}`",
+                );
+            }
+
+            let aria_current_count = body.matches("aria-current=\"page\"").count();
+            assert_eq!(
+                aria_current_count, 1,
+                "page for slug `{active}` should have exactly one aria-current=\"page\" link, found {aria_current_count}",
+            );
+            let active_marker = format!("data-nav=\"{}\" aria-current=\"page\"", active);
+            assert!(
+                body.contains(&active_marker),
+                "page for slug `{active}` should mark its own nav link with aria-current",
+            );
+        }
     }
 }

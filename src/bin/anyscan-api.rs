@@ -58,7 +58,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode, header},
-    response::{Html, IntoResponse, Response, Sse},
+    response::{Html, IntoResponse, Redirect, Response, Sse},
     routing::{get, post},
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -608,8 +608,11 @@ async fn public_index() -> Html<&'static str> {
     Html(include_str!("../../templates/public/search.html"))
 }
 
-async fn operator_app() -> Html<&'static str> {
-    Html(include_str!("../../index.html"))
+// `/app` is a stable bookmark for operators; the operator console itself now
+// lives under section pages (`/app/overview`, `/app/targets`, etc.). We redirect
+// to Overview as the default landing page so external bookmarks keep working.
+async fn operator_app() -> Redirect {
+    Redirect::temporary("/app/overview")
 }
 
 async fn public_page() -> Html<&'static str> {
