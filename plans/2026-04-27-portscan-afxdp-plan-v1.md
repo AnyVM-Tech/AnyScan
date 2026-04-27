@@ -257,14 +257,25 @@ The Python adapter (`vulnscanner-zmap-adapter.py`) will need a new optional `io_
 
 ### 4.2 Runtime (already-deployed bundle install)
 
-Add to `install-worker-bundle.sh` (or the upstream `install-external-deps.sh` apt block, whichever ships earliest in the worker bootstrap chain):
+Add to `install-worker-bundle.sh` (or the upstream `install-external-deps.sh` apt block, whichever ships earliest in the worker bootstrap chain).
+
+**Ubuntu 24.04 (Noble — recommended baseline per §4.1):**
 
 ```bash
 apt-get install -y --no-install-recommends \
-    libxdp1 libbpf1 libelf1 libz1
+    libxdp1 libbpf1 libelf1t64 zlib1g
 ```
 
-(Names are runtime `.so` packages, not `-dev`. On older Ubuntu they may be `libxdp0` / `libbpf0` — `install-external-deps.sh` already uses `apt` patterns elsewhere; reuse them.)
+**Ubuntu 22.04 (Jammy) / Debian bookworm fallback (if we end up supporting it per §4.1 open question):**
+
+```bash
+apt-get install -y --no-install-recommends \
+    libxdp1 libbpf1 libelf1 zlib1g
+```
+
+The `libelf1` → `libelf1t64` rename on Noble is from Ubuntu's [64-bit time_t transition](https://launchpad.net/ubuntu/noble/amd64/libelf1t64); `zlib1g` (not `libz1` — that name does not exist on Debian-family distros) is correct on every Debian/Ubuntu we'd plausibly target. `libxdp1`/`libbpf1` are unaffected by t64 and have the same names on Jammy/Noble/bookworm.
+
+Phase 2 should pick the right line based on the actual AMI's `lsb_release -rs` rather than copy-pasting blindly. A defensive `apt-get install` wrapper that retries the t64 name if the legacy name fails (or vice versa) is a reasonable safety belt for Phase 2; Phase 1 just commits to having the right package list per supported distro.
 
 ### 4.3 Kernel feature checks
 
