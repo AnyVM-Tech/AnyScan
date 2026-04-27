@@ -4158,9 +4158,10 @@ mod tests {
     use crate::{
         config::{AppConfig, ProxyMode, RequestProfileConfig, RequestProfileSecretRef},
         core::{
-            CoverageSourceStat, DiscoveryProvenanceRecord, RequestEngineMode, TargetRecord,
-            TargetStrategy,
+            CoverageSourceStat, DiscoveryProvenanceRecord, FindingConfidence, RequestEngineMode,
+            Severity, TargetRecord, TargetStrategy,
         },
+        detectors::DetectorEngine,
     };
 
     static TEST_ENV_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -6739,6 +6740,110 @@ paths:
                     && candidate.source == "tech-nextjs"),
             "tech-nextjs follow-on should emit at least one /_next/... candidate; got {:?}",
             report.discovered_paths,
+        );
+
+        server.abort();
+    }
+
+    async fn spawn_python_traceback_test_server() -> (JoinHandle<()>, String) {
+        let body = concat!(
+            "Traceback (most recent call last):\n",
+            "  File \"/srv/app/views.py\", line 42, in handle_request\n",
+            "    user = User.objects.get(pk=request.GET['id'])\n",
+            "  File \"/srv/app/.venv/lib/python3.11/site-packages/django/db/models/manager.py\", line 85, in manager_method\n",
+            "    return getattr(self.get_queryset(), name)(*args, **kwargs)\n",
+            "django.core.exceptions.ObjectDoesNotExist: User matching query does not exist.\n",
+        );
+        let app = Router::new().route(
+            "/oops",
+            get(move || async move {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    body,
+                )
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("traceback listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("traceback listener should report local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("traceback server should stay available")
+        });
+
+        (handle, format!("http://{}", address))
+    }
+
+    #[tokio::test]
+    async fn verbose_stack_trace_detector_fires_on_python_traceback_through_fetcher() {
+        let (server, base_url) = spawn_python_traceback_test_server().await;
+        let mut config = AppConfig::default();
+        config.inventory.allowed_host_suffixes = vec!["127.0.0.1".to_string()];
+        config.scan.max_paths_per_target = 1;
+        config.scan.max_discovered_paths_per_target = 0;
+        config.scan.enable_path_discovery = false;
+        config.scan.request_engine_mode = RequestEngineMode::DeepOnly;
+        let fetcher = Fetcher::new(&config).expect("fetcher should build");
+        let target = TargetRecord {
+            id: 1,
+            label: "stack-trace".to_string(),
+            base_url,
+            paths: vec!["/oops".to_string()],
+            tags: Vec::new(),
+            request_profile: None,
+            gobuster: Default::default(),
+            strategy: TargetStrategy::Manual,
+            discovery_provenance: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let report = fetcher
+            .fetch_target(&target)
+            .await
+            .expect("traceback target fetch should succeed");
+        let document = report
+            .documents
+            .iter()
+            .find(|document| document.path == "/oops")
+            .expect("traceback document should be fetched");
+        assert_eq!(document.status, 500);
+        assert!(
+            document
+                .body
+                .starts_with("Traceback (most recent call last):"),
+            "expected traceback body, got {:?}",
+            document.body
+        );
+
+        let engine = DetectorEngine::new();
+        let findings = engine.scan_document(document);
+        let stack_trace_finding = findings
+            .iter()
+            .find(|finding| finding.detector == "verbose_stack_trace_disclosure")
+            .expect("verbose_stack_trace_disclosure finding should be emitted");
+        assert_eq!(stack_trace_finding.severity, Severity::Low);
+        assert_eq!(
+            stack_trace_finding.confidence,
+            Some(FindingConfidence::High)
+        );
+        assert!(
+            stack_trace_finding
+                .evidence
+                .starts_with("Traceback (most recent call last):"),
+            "expected traceback evidence, got {:?}",
+            stack_trace_finding.evidence
+        );
+        assert!(
+            stack_trace_finding.evidence.chars().count() <= 201,
+            "evidence over budget: {}",
+            stack_trace_finding.evidence
         );
 
         server.abort();
