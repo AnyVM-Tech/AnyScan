@@ -141,6 +141,75 @@ detect_host_default_interface() {
     fi
 }
 
+# Print a comma-separated list of NICs that look like usable scanner ENIs:
+# UP, non-loopback, non-virtual (skip docker/cni/veth/tun/tap/wg/zt) and
+# carrying at least one IPv4 address. The default-route iface is emitted
+# first so existing single-NIC behavior is preserved when no extra ENIs
+# are attached. This intentionally errs on the side of inclusion: when the
+# operator has attached extra ENAs to a c6in.metal box for the explicit
+# purpose of multi-NIC scanning we want them picked up automatically.
+detect_host_scanner_eni_candidates() {
+    if ! command_exists ip; then
+        return 0
+    fi
+    local default_iface
+    default_iface="$(detect_host_default_interface || true)"
+    local candidates=""
+    # Iterate UP non-loopback ifaces. `ip -o link show up` gives one
+    # line per iface; we strip the trailing colon and skip well-known
+    # virtual prefixes that are never AWS ENAs.
+    local iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        case "$iface" in
+            lo|docker*|br-*|veth*|tun*|tap*|wg*|zt*|cni*|cilium*|flannel*|kube-*) continue ;;
+        esac
+        # Require at least one IPv4 address — interfaces without IPv4 cannot
+        # source SYN probes for the scanner and would just produce dead
+        # shards if we listed them.
+        if ! ip -4 -o addr show dev "$iface" 2>/dev/null | grep -q 'inet '; then
+            continue
+        fi
+        case ",$candidates," in
+            *",$iface,"*) continue ;;
+        esac
+        if [ -z "$candidates" ]; then
+            candidates="$iface"
+        else
+            candidates="$candidates,$iface"
+        fi
+    done < <(ip -o link show up 2>/dev/null \
+        | awk -F': ' '{ split($2, parts, "@"); print parts[1] }')
+    # Move the default-route iface to the front so single-NIC consumers that
+    # split on comma and take [0] keep getting the default. Multi-NIC mode
+    # is engaged only when the list has more than one entry, so this is
+    # purely a backward-compat ordering nicety.
+    if [ -n "$default_iface" ] && [ -n "$candidates" ]; then
+        local reordered=""
+        local entry
+        for entry in ${candidates//,/ }; do
+            if [ "$entry" = "$default_iface" ]; then
+                continue
+            fi
+            if [ -z "$reordered" ]; then
+                reordered="$entry"
+            else
+                reordered="$reordered,$entry"
+            fi
+        done
+        case ",$candidates," in
+            *",$default_iface,"*)
+                if [ -z "$reordered" ]; then
+                    candidates="$default_iface"
+                else
+                    candidates="$default_iface,$reordered"
+                fi
+                ;;
+        esac
+    fi
+    printf '%s' "$candidates"
+}
+
 resolve_preferred_scanner_bin() {
     local existing_value bundled_value
     existing_value="$(env_value "SCANNER_BIN" "$RUNTIME_ENV_FILE" || true)"
@@ -164,10 +233,11 @@ resolve_preferred_scanner_bin() {
 
 apply_host_resource_defaults() {
     local cpu_threads="$1"
-    local default_interface preferred_scanner_bin
+    local default_interface preferred_scanner_bin scanner_eni_candidates
 
     default_interface="$(detect_host_default_interface || true)"
     preferred_scanner_bin="$(resolve_preferred_scanner_bin || true)"
+    scanner_eni_candidates="$(detect_host_scanner_eni_candidates || true)"
 
     if [ -z "$(env_value "AGENT_MAX_ACTIVE_TASKS" "$RUNTIME_ENV_FILE" || true)" ]; then
         upsert_env_value "AGENT_MAX_ACTIVE_TASKS" "$cpu_threads" "$RUNTIME_ENV_FILE"
@@ -228,6 +298,23 @@ apply_host_resource_defaults() {
         if [ -z "$(env_value "SCANNER_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
             upsert_env_value "SCANNER_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
         fi
+        # Multi-NIC sharding (c6in.metal and other AWS instances with more
+        # than one ENA): when the host has 2+ usable ENIs the adapter
+        # spawns one scanner process per ENI to break the per-AF_PACKET
+        # socket TX-lock ceiling. We only auto-write the list when the
+        # operator has not already pinned a value AND the discovery found
+        # more than one candidate. Single-ENI hosts get nothing and stay
+        # on the legacy single-NIC code path. Operators can opt out
+        # entirely by setting ANYSCAN_DISABLE_MULTI_NIC_AUTO=true in the
+        # environment before running the installer (the installer
+        # respects an explicit empty list in runtime.env, so writing
+        # ANYSCAN_SCANNER_INTERFACES= by hand also disables the fan-out).
+        if [ "${ANYSCAN_DISABLE_MULTI_NIC_AUTO:-}" != "true" ] \
+            && [ -z "$(env_value "ANYSCAN_SCANNER_INTERFACES" "$RUNTIME_ENV_FILE" || true)" ] \
+            && [ -n "$scanner_eni_candidates" ] \
+            && [ "$scanner_eni_candidates" != "${scanner_eni_candidates%,*}" ]; then
+            upsert_env_value "ANYSCAN_SCANNER_INTERFACES" "$scanner_eni_candidates" "$RUNTIME_ENV_FILE"
+        fi
     fi
 
     # Defaults for the egress bandwidth reservation that ExecStartPre installs.
@@ -238,13 +325,25 @@ apply_host_resource_defaults() {
     if [ -z "$(env_value "ANYSCAN_RESERVE_LINK_RATE_BPS" "$RUNTIME_ENV_FILE" || true)" ]; then
         upsert_env_value "ANYSCAN_RESERVE_LINK_RATE_BPS" "1000000000" "$RUNTIME_ENV_FILE"
     fi
-    if [ -z "$(env_value "ANYSCAN_RESERVE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
-        upsert_env_value "ANYSCAN_RESERVE_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
+    # When multi-NIC fan-out is engaged we want the egress reservation and
+    # the txqueuelen bump to apply on every NIC, not just the default
+    # route. Both helpers accept a comma-separated list, so we forward
+    # the same set of ENIs the adapter will use; this keeps the
+    # heartbeat-bandwidth guarantee from PR #28 holding on every NIC the
+    # scanner is about to drive. Falls back to the single default
+    # interface on single-ENI hosts.
+    local managed_interfaces="$default_interface"
+    if [ -n "$scanner_eni_candidates" ] \
+        && [ "$scanner_eni_candidates" != "${scanner_eni_candidates%,*}" ]; then
+        managed_interfaces="$scanner_eni_candidates"
+    fi
+    if [ -z "$(env_value "ANYSCAN_RESERVE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$managed_interfaces" ]; then
+        upsert_env_value "ANYSCAN_RESERVE_INTERFACE" "$managed_interfaces" "$RUNTIME_ENV_FILE"
     fi
     # Mirror the iface for tune-scanner-host.sh's ip-link txqueuelen call so it
     # does not have to re-detect the default route on every service start.
-    if [ -z "$(env_value "ANYSCAN_TUNE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$default_interface" ]; then
-        upsert_env_value "ANYSCAN_TUNE_INTERFACE" "$default_interface" "$RUNTIME_ENV_FILE"
+    if [ -z "$(env_value "ANYSCAN_TUNE_INTERFACE" "$RUNTIME_ENV_FILE" || true)" ] && [ -n "$managed_interfaces" ]; then
+        upsert_env_value "ANYSCAN_TUNE_INTERFACE" "$managed_interfaces" "$RUNTIME_ENV_FILE"
     fi
 }
 

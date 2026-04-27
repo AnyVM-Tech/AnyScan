@@ -329,6 +329,77 @@ def parse_target_range(target_range: str) -> tuple[int, int] | None:
     return value, value
 
 
+def parse_scanner_interfaces(value: str | None) -> list[str]:
+    """Parse a comma/whitespace-separated NIC list, dedup, preserve order.
+
+    Empty entries are dropped silently. Used by the multi-NIC orchestration
+    parent to decide whether to fan out across ENIs; a single entry is
+    treated as legacy single-NIC mode and the parent does not engage.
+    """
+
+    if value is None:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for chunk in value.replace(";", ",").split(","):
+        for token in chunk.split():
+            iface = token.strip()
+            if not iface or iface in seen:
+                continue
+            seen.add(iface)
+            result.append(iface)
+    return result
+
+
+def format_target_range(start: int, end: int) -> str:
+    """Render an IPv4 [start, end] inclusive range using the scanner's accepted forms.
+
+    Single host -> bare address. Wider ranges use the dashed-IP format the
+    scanner already accepts (the same form the API emits when sharding via
+    split_port_scan_target_range in dragonfly_store.rs).
+    """
+
+    start_ip = ipaddress.IPv4Address(start)
+    end_ip = ipaddress.IPv4Address(end)
+    if start == end:
+        return str(start_ip)
+    return f"{start_ip}-{end_ip}"
+
+
+def split_target_range_for_shards(target_range: str, shard_count: int) -> list[str]:
+    """Split an IPv4 target range into roughly equal sub-ranges.
+
+    Mirrors the algorithm in src/dragonfly_store.rs::split_port_scan_target_range
+    so a single worker fans out the same way the control plane already does
+    across workers. When the input cannot be parsed we fall back to a single
+    entry so the caller can pass it through unchanged; same for shard_count
+    <= 1 or a range smaller than the requested shard count.
+    """
+
+    bounds = parse_target_range(target_range)
+    trimmed = target_range.strip()
+    if bounds is None:
+        return [trimmed]
+    start, end = bounds
+    if shard_count <= 1 or start >= end:
+        return [format_target_range(start, end)]
+    total_hosts = end - start + 1
+    shard_total = max(1, min(shard_count, total_hosts))
+    if shard_total <= 1:
+        return [format_target_range(start, end)]
+    base_hosts = total_hosts // shard_total
+    remainder = total_hosts % shard_total
+    cursor = start
+    shards: list[str] = []
+    for index in range(shard_total):
+        shard_size = base_hosts + (1 if index < remainder else 0)
+        shard_start = cursor
+        shard_end = cursor + shard_size - 1
+        shards.append(format_target_range(shard_start, shard_end))
+        cursor = shard_end + 1
+    return shards
+
+
 def parse_requested_ports(ports: str) -> set[int]:
     requested: set[int] = set()
     for chunk in ports.split(','):
@@ -412,6 +483,7 @@ def terminate_current_child(sig: int) -> None:
 
 def handle_termination(signum: int, _frame: object) -> "None":
     terminate_current_child(signal.SIGTERM)
+    _terminate_child_adapters(signal.SIGTERM)
     raise SystemExit(128 + signum)
 
 
@@ -583,6 +655,248 @@ def run_dynamic_scanner(
     return return_code, "", stderr_text
 
 
+# ---------------------------------------------------------------------------
+# Multi-NIC orchestration (Tier A)
+#
+# When ANYSCAN_SCANNER_INTERFACES lists more than one ENI we fan the
+# invocation out into one child adapter process per interface. Each child
+# runs the unmodified single-NIC code path with SCANNER_INTERFACE pinned
+# to its own ENI; per-NIC AIMD calibration falls out for free because
+# RateCalibrationStore is already keyed by interface name and each child
+# observes its own /sys/class/net/<iface>/statistics counters.
+#
+# Background:
+# A single AF_PACKET socket caps around 3M pps under the bundled scanner
+# (anygpt-24 c6in.metal bench) because of per-socket TX lock contention;
+# c6in.metal has 8 ENAs available with an aggregate ENA spec of ~14M pps,
+# so going parallel across NICs is the only way to recover that headroom
+# without a kernel-bypass change. The orchestrator does NOT touch the
+# scanner binary or AIMD math — it is pure Python fan-out plus output
+# stitching.
+# ---------------------------------------------------------------------------
+
+
+CHILD_ADAPTER_PROCESSES: list[subprocess.Popen[bytes]] = []
+CHILD_ADAPTER_PROCESSES_LOCK = threading.Lock()
+
+
+def _register_child_process(child: subprocess.Popen[bytes]) -> None:
+    with CHILD_ADAPTER_PROCESSES_LOCK:
+        CHILD_ADAPTER_PROCESSES.append(child)
+
+
+def _unregister_child_process(child: subprocess.Popen[bytes]) -> None:
+    with CHILD_ADAPTER_PROCESSES_LOCK:
+        try:
+            CHILD_ADAPTER_PROCESSES.remove(child)
+        except ValueError:
+            pass
+
+
+def _terminate_child_adapters(sig: int) -> None:
+    with CHILD_ADAPTER_PROCESSES_LOCK:
+        children = list(CHILD_ADAPTER_PROCESSES)
+    for child in children:
+        if child.poll() is not None:
+            continue
+        try:
+            os.killpg(child.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            try:
+                if sig == signal.SIGKILL:
+                    child.kill()
+                else:
+                    child.terminate()
+            except Exception:  # noqa: BLE001 - best-effort propagation
+                pass
+
+
+def build_shard_invocation(
+    parent_invocation: dict[str, object],
+    *,
+    shard_target_range: str,
+    shard_output_path: Path,
+    shard_checkpoint_path: Path | None,
+) -> dict[str, object]:
+    """Clone the parent invocation with per-shard target/output overrides."""
+
+    shard = dict(parent_invocation)
+    shard["target_range"] = shard_target_range
+    shard["output_path"] = str(shard_output_path)
+    if shard_checkpoint_path is not None:
+        shard["checkpoint_path"] = str(shard_checkpoint_path)
+    return shard
+
+
+def _spawn_shard_adapter(
+    invocation: dict[str, object],
+    *,
+    interface: str,
+    stderr_log: Path,
+) -> subprocess.Popen[bytes]:
+    env = os.environ.copy()
+    # Pin the child to a single NIC and clear the multi-NIC list so the
+    # child does not try to fan out again. Both knobs MUST be set: the
+    # cleared list is what makes the child fall through to the legacy
+    # single-NIC path; the pinned interface is what the scanner inherits
+    # via the existing SCANNER_INTERFACE -> --interface mapping.
+    env["SCANNER_INTERFACE"] = interface
+    env["ANYSCAN_SCANNER_INTERFACES"] = ""
+    # Mark the child so journal readers can correlate per-shard metrics
+    # back to the parent fan-out without parsing pid trees.
+    env["ANYSCAN_SCANNER_SHARD_INTERFACE"] = interface
+    # Tell the child it is a shard so it skips the legacy
+    # emit_endpoints + output_path.unlink() finally cleanup. The parent
+    # owns the merged output: deduping + filtering happens once on the
+    # union, and the parent reaps the temp work dir at the end. Without
+    # this flag the child would print its own endpoints to its own
+    # stdout (we point it at /dev/null) AND delete its per-shard output
+    # file, leaving the parent with nothing to merge.
+    env["ANYSCAN_ADAPTER_SHARD_MODE"] = "true"
+
+    command = [sys.executable, str(Path(__file__).resolve())]
+    stderr_handle = open(stderr_log, "wb")
+    try:
+        child = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_handle,
+            env=env,
+            start_new_session=True,
+        )
+    except Exception:
+        stderr_handle.close()
+        raise
+    finally:
+        # The child takes over the fd via dup; close our copy so EOF
+        # reaches the reader when the child exits.
+        stderr_handle.close()
+    assert child.stdin is not None
+    try:
+        child.stdin.write(json.dumps(invocation).encode("utf-8"))
+    finally:
+        child.stdin.close()
+    return child
+
+
+def run_multi_nic_scanner(
+    invocation: dict[str, object],
+    output_path: Path,
+    interfaces: list[str],
+) -> int:
+    """Fan out one adapter child per ENI and stitch the results.
+
+    Returns an exit code suitable for the adapter to surface to the worker.
+    Per-shard stderr logs are mirrored to the parent stderr at the end so
+    operators see all rate-controller telemetry in one journal stream.
+    """
+
+    target_range = require_string(invocation, "target_range")
+    shards = split_target_range_for_shards(target_range, len(interfaces))
+    if len(shards) < len(interfaces):
+        # Range was smaller than the interface count; trim interfaces to
+        # match shards and let the unused NICs sit idle for this scan
+        # rather than spawning empty children.
+        interfaces = interfaces[: len(shards)]
+
+    if rate_controller is not None:
+        rate_controller.emit_metric(
+            "multi_nic_orchestration_started",
+            {
+                "interfaces": interfaces,
+                "shard_count": len(shards),
+                "target_range": target_range,
+            },
+        )
+
+    work_dir = Path(tempfile.mkdtemp(prefix="anyscan-multi-nic-"))
+    children: list[tuple[subprocess.Popen[bytes], Path, Path, str]] = []
+    return_code = 0
+    try:
+        for index, (iface, shard_target_range) in enumerate(zip(interfaces, shards)):
+            shard_output = work_dir / f"shard-{index}-{iface}.out"
+            shard_output.parent.mkdir(parents=True, exist_ok=True)
+            shard_output.touch()
+            # Each shard gets its own checkpoint so resume after a crash
+            # does not cross-contaminate the per-NIC iteration offsets.
+            parent_checkpoint = invocation.get("checkpoint_path")
+            if isinstance(parent_checkpoint, str) and parent_checkpoint.strip():
+                shard_checkpoint: Path | None = Path(
+                    f"{parent_checkpoint.strip()}.shard-{index}"
+                )
+            else:
+                shard_checkpoint = work_dir / f"shard-{index}-{iface}.checkpoint"
+            shard_invocation = build_shard_invocation(
+                invocation,
+                shard_target_range=shard_target_range,
+                shard_output_path=shard_output,
+                shard_checkpoint_path=shard_checkpoint,
+            )
+            shard_stderr = work_dir / f"shard-{index}-{iface}.stderr"
+            child = _spawn_shard_adapter(
+                shard_invocation,
+                interface=iface,
+                stderr_log=shard_stderr,
+            )
+            _register_child_process(child)
+            children.append((child, shard_output, shard_stderr, iface))
+
+        for child, _shard_output, _shard_stderr, iface in children:
+            try:
+                exit_code = child.wait()
+            except KeyboardInterrupt:
+                _terminate_child_adapters(signal.SIGTERM)
+                exit_code = 128 + signal.SIGTERM
+            finally:
+                _unregister_child_process(child)
+            if exit_code != 0 and return_code == 0:
+                return_code = exit_code
+                # First-failure wins; tear down the rest so we surface the
+                # actual error fast instead of waiting for all stragglers.
+                _terminate_child_adapters(signal.SIGTERM)
+
+        # Stitch each shard's output file into the parent output_path. We
+        # do this even on partial failure so any endpoints already
+        # discovered by the surviving shards are not lost.
+        with open(output_path, "wb") as merged:
+            for _child, shard_output, _shard_stderr, _iface in children:
+                if not shard_output.exists():
+                    continue
+                with open(shard_output, "rb") as handle:
+                    while True:
+                        chunk = handle.read(65536)
+                        if not chunk:
+                            break
+                        merged.write(chunk)
+
+        # Surface child stderr so journal-based debugging keeps working
+        # exactly like the single-NIC path. Prefix each line with the
+        # iface so operators can tell shards apart in the journal.
+        for _child, _shard_output, shard_stderr, iface in children:
+            if not shard_stderr.exists():
+                continue
+            try:
+                payload = shard_stderr.read_text(errors="replace")
+            except OSError:
+                continue
+            for line in payload.splitlines():
+                if line.strip():
+                    print(f"[shard {iface}] {line}", file=sys.stderr)
+    finally:
+        # Reap any leftover children so the parent never returns with
+        # zombies attached to the agentd worker process.
+        _terminate_child_adapters(signal.SIGKILL)
+        with CHILD_ADAPTER_PROCESSES_LOCK:
+            CHILD_ADAPTER_PROCESSES.clear()
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except OSError:
+            pass
+
+    return return_code
+
+
 def main() -> int:
     try:
         invocation = json.load(sys.stdin)
@@ -606,9 +920,36 @@ def main() -> int:
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
 
+    multi_nic_interfaces = parse_scanner_interfaces(env_string("ANYSCAN_SCANNER_INTERFACES"))
+    multi_nic_enabled = len(multi_nic_interfaces) > 1
+
+    if multi_nic_enabled:
+        try:
+            return_code = run_multi_nic_scanner(
+                invocation, output_path, multi_nic_interfaces
+            )
+            if return_code != 0:
+                return return_code
+            raw_output = output_path.read_text() if output_path.exists() else ""
+            emit_endpoints(
+                raw_output,
+                require_string(invocation, "target_range"),
+                require_string(invocation, "ports"),
+            )
+            return 0
+        finally:
+            _terminate_child_adapters(signal.SIGKILL)
+            checkpoint_path.unlink(missing_ok=True)
+            progress_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+
     dynamic_enabled = env_flag("ANYSCAN_DYNAMIC_RATE_ENABLED", default=True) and (
         rate_controller is not None
     )
+    # Shard children skip post-processing (emit_endpoints + unlink) so
+    # the multi-NIC parent can merge their raw output files and dedupe
+    # the union exactly once. See run_multi_nic_scanner.
+    shard_mode = env_flag("ANYSCAN_ADAPTER_SHARD_MODE")
 
     try:
         if dynamic_enabled:
@@ -627,6 +968,12 @@ def main() -> int:
             print(detail, file=sys.stderr)
             return return_code
 
+        if shard_mode:
+            stderr = stderr.strip()
+            if stderr:
+                print(stderr, file=sys.stderr)
+            return 0
+
         raw_output = output_path.read_text() if output_path.exists() else stdout
         emit_endpoints(
             raw_output,
@@ -642,7 +989,8 @@ def main() -> int:
         terminate_current_child(signal.SIGKILL)
         checkpoint_path.unlink(missing_ok=True)
         progress_path.unlink(missing_ok=True)
-        output_path.unlink(missing_ok=True)
+        if not shard_mode:
+            output_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

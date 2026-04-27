@@ -39,7 +39,11 @@
 # Configurable via environment (sourced from /etc/agentd/runtime.env when
 # invoked by systemd):
 #   ANYSCAN_TUNE_DISABLE                "true" to skip entirely (default: unset)
-#   ANYSCAN_TUNE_INTERFACE              egress NIC (default: default-route iface)
+#   ANYSCAN_TUNE_INTERFACE              egress NIC, comma-separated for
+#                                        multi-NIC deploys; the txqueuelen
+#                                        bump is applied to each iface in
+#                                        the list (default: default-route
+#                                        iface). Alias: ANYSCAN_TUNE_INTERFACES.
 #   ANYSCAN_TUNE_TXQUEUELEN             tx_queue_len (default: 10000)
 #   ANYSCAN_TUNE_NETDEV_MAX_BACKLOG     netdev_max_backlog (default: 30000)
 #   ANYSCAN_TUNE_OPTMEM_MAX             optmem_max (default: 524288)
@@ -115,6 +119,39 @@ resolve_iface() {
         iface="$(detect_default_interface || true)"
     fi
     printf '%s' "$iface"
+}
+
+# Echoes one iface per line, expanding the comma/whitespace-separated value
+# from ANYSCAN_TUNE_INTERFACES (or the legacy ANYSCAN_TUNE_INTERFACE) and
+# falling back to the default-route iface. Multi-NIC sharded scanners
+# need txqueuelen bumped on every NIC the scanner will drive, not just
+# the default-route one.
+resolve_ifaces() {
+    local provided="${ANYSCAN_TUNE_INTERFACES:-${ANYSCAN_TUNE_INTERFACE:-}}"
+    local out=""
+    if [ -n "$provided" ]; then
+        local entry
+        for entry in $(printf '%s' "$provided" | tr ',;' '  '); do
+            entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+            [ -n "$entry" ] || continue
+            case " $out " in
+                *" $entry "*) continue ;;
+            esac
+            if [ -z "$out" ]; then
+                out="$entry"
+            else
+                out="$out $entry"
+            fi
+        done
+    fi
+    if [ -z "$out" ]; then
+        out="$(detect_default_interface || true)"
+    fi
+    [ -n "$out" ] || return 0
+    local entry
+    for entry in $out; do
+        printf '%s\n' "$entry"
+    done
 }
 
 resolve_uint() {
@@ -254,15 +291,23 @@ cmd_apply() {
     write_sysctl_dropin "$target" "$backlog" "$optmem" "$sockmem" "$port_range"
     apply_sysctl "$target"
 
-    local iface
-    iface="$(resolve_iface)"
-    if [ -z "$iface" ]; then
+    local ifaces iface ifaces_applied=""
+    ifaces="$(resolve_ifaces)"
+    if [ -z "$ifaces" ]; then
         log "could not determine egress interface; skipping txqueuelen"
     else
-        set_txqueuelen "$iface" "$txqueuelen"
+        while IFS= read -r iface; do
+            [ -n "$iface" ] || continue
+            set_txqueuelen "$iface" "$txqueuelen"
+            if [ -z "$ifaces_applied" ]; then
+                ifaces_applied="$iface"
+            else
+                ifaces_applied="$ifaces_applied,$iface"
+            fi
+        done <<<"$ifaces"
     fi
 
-    log "tunings applied (sysctl=$target txqueuelen_iface=${iface:-none})"
+    log "tunings applied (sysctl=$target txqueuelen_iface=${ifaces_applied:-none})"
     return 0
 }
 
@@ -277,11 +322,12 @@ cmd_release() {
             log "rm $target failed; sysctl drop-in still in place"
         fi
     fi
-    local iface
-    iface="$(resolve_iface)"
-    if [ -n "$iface" ]; then
+    local ifaces iface
+    ifaces="$(resolve_ifaces)"
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
         set_txqueuelen "$iface" 1000
-    fi
+    done <<<"$ifaces"
     return 0
 }
 
@@ -307,12 +353,13 @@ cmd_status() {
         printf 'net.ipv4.ip_local_port_range = %s\n' \
             "$(cat /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || printf '?')"
     fi
-    local iface
-    iface="$(resolve_iface)"
-    if [ -n "$iface" ]; then
+    local ifaces iface
+    ifaces="$(resolve_ifaces)"
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
         printf '\n== %s txqueuelen ==\n' "$iface"
         cat "/sys/class/net/$iface/tx_queue_len" 2>/dev/null || printf 'unknown\n'
-    fi
+    done <<<"$ifaces"
     return 0
 }
 

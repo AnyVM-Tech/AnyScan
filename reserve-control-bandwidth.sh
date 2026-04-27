@@ -24,7 +24,11 @@
 # Configurable via environment (sourced from /etc/agentd/runtime.env when
 # invoked by systemd):
 #   ANYSCAN_RESERVE_DISABLE              "true" to skip entirely (default: unset)
-#   ANYSCAN_RESERVE_INTERFACE            egress NIC (default: default-route iface)
+#   ANYSCAN_RESERVE_INTERFACE            egress NIC, comma-separated for multi-NIC
+#                                        deploys; the qdisc + class tree is
+#                                        installed on each iface (default:
+#                                        default-route iface). Alias:
+#                                        ANYSCAN_RESERVE_INTERFACES.
 #   ANYSCAN_RESERVE_BANDWIDTH_BPS        reserved control bps  (default: 5000000  = 5 Mbit)
 #   ANYSCAN_RESERVE_LINK_RATE_BPS        link ceiling bps      (default: 1000000000 = 1 Gbit)
 #   ANYSCAN_CONTROL_PLANE_HOST           comma-separated hosts to classify (default: parsed from CONTROL_URL/AGENT_MANAGEMENT_URL)
@@ -95,6 +99,41 @@ detect_default_interface() {
         value="$(awk 'NR > 1 && $2 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null || true)"
     fi
     printf '%s' "${value:-}" | tr -d '[:space:]'
+}
+
+# Resolve the list of ifaces this script should manage.
+#   - ANYSCAN_RESERVE_INTERFACE / ANYSCAN_RESERVE_INTERFACES (comma or
+#     whitespace separated) wins when set.
+#   - Otherwise we fall back to the single default-route iface to preserve
+#     the legacy single-NIC behavior for hosts that have not been moved
+#     to multi-NIC sharding yet.
+# Echoes one iface per line so callers can `while read`.
+resolve_managed_interfaces() {
+    local provided="${ANYSCAN_RESERVE_INTERFACES:-${ANYSCAN_RESERVE_INTERFACE:-}}"
+    local out=""
+    if [ -n "$provided" ]; then
+        local entry
+        for entry in $(printf '%s' "$provided" | tr ',;' '  '); do
+            entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+            [ -n "$entry" ] || continue
+            case " $out " in
+                *" $entry "*) continue ;;
+            esac
+            if [ -z "$out" ]; then
+                out="$entry"
+            else
+                out="$out $entry"
+            fi
+        done
+    fi
+    if [ -z "$out" ]; then
+        out="$(detect_default_interface || true)"
+    fi
+    [ -n "$out" ] || return 0
+    local entry
+    for entry in $out; do
+        printf '%s\n' "$entry"
+    done
 }
 
 extract_host_from_url() {
@@ -330,11 +369,9 @@ cmd_apply() {
         return 0
     fi
 
-    local iface="${ANYSCAN_RESERVE_INTERFACE:-}"
-    if [ -z "$iface" ]; then
-        iface="$(detect_default_interface || true)"
-    fi
-    if [ -z "$iface" ]; then
+    local interfaces
+    interfaces="$(resolve_managed_interfaces)"
+    if [ -z "$interfaces" ]; then
         log "could not determine egress interface; skipping"
         return 0
     fi
@@ -354,15 +391,22 @@ cmd_apply() {
         reserve_bps=$(( link_rate_bps / 2 ))
     fi
 
-    log "applying egress reservation on $iface: control=${reserve_bps}bps reserve, link=${link_rate_bps}bps ceiling"
-
-    if ! setup_qdisc "$iface" "$link_rate_bps" "$reserve_bps"; then
-        log "qdisc setup failed; tearing down partial state"
-        teardown_qdisc "$iface"
-        return 0
-    fi
+    # iptables CLASSIFY rules are not iface-bound, so we install the
+    # mangle chain once and let it apply across every NIC the qdisc tree
+    # gets installed on below.
     apply_classification
-    log "reservation active on $iface"
+
+    local iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        log "applying egress reservation on $iface: control=${reserve_bps}bps reserve, link=${link_rate_bps}bps ceiling"
+        if ! setup_qdisc "$iface" "$link_rate_bps" "$reserve_bps"; then
+            log "qdisc setup failed on $iface; tearing down partial state"
+            teardown_qdisc "$iface"
+            continue
+        fi
+        log "reservation active on $iface"
+    done <<<"$interfaces"
     return 0
 }
 
@@ -370,33 +414,34 @@ cmd_release() {
     if ! command_exists tc; then
         return 0
     fi
-    local iface="${ANYSCAN_RESERVE_INTERFACE:-}"
-    if [ -z "$iface" ]; then
-        iface="$(detect_default_interface || true)"
-    fi
+    local interfaces iface
+    interfaces="$(resolve_managed_interfaces)"
     teardown_iptables
-    if [ -n "$iface" ]; then
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
         teardown_qdisc "$iface"
         log "released reservation on $iface"
-    fi
+    done <<<"$interfaces"
     return 0
 }
 
 cmd_status() {
-    local iface="${ANYSCAN_RESERVE_INTERFACE:-}"
-    if [ -z "$iface" ]; then
-        iface="$(detect_default_interface || true)"
-    fi
-    if [ -z "$iface" ]; then
+    local interfaces iface
+    interfaces="$(resolve_managed_interfaces)"
+    if [ -z "$interfaces" ]; then
         printf '%s no interface\n' "$LOG_PREFIX"
         return 0
     fi
-    printf '== qdisc on %s ==\n' "$iface"
-    tc -s qdisc show dev "$iface" 2>/dev/null || true
-    printf '\n== classes on %s ==\n' "$iface"
-    tc -s class show dev "$iface" 2>/dev/null || true
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        printf '== qdisc on %s ==\n' "$iface"
+        tc -s qdisc show dev "$iface" 2>/dev/null || true
+        printf '\n== classes on %s ==\n' "$iface"
+        tc -s class show dev "$iface" 2>/dev/null || true
+        printf '\n'
+    done <<<"$interfaces"
     if command_exists iptables; then
-        printf '\n== iptables mangle %s ==\n' "$ANYSCAN_RESERVE_CHAIN"
+        printf '== iptables mangle %s ==\n' "$ANYSCAN_RESERVE_CHAIN"
         iptables -t mangle -S "$ANYSCAN_RESERVE_CHAIN" 2>/dev/null \
             || printf '%s chain not present\n' "$ANYSCAN_RESERVE_CHAIN"
     fi
