@@ -491,6 +491,7 @@ const KNOWN_PATH_PROFILES: &[&str] = &[
     "cicd-configs",
     "mobile-artifacts",
     "cloud-storage-listing",
+    "dotenv-variants",
 ];
 
 const BASELINE_PATHS: &[&str] = &[
@@ -1086,6 +1087,124 @@ const CLOUD_STORAGE_LISTING_PATHS: &[&str] = &[
     "/services/list-buckets",
 ];
 
+// Comprehensive `.env` variant coverage. The `baseline` profile already
+// probes `/.env` and `/.env.local`; this profile is purely additive and
+// covers the rest of the lifecycle (dev/prod/staging/qa/uat/test),
+// framework-specific suffixes (Next/Vite/Atlas/Vault/Vercel/Netlify/
+// Heroku/Docker/Compose), backup and editor-swap forms, edge spellings
+// (`.envrc`, `.flaskenv`, `dotenv`, underscore variants), and the most
+// common subdirectory placements. Dynamic per-target expansion of the
+// lifecycle suffixes for any discovered `.env*` is handled by
+// `tech_paths::sensitive_variant_candidates`.
+const DOTENV_VARIANT_PATHS: &[&str] = &[
+    // Lifecycle variants (root). `/.env` and `/.env.local` are in
+    // `baseline`; `sanitize_paths` dedupes any overlap.
+    "/.env.development",
+    "/.env.production",
+    "/.env.staging",
+    "/.env.test",
+    "/.env.testing",
+    "/.env.dev",
+    "/.env.prod",
+    "/.env.qa",
+    "/.env.uat",
+    "/.env.example",
+    "/.env.sample",
+    "/.env.dist",
+    "/.env.template",
+    "/.env.default",
+    // Framework / platform-specific (Next.js, Vite, MongoDB Atlas,
+    // HashiCorp Vault, Vercel, Netlify, Heroku, Docker, Compose).
+    "/.env.development.local",
+    "/.env.production.local",
+    "/.env.staging.local",
+    "/.env.test.local",
+    "/.env.docker",
+    "/.env.compose",
+    "/.env.shared",
+    "/.env.atlas",
+    "/.env.vault",
+    "/.env.vercel",
+    "/.env.netlify",
+    "/.env.heroku",
+    // Backup / swap forms for the most common base names. We pick the
+    // top lifecycle entries × the highest-signal suffixes rather than
+    // a full Cartesian product (which would balloon the profile to
+    // ~250 entries and exceed reasonable per-target budgets).
+    "/.env.bak",
+    "/.env.old",
+    "/.env.orig",
+    "/.env.save",
+    "/.env~",
+    "/.env.swp",
+    "/.env.swo",
+    // Dotfile-prefixed swap form (vim writes `.env` -> `/.env.swp`,
+    // some editors write `/.env.swp` as `/.env.swp` or `/..env.swp`).
+    "/..env.swp",
+    "/..env.swo",
+    "/.env.local.bak",
+    "/.env.local.old",
+    "/.env.local.orig",
+    "/.env.local.swp",
+    "/.env.local~",
+    "/.env.production.bak",
+    "/.env.production.old",
+    "/.env.production.orig",
+    "/.env.production.swp",
+    "/.env.production~",
+    "/.env.staging.bak",
+    "/.env.staging.old",
+    "/.env.staging.swp",
+    "/.env.staging~",
+    "/.env.development.bak",
+    "/.env.development.old",
+    "/.env.development.swp",
+    "/.env.development~",
+    "/.env.dev.bak",
+    "/.env.dev.old",
+    "/.env.prod.bak",
+    "/.env.prod.old",
+    // Edge cases: direnv (`.envrc`), Flask (`.flaskenv`), bare
+    // `dotenv`/`.dotenv` files (some Node projects use these), and
+    // no-leading-dot `env*` files seen on misconfigured static hosts.
+    "/.envrc",
+    "/.flaskenv",
+    "/dotenv",
+    "/.dotenv",
+    "/env",
+    "/env.local",
+    "/env.production",
+    // Underscore variants seen in older code that disallows dots in
+    // filenames (e.g. some Windows-export workflows).
+    "/.env_local",
+    "/.env_production",
+    "/.env_development",
+    "/.env_staging",
+    // Common subdirectory placements. We keep the static set tight
+    // (root .env in the typical service folders); dynamic expansion
+    // via `sensitive_variant_candidates` produces the lifecycle
+    // variants for each one when discovered.
+    "/api/.env",
+    "/api/.env.local",
+    "/api/.env.production",
+    "/admin/.env",
+    "/admin/.env.local",
+    "/config/.env",
+    "/config/.env.local",
+    "/app/.env",
+    "/app/.env.local",
+    "/server/.env",
+    "/server/.env.local",
+    "/backend/.env",
+    "/backend/.env.local",
+    "/frontend/.env",
+    "/frontend/.env.local",
+    "/web/.env",
+    "/web/.env.local",
+    "/src/.env",
+    "/src/.env.local",
+];
+
 const DEFAULT_BOOTSTRAP_REPOSITORY_NAME: &str = "VulnScanner-zmap-alternative";
 const DEFAULT_BOOTSTRAP_REPOSITORY_GITHUB_URL: &str =
     "https://github.com/Lorikazzzz/VulnScanner-zmap-alternative.git";
@@ -1634,6 +1753,7 @@ fn path_profile_paths(profile: &str) -> Option<&'static [&'static str]> {
         "cicd-configs" => Some(CICD_CONFIG_PATHS),
         "mobile-artifacts" => Some(MOBILE_ARTIFACT_PATHS),
         "cloud-storage-listing" => Some(CLOUD_STORAGE_LISTING_PATHS),
+        "dotenv-variants" => Some(DOTENV_VARIANT_PATHS),
         _ => None,
     }
 }
@@ -4030,6 +4150,86 @@ mod tests {
         assert!(paths.contains(&"/debug/pprof/".to_string()));
         assert!(paths.contains(&"/debug/vars".to_string()));
         assert!(paths.contains(&"/v2/_catalog".to_string()));
+    }
+
+    #[test]
+    fn dotenv_variants_profile_expands_lifecycle_and_subdir_paths() {
+        let mut config = AppConfig::default();
+        config.inventory.path_profiles = vec!["dotenv-variants".to_string()];
+        config.inventory.default_paths.clear();
+        config
+            .validate()
+            .expect("dotenv-variants profile should validate");
+
+        let paths = config
+            .resolved_default_paths()
+            .expect("dotenv-variants profile should resolve");
+
+        // Lifecycle.
+        assert!(paths.contains(&"/.env.production".to_string()));
+        assert!(paths.contains(&"/.env.staging".to_string()));
+        assert!(paths.contains(&"/.env.development".to_string()));
+        assert!(paths.contains(&"/.env.test".to_string()));
+        assert!(paths.contains(&"/.env.example".to_string()));
+        assert!(paths.contains(&"/.env.uat".to_string()));
+
+        // Framework / platform-specific.
+        assert!(paths.contains(&"/.env.production.local".to_string()));
+        assert!(paths.contains(&"/.env.docker".to_string()));
+        assert!(paths.contains(&"/.env.vault".to_string()));
+        assert!(paths.contains(&"/.env.vercel".to_string()));
+        assert!(paths.contains(&"/.env.netlify".to_string()));
+
+        // Backup / swap forms.
+        assert!(paths.contains(&"/.env.bak".to_string()));
+        assert!(paths.contains(&"/.env.swp".to_string()));
+        assert!(paths.contains(&"/.env~".to_string()));
+        assert!(paths.contains(&"/.env.production.bak".to_string()));
+        assert!(paths.contains(&"/..env.swp".to_string()));
+
+        // Edge cases.
+        assert!(paths.contains(&"/.envrc".to_string()));
+        assert!(paths.contains(&"/.flaskenv".to_string()));
+        assert!(paths.contains(&"/dotenv".to_string()));
+        assert!(paths.contains(&"/.env_local".to_string()));
+        assert!(paths.contains(&"/.env_production".to_string()));
+
+        // Subdirectory placements.
+        assert!(paths.contains(&"/api/.env".to_string()));
+        assert!(paths.contains(&"/api/.env.local".to_string()));
+        assert!(paths.contains(&"/admin/.env".to_string()));
+        assert!(paths.contains(&"/config/.env".to_string()));
+        assert!(paths.contains(&"/server/.env".to_string()));
+        assert!(paths.contains(&"/backend/.env".to_string()));
+        assert!(paths.contains(&"/frontend/.env".to_string()));
+    }
+
+    #[test]
+    fn dotenv_variants_profile_is_additive_to_baseline() {
+        // The static profile is documented as additive to `baseline`
+        // (which already covers `/.env` and `/.env.local`) — adding it
+        // alongside baseline must not raise a duplicate error and the
+        // resolved set must contain entries from both.
+        let mut config = AppConfig::default();
+        config.inventory.path_profiles = vec![
+            "baseline".to_string(),
+            "dotenv-variants".to_string(),
+        ];
+        config.inventory.default_paths.clear();
+        config
+            .validate()
+            .expect("baseline + dotenv-variants must validate");
+
+        let paths = config
+            .resolved_default_paths()
+            .expect("combined profile should resolve");
+
+        // From baseline.
+        assert!(paths.contains(&"/.env".to_string()));
+        assert!(paths.contains(&"/.env.local".to_string()));
+        // From dotenv-variants.
+        assert!(paths.contains(&"/.env.production".to_string()));
+        assert!(paths.contains(&"/.env.staging".to_string()));
     }
 
     #[test]
