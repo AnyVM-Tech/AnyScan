@@ -8,8 +8,12 @@ RUNTIME_ENV_DIR="$(dirname "$RUNTIME_ENV_FILE")"
 LOCAL_ENV_FILE="$SCRIPT_DIR/.external-runtime.env"
 LOCAL_BOOTSTRAP_ARTIFACT_DIR="${ANYSCAN_LOCAL_BOOTSTRAP_ARTIFACT_DIR:-$REPO_ROOT/.cache/anyscan/bootstrap-artifacts}"
 
-VULNSCANNER_REPO_URL="${ANYSCAN_VULNSCANNER_REPO_URL:-https://github.com/Lorikazzzz/VulnScanner-zmap-alternative.git}"
-VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$REPO_ROOT/VulnScanner-zmap-alternative-}"
+# The scanner C source lives in AnyVM-Tech/anyscan-engine-c — a fork of the
+# upstream Lorikazzzz/VulnScanner-zmap-alternative- repo that AnyVM-Tech can
+# carry patches against (AF_XDP integration, PF_RING ZC dispatch fix, etc.).
+# See plans/2026-04-27-portscan-afxdp-plan-v1.md §9.1.
+VULNSCANNER_REPO_URL="${ANYSCAN_VULNSCANNER_REPO_URL:-https://github.com/AnyVM-Tech/anyscan-engine-c.git}"
+VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$REPO_ROOT/anyscan-engine-c}"
 VULNSCANNER_BIN_PATH="$VULNSCANNER_REPO_DIR/scanner"
 VULNSCANNER_INSTALLED_BIN="/opt/anyscan/bin/scanner"
 
