@@ -488,6 +488,19 @@ main() {
         useradd --system --user-group --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
     fi
 
+    # Grant the service user read access to the systemd journal so operators
+    # (and remote-debug commands routed via the API) can tail `journalctl -u
+    # agentd` as $SERVICE_USER. The unit runs with NoNewPrivileges=true, so
+    # `sudo journalctl` from inside the service is blocked; group membership
+    # is the supported route. Idempotent: only adds when the group exists
+    # locally and the user is not already a member.
+    if getent group systemd-journal >/dev/null 2>&1; then
+        if ! id -nG "$SERVICE_USER" 2>/dev/null | tr ' ' '\n' | grep -qx systemd-journal; then
+            printf '[*] Adding %s to systemd-journal group for journalctl access...\n' "$SERVICE_USER"
+            usermod -aG systemd-journal "$SERVICE_USER"
+        fi
+    fi
+
     printf '[*] Creating install directories...\n'
     install -d -m 0755 "$INSTALL_ROOT" "$BIN_DIR" "$EXTENSIONS_DIR"
     install -d -m 0755 "$EXTENSIONS_DIR/bundled" "$EXTENSIONS_DIR/bundled/manifests" "$EXTENSIONS_DIR/bundled/rules" "$EXTENSIONS_DIR/bundled/scripts"
