@@ -15,25 +15,23 @@
     "summary": "Browserless - Unauthenticated Headless Chrome (SSRF + LFI) markers were observed in a public response.",
     "evidence_template": "{product_name} markers were observed at {path}.",
     "evidence": "Browserless - Unauthenticated Headless Chrome (SSRF + LFI) markers were observed in a public response.",
-    "aliases": [
-      "browserless"
-    ],
+    "aliases": [],
     "any_of_path_contains": [
       "/json/version",
-      "/content",
-      "/download",
-      "/function",
-      "/pdf",
-      "/screenshot",
-      "/scrape",
-      "/unblock"
+      "/json/list",
+      "/json/protocol",
+      "/json/new",
+      "/pressure",
+      "/sessions",
+      "/workspace",
+      "/screencast"
     ],
     "path_not_contains": [
       "/docs",
       "/blog",
       "/changelog"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:\"webSocketDebuggerUrl\"\\s*:\\s*\"ws://|\"browserwsendpoint\"|browserless/chromium|/devtools/page/|/devtools/browser/)",
     "product_name": "browserless"
   },
   {
@@ -70,10 +68,13 @@
       "geoserver"
     ],
     "any_of_path_contains": [
-      "/geoserver",
-      "/web/"
+      "/geoserver/web/",
+      "/geoserver/ows",
+      "/geoserver/wms",
+      "/geoserver/wfs",
+      "/geoserver/rest"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:geoserver|<title>\\s*geoserver|/geoserver/web/wicket|wicket:id=|geoserver-administration)",
     "product_name": "geoserver"
   },
   {
@@ -95,10 +96,13 @@
       "geoserver"
     ],
     "any_of_path_contains": [
-      "/geoserver",
-      "/web/"
+      "/geoserver/web/",
+      "/geoserver/ows",
+      "/geoserver/wms",
+      "/geoserver/wfs",
+      "/geoserver/rest"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:geoserver|<title>\\s*geoserver|/geoserver/web/wicket|wicket:id=|geoserver-administration)",
     "product_name": "geoserver"
   },
   {
@@ -139,6 +143,7 @@
       "/changelog",
       "/help"
     ],
+    "body_regex": "(?i)(?:\"data\"\\s*:\\s*\\{|\"errors\"\\s*:\\s*\\[\\s*\\{\\s*\"message\"|\"__schema\"\\s*:|\"__typename\"\\s*:|<title>\\s*GraphiQL|playground\\.min\\.js|altair-graphql|voyager|introspectionquery)",
     "product_name": "graphql"
   },
   {
@@ -199,6 +204,7 @@
     "evidence": "GraphQL introspection response markers were observed in a public response.",
     "aliases": [],
     "body_regex": "(?:\"__schema\"\\s*:\\s*\\{|\"types\"\\s*:\\s*\\[\\s*\\{\\s*\"kind\"\\s*:\\s*\"OBJECT\")",
+    "min_body_bytes": 0,
     "product_name": "graphql"
   },
   {
@@ -219,6 +225,7 @@
     "evidence": "GraphQL error envelope markers were observed in a public response.",
     "aliases": [],
     "body_regex": "\\{\\s*\"errors\"\\s*:\\s*\\[\\s*\\{\\s*\"message\"\\s*:",
+    "min_body_bytes": 0,
     "product_name": "graphql"
   },
   {
@@ -244,14 +251,14 @@
     ],
     "any_of_path_contains": [
       "/guacamole/",
-      "/api/tokens",
-      "/#/client/"
+      "/guacamole/api/tokens",
+      "/guacamole/#/"
     ],
     "path_not_contains": [
       "/documentation",
       "/manual"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:<title>\\s*apache\\s+guacamole|guac-login|guac-display|guacamole/index\\.html|guacamole-common-js|\"authToken\"\\s*:\\s*\")",
     "product_name": "apache guacamole"
   },
   {
@@ -272,11 +279,10 @@
       "ictbroadcast"
     ],
     "any_of_path_contains": [
-      "/ictbroadcast",
-      "/broadcast",
-      "/livecallcenter"
+      "/ictbroadcast/",
+      "/livecallcenter/"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:ictbroadcast|<title>\\s*ictbroadcast|livecallcenter|ICTGroup\\b)",
     "product_name": "ictbroadcast"
   },
   {
@@ -299,16 +305,17 @@
       "langflow"
     ],
     "any_of_path_contains": [
-      "/api/v1",
-      "/health",
-      "/login",
-      "/lf/"
+      "/api/v1/flows",
+      "/api/v1/components",
+      "/api/v1/store",
+      "/lf/",
+      "/flows/"
     ],
     "path_not_contains": [
       "/docs",
       "/blog"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:langflow|<title>\\s*langflow|/static/lf-|langflow-app)",
     "product_name": "langflow"
   },
   {
@@ -327,7 +334,9 @@
     "evidence": "Log4J exploit markers were observed in a public response.",
     "aliases": [],
     "detector": "log4j_opportunistic_marker",
-    "body_regex": "(?i)(?:\\$\\{jndi:(?:ldap|rmi|dns|nis|iiop):|log4shell|log4j)",
+    "body_regex": "(?i)\\$\\{(?:jndi:(?:ldap|ldaps|rmi|dns|nis|iiop|corba|nds|http|https):|(?:lower|upper|env|sys|date|java):[^}]+\\}\\s*\\$\\{jndi:)",
+    "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "Log4JOpportunistic"
   },
   {
@@ -350,15 +359,16 @@
       "adobe commerce"
     ],
     "any_of_path_contains": [
-      "/rest/",
-      "/graphql",
-      "/admin"
+      "/rest/V1/",
+      "/rest/all/V1/",
+      "/admin/admin/dashboard",
+      "/customer/account/login"
     ],
     "path_not_contains": [
       "/docs",
       "/developer"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:magento|adobe commerce|/static/version\\d+/frontend/Magento|mage\\.cookies|<meta\\s+name=\"author\"\\s+content=\"magento)",
     "product_name": "magento"
   },
   {
@@ -377,7 +387,9 @@
     "evidence": "Suspicious malware/operator markers were observed in an unsolicited HTTP response.",
     "aliases": [],
     "detector": "malware_http_indicator",
-    "body_regex": "(?i)(?:mirai|gafgyt|botnet|cobalt strike|sliver|metasploit|malware|webshell)",
+    "body_regex": "(?i)(?:<\\?php\\s+(?:eval|assert|system|passthru|shell_exec|base64_decode)\\s*\\(|c99shell|r57shell|wso\\s*shell|b374k\\s*shell|/cgi-bin/.*\\?cmd=|coinhive|cryptonight|stratum\\+tcp://)",
+    "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "MalwareHttpPlugin"
   },
   {
@@ -403,9 +415,9 @@
       "/meshagents",
       "/control.ashx",
       "/agentinvite",
-      "/login"
+      "/meshcentral.js"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:meshcentral|<title>\\s*meshcentral|/scripts/meshcentral|meshrouter|/scripts/agent-redir)",
     "product_name": "meshcentral"
   },
   {
@@ -459,12 +471,14 @@
       "netbox"
     ],
     "any_of_path_contains": [
-      "/api/status",
-      "/dcim/",
-      "/ipam/",
-      "/circuits/"
+      "/api/status/",
+      "/api/dcim/",
+      "/api/ipam/",
+      "/api/circuits/",
+      "/dcim/devices/",
+      "/ipam/prefixes/"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:\"netbox-version\"|<title>[^<]*netbox|netbox-app|/static/netbox\\.|django\\s+netbox)",
     "product_name": "netbox"
   },
   {
@@ -490,9 +504,9 @@
     "any_of_path_contains": [
       "/red/",
       "/flows",
-      "/settings"
+      "/red/settings"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:node-red|<title>\\s*node-red|/red/red\\.min\\.js|/red/main\\.js|nr-workspace|nodered/nodered|node-red/node-red)",
     "product_name": "node-red"
   },
   {
@@ -516,6 +530,8 @@
       "/cgi-bin/",
       ".php"
     ],
+    "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "PhpCgiRcePlugin"
   },
   {
@@ -535,6 +551,8 @@
     "aliases": [],
     "detector": "php_stdin_best_effort",
     "body_regex": "(?i)(?:php://input|stdin|auto_prepend_file)",
+    "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "PhpStdinPlugin"
   },
   {
@@ -561,9 +579,9 @@
       "/api/overview",
       "/api/whoami",
       "/api/nodes",
-      "/rabbitmq/"
+      "/rabbitmq/api/"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:rabbitmq|<title>\\s*rabbitmq|\"management_version\"|\"rabbitmq_version\"|\"erlang_version\"|/cli/rabbitmqctl)",
     "product_name": "rabbitmq management"
   },
   {
@@ -584,11 +602,12 @@
       "rustfs"
     ],
     "any_of_path_contains": [
-      "/minio/health",
-      "/rpc/",
-      "/console/"
+      "/minio/health/live",
+      "/minio/health/ready",
+      "/rustfs/",
+      "/rpc/v1"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:rustfs|<title>\\s*rustfs|\\\"rustfs_version\\\"|/static/rustfs)",
     "product_name": "rustfs"
   },
   {
@@ -630,12 +649,14 @@
       "selenoid"
     ],
     "any_of_path_contains": [
-      "/status",
-      "/wd/hub",
+      "/wd/hub/",
+      "/wd/hub/status",
+      "/selenoid/",
+      "/host/",
       "/video/",
       "/vnc/"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:selenoid|aerokube|<title>\\s*selenoid|\"selenoid\\b|/selenoid-ui/|/wd/hub/session)",
     "product_name": "selenoid"
   },
   {
@@ -658,9 +679,10 @@
     "any_of_path_contains": [
       "/spip.php",
       "/ecrire/",
-      "/spip/"
+      "/spip/",
+      "/IMG/"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:<meta\\s+name=\"generator\"\\s+content=\"spip|spip\\.php|/IMG/siteon0|spip-bandeau|/squelettes/|composantes/spip)",
     "product_name": "spip"
   },
   {
@@ -685,14 +707,16 @@
     ],
     "any_of_path_contains": [
       "/superset/welcome",
-      "/api/v1",
-      "/login/"
+      "/superset/dashboard",
+      "/api/v1/dashboard",
+      "/api/v1/chart",
+      "/login/?next=/superset"
     ],
     "path_not_contains": [
       "/docs",
       "/faq"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:<title>\\s*superset|apache\\s+superset|/static/assets/.*superset|superset-extensions|superset-frontend|powered by apache superset)",
     "product_name": "apache superset"
   },
   {
@@ -715,11 +739,14 @@
       "surreal db"
     ],
     "any_of_path_contains": [
-      "/health",
+      "/rpc",
+      "/sql",
       "/signin",
-      "/sql"
+      "/signup",
+      "/key/",
+      "/version"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:surrealdb|surreal\\s+db|\"surrealdb-version\"|\\bsurrealdb-\\d|surrealist)",
     "product_name": "surrealdb"
   },
   {
@@ -741,11 +768,13 @@
       "tacticalrmm"
     ],
     "any_of_path_contains": [
-      "/api/v3",
-      "/login",
-      "/mesh/"
+      "/api/v3/checkrunner",
+      "/api/v3/agents",
+      "/api/v3/sysinfo",
+      "/tacticalrmm/",
+      "/mesh/agent.ashx"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:tacticalrmm|tactical\\s+rmm|<title>[^<]*tactical\\s+rmm|trmm|/static/assets/tactical)",
     "product_name": "tactical rmm"
   },
   {
@@ -768,11 +797,12 @@
     ],
     "any_of_path_contains": [
       "/tika",
-      "/meta",
-      "/rmeta",
-      "/detect/stream"
+      "/rmeta/",
+      "/detect/stream",
+      "/version",
+      "/parser"
     ],
-    "min_score": 2,
+    "body_regex": "(?i)(?:apache\\s+tika|<title>\\s*tika|\\btika-server-\\d|tika\\s+server|\"X-TIKA:|application/x-tika-)",
     "product_name": "apache tika"
   },
   {
@@ -792,7 +822,9 @@
     "evidence": "Traversal markers were observed in a public HTTP response.",
     "aliases": [],
     "detector": "traversal_http_best_effort",
-    "body_regex": "(?i)(?:root:.:0:0:|for 16-bit app support|\\[extensions\\]|boot loader|zone\\.transfer|<!doctype html public)",
+    "body_regex": "(?i)(?:root:[^:\\r\\n]*:0:0:[^:\\r\\n]*:[/]|for 16-bit app support|\\[boot loader\\]\\s*\\r?\\n|\\[fonts\\]\\s*\\r?\\n|\\[extensions\\]\\s*\\r?\\n|zone\\.transfer)",
+    "status_in": [],
+    "min_body_bytes": 0,
     "product_name": "TraversalHttpPlugin"
   },
   {
@@ -815,6 +847,7 @@
     "detector": "wordpress_user_enumeration_best_effort",
     "path_regex": "(?i)(?:/wp-json/wp/v2/users|[?&]author=\\d+)",
     "body_regex": "(?i)\"slug\"\\s*:\\s*\"[^\"]+\"",
+    "min_body_bytes": 0,
     "product_name": "WpUserEnumHttp"
   }
 ]

