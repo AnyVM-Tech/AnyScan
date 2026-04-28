@@ -483,6 +483,21 @@ install_pfring_zc_build_deps() {
 #
 # Set ANYSCAN_INSTALL_DPDK_DEPS=false to suppress this block (e.g. on
 # AMIs where the operator pre-pinned a different libdpdk version).
+# Per-NIC DPDK PMD packages. Debian DPDK 24.11.x ships every Poll-Mode
+# Driver as its own package (librte-net-<vendor><abi>) instead of shoving
+# them all into libdpdk-dev. Without the relevant PMD installed,
+# rte_eal_init() succeeds but no eth ports are probed and the scanner
+# refuses to start (anygpt-52 hit this on c6in.metal: ENA NICs silently
+# absent from rte_eth_dev_count_avail() until librte-net-ena25 was
+# apt-installed manually).
+#
+# We pull both the AWS PMD (ENA — every c6in/c5n/m5n/m6in instance) and
+# the Mellanox PMD (mlx5 — bare-metal hosts at Equinix/OVH/Hetzner with
+# CX-5/CX-6 NICs). Stock Intel ixgbe/i40e drivers are still in
+# libdpdk-dev's auto-pull set so we don't need to name them. The 25 ABI
+# suffix matches Debian trixie's DPDK 24.11.x (libdpdk-dev → librte-*-25).
+DPDK_PMD_PACKAGES=(librte-net-ena25 librte-net-mlx5-25)
+
 install_dpdk_build_deps() {
 	if [ "${ANYSCAN_INSTALL_DPDK_DEPS:-true}" != "true" ]; then
 		return 0
@@ -499,21 +514,32 @@ install_dpdk_build_deps() {
 	else
 		printf '[*] Skipping DPDK build deps: not root and sudo is not available.\n'
 		printf '    Install manually if you plan to build the scanner with USE_DPDK=1:\n'
-		printf '      sudo apt-get install -y libdpdk-dev dpdk\n'
+		printf '      sudo apt-get install -y libdpdk-dev dpdk %s\n' "${DPDK_PMD_PACKAGES[*]}"
 		return 0
 	fi
 	if [ "${apt_cmd[0]}" = "sudo" ] && ! sudo -n true >/dev/null 2>&1; then
 		printf '[*] Skipping DPDK build deps: sudo would prompt for a password.\n'
 		printf '    Install manually if you plan to build the scanner with USE_DPDK=1:\n'
-		printf '      sudo apt-get install -y libdpdk-dev dpdk\n'
+		printf '      sudo apt-get install -y libdpdk-dev dpdk %s\n' "${DPDK_PMD_PACKAGES[*]}"
 		return 0
 	fi
-	printf '[*] Installing DPDK build deps (libdpdk-dev dpdk)...\n'
+	printf '[*] Installing DPDK build deps (libdpdk-dev dpdk %s)...\n' "${DPDK_PMD_PACKAGES[*]}"
 	if ! "${apt_cmd[@]}" install -y --no-install-recommends \
-		libdpdk-dev dpdk >/dev/null 2>&1; then
-		printf '[!] apt-get install of DPDK build deps failed; the scanner will still build with default `make`.\n' >&2
-		printf '    Re-run with USE_DPDK=1 only after libdpdk-dev is present.\n' >&2
-		return 0
+		libdpdk-dev dpdk "${DPDK_PMD_PACKAGES[@]}" >/dev/null 2>&1; then
+		# Fall back to libdpdk-dev alone if PMD packages are unavailable
+		# in the current archive — better to ship a partial DPDK build
+		# than fail the whole install. The scanner will still link
+		# against librte_eal but rte_eth_dev_count_avail() will return
+		# 0 on hosts whose NIC PMD is missing.
+		printf '[!] apt-get install of DPDK build deps incl. PMDs failed; retrying without PMDs.\n' >&2
+		if ! "${apt_cmd[@]}" install -y --no-install-recommends \
+			libdpdk-dev dpdk >/dev/null 2>&1; then
+			printf '[!] apt-get install of DPDK build deps failed; the scanner will still build with default `make`.\n' >&2
+			printf '    Re-run with USE_DPDK=1 only after libdpdk-dev is present.\n' >&2
+			return 0
+		fi
+		printf '[!] DPDK PMD packages (%s) not installed; rte_eth_dev_count_avail() may return 0 at runtime on ENA/mlx5 hosts.\n' "${DPDK_PMD_PACKAGES[*]}" >&2
+		printf '    Install manually once available: sudo apt-get install -y %s\n' "${DPDK_PMD_PACKAGES[*]}" >&2
 	fi
 }
 

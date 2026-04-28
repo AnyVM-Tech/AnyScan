@@ -298,6 +298,91 @@ else
     note_fail "dpdk cached-binary path" "install-external-deps.sh exited non-zero (see $case_dir/stderr.log)"
 fi
 
+# ---------------------------------------------------------------------------
+# Case 5: ANYSCAN_INSTALL_DPDK_DEPS=true → apt-get install includes the
+#         per-NIC PMD packages (librte-net-ena25 + librte-net-mlx5-25).
+#
+# Without these, rte_eal_init() succeeds but rte_eth_dev_count_avail()
+# returns 0 on ENA hosts (anygpt-52 hit this on c6in.metal: librte-net-
+# ena25 had to be apt-installed manually before the scanner could see
+# any eth ports). PR #65 issuecomment-4339242358.
+# ---------------------------------------------------------------------------
+case_dir="$WORK_ROOT/case-dpdk-pmd-install"
+mkdir -p "$case_dir"
+
+repo_dir="$case_dir/engine"
+runtime_env="$case_dir/runtime.env"
+artifact_dir="$case_dir/artifacts"
+make_log="$case_dir/make.log"
+git_log="$case_dir/git.log"
+apt_log="$case_dir/apt.log"
+stub_dir="$case_dir/stubs"
+linkage_marker="$case_dir/linkage-marker"
+
+mkdir -p "$repo_dir" "$artifact_dir"
+: >"$linkage_marker"  # advertise DPDK linkage so make stub produces a librte-linked scanner
+: >"$repo_dir/Makefile"
+
+prepare_stubs "$stub_dir" "$make_log" "$git_log" "$linkage_marker"
+
+# Stub `id` so install_dpdk_build_deps takes the root branch (apt-get
+# directly, not sudo). The script captures id's output via $(id -u …),
+# so the stub must echo "0" not "1".
+cat >"$stub_dir/id" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    -u) printf '0\n' ;;
+    *) printf '0\n' ;;
+esac
+EOF
+chmod +x "$stub_dir/id"
+
+# Stub `apt-get` to record argv and succeed.
+cat >"$stub_dir/apt-get" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$apt_log"
+exit 0
+EOF
+chmod +x "$stub_dir/apt-get"
+
+(
+    export PATH="$stub_dir:$PATH"
+    export ANYSCAN_USE_DPDK=1
+    export ANYSCAN_VULNSCANNER_REPO_DIR="$repo_dir"
+    # Leave ANYSCAN_INSTALL_DPDK_DEPS unset (defaults to true) so
+    # install_dpdk_build_deps actually runs the apt-get path.
+    export ANYSCAN_INSTALL_AFXDP_DEPS=false
+    export ANYSCAN_INSTALL_PFRING_ZC_DEPS=false
+    export ANYSCAN_RUNTIME_ENV_FILE="$runtime_env"
+    export ANYSCAN_LOCAL_BOOTSTRAP_ARTIFACT_DIR="$artifact_dir"
+    unset SUDO_USER
+    "$TARGET_SCRIPT" >"$case_dir/stdout.log" 2>"$case_dir/stderr.log"
+) || note_fail "dpdk pmd install path" \
+    "install-external-deps.sh exited non-zero (see $case_dir/stderr.log)"
+
+if [ -s "$apt_log" ]; then
+    note_pass "dpdk pmd install path invokes apt-get"
+    assert_contains_substring \
+        "dpdk pmd install passes libdpdk-dev to apt-get" \
+        "libdpdk-dev" \
+        "$apt_log"
+    assert_contains_substring \
+        "dpdk pmd install passes librte-net-ena25 to apt-get (ENA PMD for AWS c6in/c5n/m6in)" \
+        "librte-net-ena25" \
+        "$apt_log"
+    assert_contains_substring \
+        "dpdk pmd install passes librte-net-mlx5-25 to apt-get (mlx5 PMD for non-AWS bare metal)" \
+        "librte-net-mlx5-25" \
+        "$apt_log"
+else
+    note_fail "dpdk pmd install path invokes apt-get" \
+        "expected apt-get to be invoked but $apt_log is empty"
+    if [ -f "$case_dir/stderr.log" ]; then
+        printf '    stderr:\n' >&2
+        sed 's/^/      /' "$case_dir/stderr.log" >&2
+    fi
+fi
+
 printf '\n'
 printf 'PASS: %d\n' "$PASS"
 printf 'FAIL: %d\n' "$FAIL"
