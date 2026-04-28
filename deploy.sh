@@ -35,6 +35,12 @@ ENABLED_EXTENSION_MANIFESTS="$LOCAL_BOOTSTRAP_MANIFEST"
 # §3.6 and anygpt-42. When set to 1 the prod-host install path passes
 # USE_AF_XDP=1 to make and rejects a cached AF_PACKET-only binary.
 ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
+# Build-time PF_RING ZC opt-in (anygpt-46). Same shape as
+# ANYSCAN_USE_AF_XDP but probes for libpfring linkage and forwards
+# USE_PFRING_ZC=1 to make. PF_RING ZC requires a commercial ntop license
+# at runtime; without it the libpfring runtime throttles ZC traffic to
+# ~100k pps — flip this on only on hosts where the license is provisioned.
+ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
 
 # Opt-in kernel backport upgrade. Mirrors install-external-deps.sh —
 # see PR 65 issuecomment-4336192354 / anygpt-42 / anygpt-44. Default 0
@@ -114,6 +120,22 @@ binary_has_afxdp_linkage() {
     fi
     if command -v readelf >/dev/null 2>&1; then
         if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libxdp\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+binary_has_pfring_zc_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command -v ldd >/dev/null 2>&1; then
+        if ldd "$bin" 2>/dev/null | grep -q 'libpfring\.so'; then
+            return 0
+        fi
+    fi
+    if command -v readelf >/dev/null 2>&1; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libpfring\.so'; then
             return 0
         fi
     fi
@@ -230,6 +252,9 @@ install_vulnscanner_binary() {
     if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
         make_args+=("USE_AF_XDP=1")
     fi
+    if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
+        make_args+=("USE_PFRING_ZC=1")
+    fi
     # When AF_XDP is requested but the cached source binary lacks libxdp
     # linkage, drop it so the build branch below fires. anygpt-42: the
     # previous logic short-circuited on the existence of a stale
@@ -239,6 +264,19 @@ install_vulnscanner_binary() {
         && [ -x "$VULNSCANNER_SOURCE_BIN" ] \
         && ! binary_has_afxdp_linkage "$VULNSCANNER_SOURCE_BIN"; then
         printf '[*] Removing pre-AF_XDP scanner at %s so the build path with USE_AF_XDP=1 fires.\n' \
+            "$VULNSCANNER_SOURCE_BIN"
+        rm -f "$VULNSCANNER_SOURCE_BIN"
+        if [ -f "$VULNSCANNER_SOURCE_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
+            make -C "$VULNSCANNER_SOURCE_DIR" clean >/dev/null 2>&1 || true
+        fi
+    fi
+    # Same logic for PF_RING ZC: drop a libpfring-less cached binary so
+    # the build path with USE_PFRING_ZC=1 fires. Composes with the AF_XDP
+    # branch — both flags share the same source dir + Makefile invocation.
+    if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ] \
+        && [ -x "$VULNSCANNER_SOURCE_BIN" ] \
+        && ! binary_has_pfring_zc_linkage "$VULNSCANNER_SOURCE_BIN"; then
+        printf '[*] Removing pre-PFRING-ZC scanner at %s so the build path with USE_PFRING_ZC=1 fires.\n' \
             "$VULNSCANNER_SOURCE_BIN"
         rm -f "$VULNSCANNER_SOURCE_BIN"
         if [ -f "$VULNSCANNER_SOURCE_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
@@ -271,6 +309,12 @@ install_vulnscanner_binary() {
 
     if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ] && ! binary_has_afxdp_linkage "$source_bin"; then
         printf '[!] ANYSCAN_USE_AF_XDP=1 but %s does not link libxdp.so. Install libxdp-dev/libbpf-dev/libelf-dev and re-run.\n' \
+            "$source_bin" >&2
+        return 1
+    fi
+
+    if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ] && ! binary_has_pfring_zc_linkage "$source_bin"; then
+        printf '[!] ANYSCAN_USE_PFRING_ZC=1 but %s does not link libpfring.so. Install libpfring-dev (ntop apt-stable repo) and re-run.\n' \
             "$source_bin" >&2
         return 1
     fi

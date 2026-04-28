@@ -421,6 +421,53 @@ apply_afxdp_availability() {
     fi
 }
 
+probe_pfring_zc_runtime_available() {
+    # anygpt-46. The bundled scanner can be invoked with
+    # --io-engine=pfring_zc only when (a) the pfring kernel module is
+    # loaded so /proc/net/pf_ring exists and pfring_zc_open_device can
+    # acquire ZC descriptors and (b) libpfring.so is loadable on the
+    # host (the binary is dynamically linked against it when built with
+    # USE_PFRING_ZC=1). Both checks are cheap and side-effect-free so we
+    # do them at install time and write ANYSCAN_PFRING_ZC_AVAILABLE so
+    # the adapter does not have to redo the probe per-scan.
+    #
+    # We do NOT probe for the commercial license file here because (a)
+    # ntop license check semantics vary across libpfring versions and
+    # are not stable to introspect from outside the library, and (b)
+    # operators may legitimately want ANYSCAN_PFRING_ZC_AVAILABLE=true
+    # in license-throttled mode for testing. The license obligation is
+    # documented in runtime.worker.env.template.
+    if [ ! -e /proc/net/pf_ring ]; then
+        printf 'false'
+        return 0
+    fi
+    if ! command_exists ldconfig; then
+        printf 'false'
+        return 0
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q '\<libpfring\.so'; then
+        printf 'false'
+        return 0
+    fi
+    printf 'true'
+}
+
+apply_pfring_zc_availability() {
+    # Mirror of apply_afxdp_availability: always write (true OR false)
+    # so /etc/agentd/runtime.env carries an explicit value and a partial
+    # upgrade can't leave a stale "true" after the pfring module was
+    # unloaded.
+    local pfring_zc_available
+    pfring_zc_available="$(probe_pfring_zc_runtime_available)"
+    upsert_env_value "ANYSCAN_PFRING_ZC_AVAILABLE" "$pfring_zc_available" "$RUNTIME_ENV_FILE"
+    if [ "$pfring_zc_available" = "true" ]; then
+        printf '[*] PF_RING ZC runtime probe passed (pfring kmod + libpfring.so present); ANYSCAN_PFRING_ZC_AVAILABLE=true.\n'
+        printf '    Note: PF_RING ZC requires a commercial ntop license at runtime to operate above the ~100k pps community-mode throttle.\n'
+    else
+        printf '[*] PF_RING ZC runtime probe failed (pfring kmod absent or libpfring.so missing); ANYSCAN_PFRING_ZC_AVAILABLE=false.\n'
+    fi
+}
+
 apply_scanner_host_tunings() {
     if [ ! -x "$TUNE_SCANNER_HOST_HELPER_DEST_FILE" ]; then
         return 0
@@ -794,6 +841,7 @@ main() {
 
     apply_host_resource_defaults "$cpu_threads"
     apply_afxdp_availability
+    apply_pfring_zc_availability
     apply_scanner_host_tunings
 
     if [ "$existing_install" = "true" ]; then

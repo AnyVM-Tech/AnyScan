@@ -117,23 +117,29 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-# Phase 2 PR D of plans/2026-04-27-portscan-afxdp-plan-v1.md §3.7. The
-# scanner accepts --io-engine={af_packet,af_xdp}; AF_PACKET stays the
-# unconditional default and AF_XDP is opt-in per worker. The install-time
-# probe in install-worker-bundle.sh::probe_afxdp_runtime_available
-# writes ANYSCAN_AF_XDP_AVAILABLE=true|false based on kernel >=5.10
-# AND libxdp.so being loadable; we refuse to forward af_xdp when the
-# probe failed because the scanner would crash at startup with a dlopen
-# error and the worker has no way to recover. The fall-back warning is
-# loud on purpose: silently dropping back to AF_PACKET would let an
-# operator who flipped the knob keep believing they were running on the
-# fast path.
-SUPPORTED_IO_ENGINES = ("af_packet", "af_xdp")
+# Phase 2 PR D of plans/2026-04-27-portscan-afxdp-plan-v1.md §3.7 added
+# af_xdp; anygpt-46 added pfring_zc with the same shape. The scanner
+# accepts --io-engine={af_packet,af_xdp,pfring_zc}; AF_PACKET stays the
+# unconditional default and unconditional fallback. The other engines
+# are opt-in per worker and gated on install-time probes:
+#   - ANYSCAN_AF_XDP_AVAILABLE   — kernel >=5.10 + libxdp.so loadable
+#   - ANYSCAN_PFRING_ZC_AVAILABLE — pfring kmod loaded + libpfring.so loadable
+# We refuse to forward an engine when its probe failed because the
+# scanner would error at startup with a dlopen / cluster-init error and
+# the worker has no way to recover. The fall-back warning is loud on
+# purpose: silently dropping back to AF_PACKET would let an operator who
+# flipped the knob keep believing they were running on the fast path.
+SUPPORTED_IO_ENGINES = ("af_packet", "af_xdp", "pfring_zc")
 DEFAULT_IO_ENGINE = "af_packet"
+
+_IO_ENGINE_AVAILABILITY_KEYS = {
+    "af_xdp": "ANYSCAN_AF_XDP_AVAILABLE",
+    "pfring_zc": "ANYSCAN_PFRING_ZC_AVAILABLE",
+}
 
 
 def resolve_io_engine() -> str:
-    """Resolve the scanner --io-engine value from env, with AF_XDP gating.
+    """Resolve the scanner --io-engine value from env, with availability gating.
 
     Returns the engine string the adapter should pass to the scanner.
     Always returns a value from ``SUPPORTED_IO_ENGINES``; unrecognized,
@@ -153,11 +159,12 @@ def resolve_io_engine() -> str:
             file=sys.stderr,
         )
         return DEFAULT_IO_ENGINE
-    if requested == "af_xdp" and not env_flag("ANYSCAN_AF_XDP_AVAILABLE"):
+    availability_key = _IO_ENGINE_AVAILABILITY_KEYS.get(requested)
+    if availability_key is not None and not env_flag(availability_key):
         print(
-            "[anyscan-adapter] ANYSCAN_SCANNER_IO_ENGINE=af_xdp requested but "
-            "ANYSCAN_AF_XDP_AVAILABLE!=true; the install-time probe did not "
-            "detect a kernel/libxdp combination that supports AF_XDP. "
+            f"[anyscan-adapter] ANYSCAN_SCANNER_IO_ENGINE={requested} requested but "
+            f"{availability_key}!=true; the install-time probe did not "
+            f"detect a host configuration that supports {requested}. "
             f"Falling back to {DEFAULT_IO_ENGINE}.",
             file=sys.stderr,
         )

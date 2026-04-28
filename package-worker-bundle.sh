@@ -35,6 +35,11 @@ BUNDLE_NAME_OVERRIDE="${ANYSCAN_PACKAGE_BUNDLE_NAME:-}"
 # AF_XDP-capable scanner. Default 0 keeps existing bundle CI green.
 # Source: plans/2026-04-27-portscan-afxdp-plan-v1.md §3.6 + anygpt-42.
 ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
+# Build-time PF_RING ZC opt-in (anygpt-46). Same shape as ANYSCAN_USE_AF_XDP
+# but probes for libpfring linkage and forwards USE_PFRING_ZC=1 to make.
+# See install-external-deps.sh for license obligation notes (PF_RING ZC
+# requires a commercial ntop license at runtime).
+ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
 ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT="$SCRIPT_DIR/../../anyscan-engine-c"
 ANYSCAN_VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT}"
 
@@ -347,9 +352,40 @@ binary_has_afxdp_linkage() {
     return 1
 }
 
+# Mirror of binary_has_pfring_zc_linkage in install-external-deps.sh.
+binary_has_pfring_zc_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command_exists ldd; then
+        if ldd "$bin" 2>/dev/null | grep -q 'libpfring\.so'; then
+            return 0
+        fi
+    fi
+    if command_exists readelf; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libpfring\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Resolve the engine make argv so cached invocations match
+# install-external-deps.sh::vulnscanner_make_args byte-for-byte. Stays
+# empty when both build flags are 0; otherwise emits one token per line.
+bundle_engine_make_args() {
+    if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
+        printf 'USE_AF_XDP=1\n'
+    fi
+    if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
+        printf 'USE_PFRING_ZC=1\n'
+    fi
+}
+
 # Fire a `make USE_AF_XDP=1` in the engine repo so the bundle ships an
 # AF_XDP-linked scanner. Used when ANYSCAN_USE_AF_XDP=1 and the cached
 # binary either does not exist or was built without libxdp linkage.
+# When ANYSCAN_USE_PFRING_ZC=1 is also set, the same invocation gets
+# USE_PFRING_ZC=1 appended so a single make line links both code paths.
 rebuild_scanner_with_afxdp() {
     local repo_dir="$1"
     if [ ! -f "$repo_dir/Makefile" ]; then
@@ -361,9 +397,33 @@ rebuild_scanner_with_afxdp() {
         printf '[!] make not on PATH; cannot rebuild scanner with USE_AF_XDP=1.\n' >&2
         return 1
     fi
-    printf '[*] Rebuilding scanner with USE_AF_XDP=1 in %s...\n' "$repo_dir"
+    # shellcheck disable=SC2046  # word-splitting wanted: function emits 0+ tokens
+    local make_args=( $(bundle_engine_make_args) )
+    printf '[*] Rebuilding scanner in %s with %s...\n' "$repo_dir" "${make_args[*]}"
     make -C "$repo_dir" clean >/dev/null 2>&1 || true
-    make -C "$repo_dir" USE_AF_XDP=1
+    make -C "$repo_dir" "${make_args[@]}"
+}
+
+# Fire a `make USE_PFRING_ZC=1` (plus USE_AF_XDP=1 if also requested) so
+# the bundle ships a libpfring-linked scanner. Mirrors
+# rebuild_scanner_with_afxdp; the two helpers funnel through the same
+# argv builder so both flags compose cleanly.
+rebuild_scanner_with_pfring_zc() {
+    local repo_dir="$1"
+    if [ ! -f "$repo_dir/Makefile" ]; then
+        printf '[!] ANYSCAN_USE_PFRING_ZC=1 requested but no Makefile at %s.\n' "$repo_dir" >&2
+        printf '    Run install-external-deps.sh ANYSCAN_USE_PFRING_ZC=1 first, or set ANYSCAN_PACKAGE_VULNSCANNER_BIN to a pre-built PF_RING-ZC-capable scanner binary.\n' >&2
+        return 1
+    fi
+    if ! command_exists make; then
+        printf '[!] make not on PATH; cannot rebuild scanner with USE_PFRING_ZC=1.\n' >&2
+        return 1
+    fi
+    # shellcheck disable=SC2046
+    local make_args=( $(bundle_engine_make_args) )
+    printf '[*] Rebuilding scanner in %s with %s...\n' "$repo_dir" "${make_args[*]}"
+    make -C "$repo_dir" clean >/dev/null 2>&1 || true
+    make -C "$repo_dir" "${make_args[@]}"
 }
 
 copy_runtime_file() {
@@ -614,6 +674,34 @@ main() {
             exit 1
         fi
     fi
+    # PF_RING ZC wire-up (anygpt-46): same shape as AF_XDP. When
+    # ANYSCAN_USE_PFRING_ZC=1 and the candidate binary lacks libpfring
+    # linkage, fire `make USE_PFRING_ZC=1` so the bundled scanner has
+    # the PF_RING ZC io_engine vtable wired in. Composes with AF_XDP —
+    # if both flags are 1 the AF_XDP block above already produced a
+    # binary linked with both libxdp and libpfring (bundle_engine_make_args
+    # emits both tokens) so this branch becomes a no-op linkage check.
+    if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
+        local needs_pfring_rebuild=0
+        if [ -z "$SCANNER_SOURCE_BIN" ] || [ ! -x "$SCANNER_SOURCE_BIN" ]; then
+            needs_pfring_rebuild=1
+        elif ! binary_has_pfring_zc_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[*] %s lacks libpfring linkage; ANYSCAN_USE_PFRING_ZC=1 requires a rebuild.\n' "$SCANNER_SOURCE_BIN"
+            needs_pfring_rebuild=1
+        fi
+        if [ "$needs_pfring_rebuild" = "1" ]; then
+            if ! rebuild_scanner_with_pfring_zc "$ANYSCAN_VULNSCANNER_REPO_DIR"; then
+                printf '[!] ANYSCAN_USE_PFRING_ZC=1 but unable to produce a libpfring-linked scanner. Aborting bundle.\n' >&2
+                exit 1
+            fi
+            SCANNER_SOURCE_BIN="$ANYSCAN_VULNSCANNER_REPO_DIR/scanner"
+        fi
+        if [ ! -x "$SCANNER_SOURCE_BIN" ] || ! binary_has_pfring_zc_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[!] Scanner at %s still lacks libpfring linkage after rebuild. Aborting bundle.\n' \
+                "$SCANNER_SOURCE_BIN" >&2
+            exit 1
+        fi
+    fi
     include_scanner="false"
     if [ -n "$SCANNER_SOURCE_BIN" ] && [ -x "$SCANNER_SOURCE_BIN" ]; then
         printf '[*] Including scanner binary from %s...\n' "$SCANNER_SOURCE_BIN"
@@ -755,6 +843,7 @@ Bundle control route:
 Bundle scanner build:
   scanner_included: ${include_scanner}
   use_af_xdp: ${ANYSCAN_USE_AF_XDP}
+  use_pfring_zc: ${ANYSCAN_USE_PFRING_ZC}
   install_kernel_backport: ${ANYSCAN_INSTALL_KERNEL_BACKPORT}
 EOF
 

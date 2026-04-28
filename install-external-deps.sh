@@ -26,6 +26,24 @@ VULNSCANNER_INSTALLED_BIN="/opt/anyscan/bin/scanner"
 # to. See plans/2026-04-27-portscan-afxdp-plan-v1.md §3.6.
 ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 
+# Build-time PF_RING ZC opt-in (anygpt-46). Mirrors ANYSCAN_USE_AF_XDP. The
+# engine Makefile's USE_PFRING_ZC=1 branch adds -DUSE_PFRING_ZC, links
+# `-lpfring -lpcap`, and pulls src/{send,recv}-pfring.c into the build so
+# the io_engine_pfring_zc vtable in engine.c is wired into pick_io_engine.
+# Without this flag, --io-engine=pfring_zc fails at startup with
+# "binary not built with USE_PFRING_ZC=1". The runtime --io-engine knob
+# (ANYSCAN_SCANNER_IO_ENGINE) plumbed in PR #70 means nothing if this
+# build flag never reaches make.
+#
+# IMPORTANT (license): PF_RING ZC requires a commercial per-host license
+# from ntop to operate at full speed. Without a license, the libpfring
+# runtime falls back to a community/demo mode that throttles ZC traffic
+# to ~100k pps, which is below the rate AF_PACKET already sustains. Set
+# this to 1 only on hosts where the license file is present and the
+# pfring kernel module is loaded; see runtime.worker.env.template for
+# the runtime-side gating knob ANYSCAN_PFRING_ZC_AVAILABLE.
+ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
+
 # Opt-in kernel backport upgrade. Default 0 leaves the running kernel
 # untouched (existing AMIs unchanged). Setting 1 installs the Debian
 # bookworm-backports kernel image so the host can run kernel 6.16+
@@ -69,13 +87,39 @@ binary_has_afxdp_linkage() {
 	return 1
 }
 
+# True when the existing scanner binary was linked against libpfring at
+# build time. The PF_RING ZC build path (USE_PFRING_ZC=1 in the engine
+# Makefile) adds `-lpfring -lpcap` so libpfring.so shows up as a dynamic
+# dependency; the legacy build does not link libpfring at all. Same
+# ldd → readelf fallback as binary_has_afxdp_linkage so the check works
+# on stripped or static glibc hosts.
+binary_has_pfring_zc_linkage() {
+	local bin="$1"
+	[ -x "$bin" ] || return 1
+	if command -v ldd >/dev/null 2>&1; then
+		if ldd "$bin" 2>/dev/null | grep -q 'libpfring\.so'; then
+			return 0
+		fi
+	fi
+	if command -v readelf >/dev/null 2>&1; then
+		if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libpfring\.so'; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
 # Resolve the make argv once so install/bundle/deploy paths produce
-# byte-identical invocations and the unit test in
-# tools/test-install-external-deps-afxdp.sh can assert the expected
-# token list. Stays empty (no extra args) when ANYSCAN_USE_AF_XDP=0.
+# byte-identical invocations and the unit tests in
+# tools/test-install-external-deps-{afxdp,pfring-zc}.sh can assert the
+# expected token list. Stays empty (no extra args) when both
+# ANYSCAN_USE_AF_XDP and ANYSCAN_USE_PFRING_ZC are 0.
 vulnscanner_make_args() {
 	if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
 		printf 'USE_AF_XDP=1\n'
+	fi
+	if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
+		printf 'USE_PFRING_ZC=1\n'
 	fi
 }
 
@@ -275,6 +319,62 @@ install_afxdp_build_deps() {
 	fi
 }
 
+# Install build-time dependencies for the PF_RING ZC I/O path the scanner
+# Makefile gains under USE_PFRING_ZC=1 (-lpfring -lpcap). libpfring is not
+# in stock Debian/Ubuntu, so this helper attempts the system apt-get path
+# first (some derivatives carry it) and falls back to a clear pointer to
+# the ntop apt repo (https://packages.ntop.org/apt-stable/) when the
+# package is not available. We intentionally do NOT auto-add a
+# third-party apt repo from this script — that would alter package
+# provenance on every CI host that runs install-external-deps.sh.
+# Operators who want PF_RING ZC are expected to provision the ntop repo
+# at AMI/image-build time (or by hand) before flipping
+# ANYSCAN_USE_PFRING_ZC=1.
+#
+# Same fail-open semantics as install_afxdp_build_deps: skip if apt-get
+# missing, skip if no privilege, skip if sudo would prompt. The build
+# fails loudly later if libpfring-dev was not installable — that is the
+# correct escalation rather than masking the missing dep.
+#
+# Set ANYSCAN_INSTALL_PFRING_ZC_DEPS=false to suppress this block.
+install_pfring_zc_build_deps() {
+	if [ "${ANYSCAN_INSTALL_PFRING_ZC_DEPS:-true}" != "true" ]; then
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		printf '[*] Skipping PF_RING ZC build deps: apt-get not on PATH (non-Debian host).\n'
+		return 0
+	fi
+	local apt_cmd=()
+	if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+		apt_cmd=(apt-get)
+	elif command -v sudo >/dev/null 2>&1; then
+		apt_cmd=(sudo -n apt-get)
+	else
+		printf '[*] Skipping PF_RING ZC build deps: not root and sudo is not available.\n'
+		printf '    Install manually if you plan to build the scanner with USE_PFRING_ZC=1:\n'
+		printf '      # Add the ntop apt repo (one-time per AMI):\n'
+		printf '      #   wget https://packages.ntop.org/apt-stable/<distro>/all/apt-ntop-stable.deb\n'
+		printf '      #   sudo dpkg -i apt-ntop-stable.deb && sudo apt-get update\n'
+		printf '      sudo apt-get install -y libpfring-dev pfring-dkms\n'
+		return 0
+	fi
+	if [ "${apt_cmd[0]}" = "sudo" ] && ! sudo -n true >/dev/null 2>&1; then
+		printf '[*] Skipping PF_RING ZC build deps: sudo would prompt for a password.\n'
+		printf '    Install manually if you plan to build the scanner with USE_PFRING_ZC=1:\n'
+		printf '      sudo apt-get install -y libpfring-dev pfring-dkms\n'
+		return 0
+	fi
+	printf '[*] Installing PF_RING ZC build deps (libpfring-dev pfring-dkms)...\n'
+	if ! "${apt_cmd[@]}" install -y --no-install-recommends \
+		libpfring-dev pfring-dkms >/dev/null 2>&1; then
+		printf '[!] apt-get install of PF_RING build deps failed.\n' >&2
+		printf '    libpfring-dev / pfring-dkms are not in stock Debian/Ubuntu repos. Provision the ntop apt-stable repo (https://packages.ntop.org/apt-stable/) and re-run, or install via dkms manually.\n' >&2
+		printf '    The default `make` will still succeed — only `make USE_PFRING_ZC=1` requires these packages.\n' >&2
+		return 0
+	fi
+}
+
 upsert_env_value() {
 	local key="$1"
 	local value="$2"
@@ -306,6 +406,7 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 
 install_afxdp_build_deps
+install_pfring_zc_build_deps
 install_kernel_backport_if_requested
 
 if [ -d "$VULNSCANNER_REPO_DIR/.git" ]; then
@@ -328,6 +429,17 @@ elif [ "$ANYSCAN_USE_AF_XDP" = "1" ] && ! binary_has_afxdp_linkage "$VULNSCANNER
 	# can mask missing source files added by the AF_XDP block of the
 	# engine Makefile.
 	printf '[*] Existing scanner at %s lacks libxdp linkage; forcing rebuild because ANYSCAN_USE_AF_XDP=1.\n' "$VULNSCANNER_BIN_PATH"
+	if [ -f "$VULNSCANNER_REPO_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
+		make -C "$VULNSCANNER_REPO_DIR" clean >/dev/null 2>&1 || true
+	fi
+	rm -f "$VULNSCANNER_BIN_PATH"
+	need_build=1
+elif [ "$ANYSCAN_USE_PFRING_ZC" = "1" ] && ! binary_has_pfring_zc_linkage "$VULNSCANNER_BIN_PATH"; then
+	# Same shape as the AF_XDP cache check: force clean rebuild when
+	# the cached binary lacks libpfring linkage. Without this the cache
+	# short-circuit at line above would keep shipping the legacy binary
+	# and --io-engine=pfring_zc would error at startup.
+	printf '[*] Existing scanner at %s lacks libpfring linkage; forcing rebuild because ANYSCAN_USE_PFRING_ZC=1.\n' "$VULNSCANNER_BIN_PATH"
 	if [ -f "$VULNSCANNER_REPO_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
 		make -C "$VULNSCANNER_REPO_DIR" clean >/dev/null 2>&1 || true
 	fi
@@ -358,6 +470,12 @@ fi
 
 if [ "$ANYSCAN_USE_AF_XDP" = "1" ] && ! binary_has_afxdp_linkage "$VULNSCANNER_BIN_PATH"; then
 	printf '[!] ANYSCAN_USE_AF_XDP=1 but %s does not link libxdp.so. Build deps were probably missing — install libxdp-dev/libbpf-dev/libelf-dev and re-run.\n' \
+		"$VULNSCANNER_BIN_PATH" >&2
+	exit 1
+fi
+
+if [ "$ANYSCAN_USE_PFRING_ZC" = "1" ] && ! binary_has_pfring_zc_linkage "$VULNSCANNER_BIN_PATH"; then
+	printf '[!] ANYSCAN_USE_PFRING_ZC=1 but %s does not link libpfring.so. Build deps were probably missing — install libpfring-dev (ntop apt-stable repo) and re-run.\n' \
 		"$VULNSCANNER_BIN_PATH" >&2
 	exit 1
 fi

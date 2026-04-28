@@ -45,7 +45,11 @@ def _load_adapter():
 adapter = _load_adapter()
 
 
-IO_ENGINE_ENV_KEYS = ("ANYSCAN_SCANNER_IO_ENGINE", "ANYSCAN_AF_XDP_AVAILABLE")
+IO_ENGINE_ENV_KEYS = (
+    "ANYSCAN_SCANNER_IO_ENGINE",
+    "ANYSCAN_AF_XDP_AVAILABLE",
+    "ANYSCAN_PFRING_ZC_AVAILABLE",
+)
 
 
 def _clear_io_engine_env() -> None:
@@ -123,6 +127,44 @@ class ResolveIoEngineTests(unittest.TestCase):
             self.assertEqual(adapter.resolve_io_engine(), "af_packet")
         self.assertIn("dpdk", captured.getvalue())
 
+    def test_pfring_zc_with_runtime_available(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "true"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "pfring_zc")
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_pfring_zc_request_uppercase_normalizes(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "PFRING_ZC"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "true"
+        self.assertEqual(adapter.resolve_io_engine(), "pfring_zc")
+
+    def test_pfring_zc_with_unavailable_runtime_falls_back_with_warning(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "false"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "af_packet")
+        message = captured.getvalue()
+        self.assertIn("pfring_zc", message)
+        self.assertIn("ANYSCAN_PFRING_ZC_AVAILABLE", message)
+
+    def test_pfring_zc_without_availability_var_falls_back(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "af_packet")
+        self.assertIn("ANYSCAN_PFRING_ZC_AVAILABLE", captured.getvalue())
+
+    def test_pfring_zc_does_not_consult_af_xdp_available(self) -> None:
+        # Cross-engine availability flags must not interfere: AF_XDP being
+        # unavailable should have zero effect on a pfring_zc request.
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "true"
+        os.environ["ANYSCAN_AF_XDP_AVAILABLE"] = "false"
+        self.assertEqual(adapter.resolve_io_engine(), "pfring_zc")
+
     def test_blank_value_defaults_to_af_packet_silently(self) -> None:
         os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = ""
         captured = io.StringIO()
@@ -181,6 +223,23 @@ class BuildCommandIoEngineTests(unittest.TestCase):
         self.assertIn("--io-engine=af_packet", cmd)
         self.assertNotIn("--io-engine=af_xdp", cmd)
         self.assertIn("ANYSCAN_AF_XDP_AVAILABLE", captured.getvalue())
+
+    def test_pfring_zc_request_with_runtime_available_appends_pfring_zc(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "true"
+        cmd = self._build()
+        self.assertIn("--io-engine=pfring_zc", cmd)
+        self.assertNotIn("--io-engine=af_packet", cmd)
+
+    def test_pfring_zc_request_without_runtime_falls_back_to_af_packet(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "false"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            cmd = self._build()
+        self.assertIn("--io-engine=af_packet", cmd)
+        self.assertNotIn("--io-engine=pfring_zc", cmd)
+        self.assertIn("ANYSCAN_PFRING_ZC_AVAILABLE", captured.getvalue())
 
     def test_invalid_request_falls_back_to_af_packet(self) -> None:
         os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "garbage"
@@ -288,6 +347,32 @@ class AdapterIoEngineIntegrationTests(unittest.TestCase):
         self.assertIn("--io-engine=af_packet", calls[0])
         # The warning must surface so operators see the downgrade in journal.
         self.assertIn("ANYSCAN_AF_XDP_AVAILABLE", result.stderr)
+
+    def test_pfring_zc_request_with_runtime_available_passes_pfring_zc(self) -> None:
+        result = self._run_adapter(
+            {
+                "ANYSCAN_SCANNER_IO_ENGINE": "pfring_zc",
+                "ANYSCAN_PFRING_ZC_AVAILABLE": "true",
+            }
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        calls = self._read_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--io-engine=pfring_zc", calls[0])
+        self.assertNotIn("--io-engine=af_packet", calls[0])
+
+    def test_pfring_zc_request_without_runtime_falls_back_to_af_packet(self) -> None:
+        result = self._run_adapter(
+            {
+                "ANYSCAN_SCANNER_IO_ENGINE": "pfring_zc",
+                "ANYSCAN_PFRING_ZC_AVAILABLE": "false",
+            }
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        calls = self._read_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("--io-engine=af_packet", calls[0])
+        self.assertIn("ANYSCAN_PFRING_ZC_AVAILABLE", result.stderr)
 
 
 if __name__ == "__main__":
