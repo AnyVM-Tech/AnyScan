@@ -117,6 +117,54 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+# Phase 2 PR D of plans/2026-04-27-portscan-afxdp-plan-v1.md §3.7. The
+# scanner accepts --io-engine={af_packet,af_xdp}; AF_PACKET stays the
+# unconditional default and AF_XDP is opt-in per worker. The install-time
+# probe in install-worker-bundle.sh::probe_afxdp_runtime_available
+# writes ANYSCAN_AF_XDP_AVAILABLE=true|false based on kernel >=5.10
+# AND libxdp.so being loadable; we refuse to forward af_xdp when the
+# probe failed because the scanner would crash at startup with a dlopen
+# error and the worker has no way to recover. The fall-back warning is
+# loud on purpose: silently dropping back to AF_PACKET would let an
+# operator who flipped the knob keep believing they were running on the
+# fast path.
+SUPPORTED_IO_ENGINES = ("af_packet", "af_xdp")
+DEFAULT_IO_ENGINE = "af_packet"
+
+
+def resolve_io_engine() -> str:
+    """Resolve the scanner --io-engine value from env, with AF_XDP gating.
+
+    Returns the engine string the adapter should pass to the scanner.
+    Always returns a value from ``SUPPORTED_IO_ENGINES``; unrecognized,
+    unset, or ungated requests collapse to ``af_packet`` so the scanner
+    stays on its known-safe default. Warnings are emitted to stderr
+    when a request is downgraded so the journal carries an audit trail.
+    """
+
+    raw = env_string("ANYSCAN_SCANNER_IO_ENGINE")
+    if raw is None:
+        return DEFAULT_IO_ENGINE
+    requested = raw.lower()
+    if requested not in SUPPORTED_IO_ENGINES:
+        print(
+            f"[anyscan-adapter] unrecognized ANYSCAN_SCANNER_IO_ENGINE={raw!r}; "
+            f"falling back to {DEFAULT_IO_ENGINE}",
+            file=sys.stderr,
+        )
+        return DEFAULT_IO_ENGINE
+    if requested == "af_xdp" and not env_flag("ANYSCAN_AF_XDP_AVAILABLE"):
+        print(
+            "[anyscan-adapter] ANYSCAN_SCANNER_IO_ENGINE=af_xdp requested but "
+            "ANYSCAN_AF_XDP_AVAILABLE!=true; the install-time probe did not "
+            "detect a kernel/libxdp combination that supports AF_XDP. "
+            f"Falling back to {DEFAULT_IO_ENGINE}.",
+            file=sys.stderr,
+        )
+        return DEFAULT_IO_ENGINE
+    return requested
+
+
 def resolve_scanner_binary() -> Path:
     candidates: list[Path] = []
     configured = env_string("SCANNER_BIN")
@@ -192,6 +240,7 @@ def build_command(
         str(cooldown),
         "--output-file",
         str(output_path),
+        f"--io-engine={resolve_io_engine()}",
     ]
     checkpoint_path = invocation.get("checkpoint_path")
     if isinstance(checkpoint_path, str) and checkpoint_path.strip():

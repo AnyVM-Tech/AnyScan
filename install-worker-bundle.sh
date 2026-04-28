@@ -323,6 +323,17 @@ apply_host_resource_defaults() {
         if [ -z "$(env_value "ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES" "$RUNTIME_ENV_FILE" || true)" ]; then
             upsert_env_value "ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES" "4" "$RUNTIME_ENV_FILE"
         fi
+        # Phase 2 PR D of plans/2026-04-27-portscan-afxdp-plan-v1.md §3.7.
+        # The adapter forwards this value as scanner --io-engine=<value>.
+        # AF_PACKET is the unconditional default on fresh installs so the
+        # opt-in knob is explicit in /etc/agentd/runtime.env; flipping
+        # it to af_xdp also requires ANYSCAN_AF_XDP_AVAILABLE=true (set
+        # by apply_afxdp_availability below) and the CAP_BPF grant in
+        # anyscan-worker.service. Operators who already have a value
+        # pinned (in-place upgrades) keep their setting.
+        if [ -z "$(env_value "ANYSCAN_SCANNER_IO_ENGINE" "$RUNTIME_ENV_FILE" || true)" ]; then
+            upsert_env_value "ANYSCAN_SCANNER_IO_ENGINE" "af_packet" "$RUNTIME_ENV_FILE"
+        fi
     fi
 
     # Defaults for the egress bandwidth reservation that ExecStartPre installs.
