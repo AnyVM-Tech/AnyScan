@@ -366,6 +366,25 @@ apply_host_resource_defaults() {
     fi
 }
 
+# Parse the major.minor pair out of a `uname -r` output. Uses awk -F.
+# so 3-component releases like `6.12.74-cloud-amd64`, `5.10.0-13-amd64`,
+# or `6.12.74+deb13+1-amd64` get parsed correctly — the previous
+# parameter-expansion approach silently mishandled some shapes on
+# Debian 13 + kernel 6.12 (anygpt-52, c6in.metal: probe reported
+# "kernel <5.10 or libxdp.so missing" despite the kernel being 6.12).
+# Echoes "MAJOR MINOR" on stdout. On parse failure, echoes "0 0" so
+# callers can decide how to handle it.
+parse_kernel_major_minor() {
+    local release="$1"
+    awk -F'[.-]' '
+        {
+            major = $1 + 0
+            minor = $2 + 0
+            printf "%d %d\n", major, minor
+        }
+    ' <<<"$release"
+}
+
 probe_afxdp_runtime_available() {
     # Phase 2 PR C of plans/2026-04-27-portscan-afxdp-plan-v1.md §4.3.
     # The scanner can be invoked with --io-engine=af_xdp only when (a) the
@@ -380,26 +399,37 @@ probe_afxdp_runtime_available() {
     # override to "true" by hand if they know the bundle's bin/scanner
     # was built with USE_AF_XDP=1 and they have the libs from a path not
     # visible to ldconfig (e.g. LD_LIBRARY_PATH).
-    local kernel_release kernel_major kernel_minor
+    #
+    # On stderr, the function emits a one-line reason whenever it
+    # returns "false" so the operator can tell which check failed
+    # (kernel too old vs. libxdp missing). Quiet on success.
+    local kernel_release
     kernel_release="$(uname -r 2>/dev/null || true)"
-    if [ -z "$kernel_release" ]; then
+
+    local kernel_major=0 kernel_minor=0
+    if [ -n "$kernel_release" ]; then
+        read -r kernel_major kernel_minor < <(parse_kernel_major_minor "$kernel_release")
+    fi
+    if [ "$kernel_major" -eq 0 ]; then
+        printf '[probe-afxdp] could not parse kernel version from uname -r=%q\n' \
+            "$kernel_release" >&2
         printf 'false'
         return 0
     fi
-    kernel_major="${kernel_release%%.*}"
-    local rest="${kernel_release#*.}"
-    kernel_minor="${rest%%.*}"
-    case "$kernel_major" in ''|*[!0-9]*) printf 'false'; return 0 ;; esac
-    case "$kernel_minor" in ''|*[!0-9]*) kernel_minor=0 ;; esac
-    if [ "$kernel_major" -lt 5 ] || { [ "$kernel_major" -eq 5 ] && [ "$kernel_minor" -lt 10 ]; }; then
+    if [ "$kernel_major" -lt 5 ] || \
+       { [ "$kernel_major" -eq 5 ] && [ "$kernel_minor" -lt 10 ]; }; then
+        printf '[probe-afxdp] kernel %s.%s < 5.10\n' \
+            "$kernel_major" "$kernel_minor" >&2
         printf 'false'
         return 0
     fi
     if ! command_exists ldconfig; then
+        printf '[probe-afxdp] ldconfig not on PATH (cannot verify libxdp.so)\n' >&2
         printf 'false'
         return 0
     fi
     if ! ldconfig -p 2>/dev/null | grep -q '\<libxdp\.so'; then
+        printf '[probe-afxdp] libxdp.so not in ldconfig -p (apt-get install libxdp1)\n' >&2
         printf 'false'
         return 0
     fi
@@ -411,14 +441,22 @@ apply_afxdp_availability() {
     # /etc/agentd/runtime.env and a partial upgrade can't leave a stale
     # "true" in place after the kernel was downgraded or libxdp was
     # uninstalled. This mirrors the AGENT_REMOTE_UPDATE_* pattern above.
-    local afxdp_available
-    afxdp_available="$(probe_afxdp_runtime_available)"
+    local afxdp_available probe_stderr
+    probe_stderr="$(mktemp)"
+    afxdp_available="$(probe_afxdp_runtime_available 2>"$probe_stderr")"
     upsert_env_value "ANYSCAN_AF_XDP_AVAILABLE" "$afxdp_available" "$RUNTIME_ENV_FILE"
     if [ "$afxdp_available" = "true" ]; then
         printf '[*] AF_XDP runtime probe passed (kernel + libxdp.so present); ANYSCAN_AF_XDP_AVAILABLE=true.\n'
     else
-        printf '[*] AF_XDP runtime probe failed (kernel <5.10 or libxdp.so missing); ANYSCAN_AF_XDP_AVAILABLE=false.\n'
+        local reason
+        reason="$(tail -n1 "$probe_stderr" 2>/dev/null || true)"
+        if [ -n "$reason" ]; then
+            printf '[*] AF_XDP runtime probe failed (%s); ANYSCAN_AF_XDP_AVAILABLE=false.\n' "$reason"
+        else
+            printf '[*] AF_XDP runtime probe failed; ANYSCAN_AF_XDP_AVAILABLE=false.\n'
+        fi
     fi
+    rm -f "$probe_stderr"
 }
 
 # True when the installed scanner binary at $1 was linked against librte_eal
@@ -1065,5 +1103,14 @@ main() {
         printf '  3. Review %s only if you want to override the preset control URL, agent id, pool, tags, or proxy.\n' "$RUNTIME_ENV_FILE"
     fi
 }
+
+# Test hook: when ANYSCAN_INSTALL_LOAD_ONLY=1 is set the script is being
+# sourced for unit-test access to its helpers (tools/test-install-
+# worker-bundle-afxdp-probe.sh) and must skip main(). `return` works in
+# sourced bash; falling through to `exit` covers the unlikely case
+# where the hook is set during a direct invocation.
+if [ "${ANYSCAN_INSTALL_LOAD_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 main "$@"
