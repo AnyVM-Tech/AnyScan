@@ -197,6 +197,7 @@ def build_network_interfaces(
     subnet_ids: list[str],
     security_group_ids: list[str],
     network_cards: list[dict[str, Any]] | None = None,
+    associate_public_ip: bool = False,
 ) -> list[dict[str, Any]]:
     """Construct the NetworkInterfaces parameter for ec2:RunInstances.
 
@@ -211,6 +212,14 @@ def build_network_interfaces(
     `distribute_enis_across_cards` — required on multi-card instance
     types like c6in.metal where the primary card holds only 8 of the 16
     available ENI slots.
+
+    `associate_public_ip` (off by default) sets AssociatePublicIpAddress
+    on the primary ENI only — the entry with DeviceIndex=0 and (when
+    multi-card) NetworkCardIndex=0. AWS rejects the field on secondaries.
+    Needed because RunInstances ignores the subnet's MapPublicIpOnLaunch
+    when an explicit NetworkInterfaces[] is passed; without this opt-in
+    the launch comes up with no public IP. See PR #65
+    issuecomment-4338158487 (anygpt-48) for the failure mode.
     """
     if target_count < 1:
         raise ValueError("target_count must be >= 1")
@@ -218,6 +227,7 @@ def build_network_interfaces(
         raise ValueError("subnet_ids must contain at least one subnet")
     placements = distribute_enis_across_cards(target_count, network_cards)
     interfaces: list[dict[str, Any]] = []
+    primary_assigned = False
     for sequence_index, (card_index, device_index) in enumerate(placements):
         spec: dict[str, Any] = {
             "DeviceIndex": device_index,
@@ -231,6 +241,17 @@ def build_network_interfaces(
             spec["NetworkCardIndex"] = card_index
         if security_group_ids:
             spec["Groups"] = list(security_group_ids)
+        # AssociatePublicIpAddress is only valid on the primary ENI.
+        # Set it on exactly one entry: DeviceIndex=0 plus (when we're
+        # emitting NetworkCardIndex) NetworkCardIndex=0. The placement
+        # helper guarantees the primary ENI lands first, so we only
+        # need to flip the flag the first time we see a DeviceIndex=0
+        # entry on card 0.
+        if associate_public_ip and not primary_assigned and device_index == 0:
+            on_primary_card = (not network_cards) or card_index == 0
+            if on_primary_card:
+                spec["AssociatePublicIpAddress"] = True
+                primary_assigned = True
         interfaces.append(spec)
     return interfaces
 
@@ -306,6 +327,17 @@ class ManagerConfig:
     # primary ENI's security group.
     max_enis: int | None
     eni_subnet_ids: list[str]
+    # Public-IP association on the multi-ENI launch path. When the
+    # explicit NetworkInterfaces[] payload is used (ANYSCAN_MAX_ENIS
+    # set), AWS does NOT auto-associate a public IP from the subnet's
+    # MapPublicIpOnLaunch setting — the operator has to opt in
+    # explicitly via AssociatePublicIpAddress on the primary ENI.
+    # Default off so existing fleets stay unchanged. See PR #65
+    # issuecomment-4338158487 (anygpt-48): the metal came up
+    # unreachable from outside the VPC because this entry was missing
+    # on the primary ENI and the operator had to manually
+    # allocate-address + associate-address post-launch.
+    associate_public_ip: bool
 
     @classmethod
     def from_env(cls) -> "ManagerConfig":
@@ -363,6 +395,10 @@ class ManagerConfig:
             loop_interval_seconds=env_int("ANYSCAN_EC2_LOOP_INTERVAL_SECONDS", 60),
             max_enis=parse_max_enis(env_string("ANYSCAN_MAX_ENIS")),
             eni_subnet_ids=split_csv(env_string("ANYSCAN_EC2_ENI_SUBNET_IDS")),
+            associate_public_ip=(
+                env_string("ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP", "false") or "false"
+            ).lower()
+            in {"1", "true", "yes", "on"},
         )
 
 
@@ -944,6 +980,7 @@ class Ec2WorkerManager:
                     subnet_ids=subnet_pool,
                     security_group_ids=security_group_ids,
                     network_cards=network_cards,
+                    associate_public_ip=self.config.associate_public_ip,
                 )
                 eni_attach_info["attached"] = target_count
                 eni_attach_info["subnet_pool"] = subnet_pool
