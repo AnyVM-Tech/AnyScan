@@ -421,16 +421,44 @@ apply_afxdp_availability() {
     fi
 }
 
+# True when the installed scanner binary at $1 was linked against
+# libpfring at build time (i.e. compiled with USE_PFRING_ZC=1). Same
+# probe shape as binary_has_pfring_zc_linkage in install-external-deps.sh
+# / package-worker-bundle.sh / deploy.sh, kept inline so this script
+# stays stand-alone for hosted-bundle installs that do not source the
+# build-side helpers. ldd → readelf -d fallback.
+binary_has_pfring_zc_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command_exists ldd; then
+        if ldd "$bin" 2>/dev/null | grep -q 'libpfring\.so'; then
+            return 0
+        fi
+    fi
+    if command_exists readelf; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libpfring\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 probe_pfring_zc_runtime_available() {
     # anygpt-46. The bundled scanner can be invoked with
-    # --io-engine=pfring_zc only when (a) the pfring kernel module is
-    # loaded so /proc/net/pf_ring exists and pfring_zc_open_device can
-    # acquire ZC descriptors and (b) libpfring.so is loadable on the
-    # host (the binary is dynamically linked against it when built with
-    # USE_PFRING_ZC=1). Both checks are cheap and side-effect-free so we
-    # do them at install time and write ANYSCAN_PFRING_ZC_AVAILABLE so
-    # the adapter does not have to redo the probe per-scan.
-    #
+    # --io-engine=pfring_zc only when ALL of:
+    #   (a) the pfring kernel module is loaded so /proc/net/pf_ring
+    #       exists and pfring_zc_open_device can acquire ZC descriptors;
+    #   (b) libpfring.so is loadable on the host (the binary is
+    #       dynamically linked against it when built with USE_PFRING_ZC=1);
+    #   (c) the installed scanner binary at $VULNSCANNER_BIN_DEST was
+    #       actually built with USE_PFRING_ZC=1 (probed by checking
+    #       libpfring linkage on the on-disk binary).
+    # The (c) gate closes the gap chatgpt-codex-connector flagged on
+    # PR #75: a host that has the runtime packages installed for
+    # other tooling could otherwise be marked available even when the
+    # bundled scanner is the default AF_PACKET-only build, and the
+    # adapter would forward --io-engine=pfring_zc to a binary that
+    # errors at startup with "binary not built with USE_PFRING_ZC=1".
     # We do NOT probe for the commercial license file here because (a)
     # ntop license check semantics vary across libpfring versions and
     # are not stable to introspect from outside the library, and (b)
@@ -449,6 +477,10 @@ probe_pfring_zc_runtime_available() {
         printf 'false'
         return 0
     fi
+    if ! binary_has_pfring_zc_linkage "$VULNSCANNER_BIN_DEST"; then
+        printf 'false'
+        return 0
+    fi
     printf 'true'
 }
 
@@ -456,15 +488,16 @@ apply_pfring_zc_availability() {
     # Mirror of apply_afxdp_availability: always write (true OR false)
     # so /etc/agentd/runtime.env carries an explicit value and a partial
     # upgrade can't leave a stale "true" after the pfring module was
-    # unloaded.
+    # unloaded or the scanner was reinstalled from an AF_PACKET-only
+    # bundle.
     local pfring_zc_available
     pfring_zc_available="$(probe_pfring_zc_runtime_available)"
     upsert_env_value "ANYSCAN_PFRING_ZC_AVAILABLE" "$pfring_zc_available" "$RUNTIME_ENV_FILE"
     if [ "$pfring_zc_available" = "true" ]; then
-        printf '[*] PF_RING ZC runtime probe passed (pfring kmod + libpfring.so present); ANYSCAN_PFRING_ZC_AVAILABLE=true.\n'
+        printf '[*] PF_RING ZC runtime probe passed (pfring kmod + libpfring.so + scanner libpfring linkage); ANYSCAN_PFRING_ZC_AVAILABLE=true.\n'
         printf '    Note: PF_RING ZC requires a commercial ntop license at runtime to operate above the ~100k pps community-mode throttle.\n'
     else
-        printf '[*] PF_RING ZC runtime probe failed (pfring kmod absent or libpfring.so missing); ANYSCAN_PFRING_ZC_AVAILABLE=false.\n'
+        printf '[*] PF_RING ZC runtime probe failed (pfring kmod absent, libpfring.so missing, or scanner not built with USE_PFRING_ZC=1); ANYSCAN_PFRING_ZC_AVAILABLE=false.\n'
     fi
 }
 
