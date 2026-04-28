@@ -119,13 +119,11 @@ def distribute_enis_across_cards(
     which is the whole point of attaching more ENIs at this scale.
 
     On c6in.metal DescribeInstanceTypes returns NetworkCards = [
-      {NetworkCardIndex:0, MaximumNetworkInterfaces:5},  (primary)
-      {NetworkCardIndex:1, MaximumNetworkInterfaces:4},
-      {NetworkCardIndex:2, MaximumNetworkInterfaces:3},
-      {NetworkCardIndex:3, MaximumNetworkInterfaces:3},
-    ] — total 15. Without per-card distribution, attaching 15 ENIs to
+      {NetworkCardIndex:0, MaximumNetworkInterfaces:8},  (primary)
+      {NetworkCardIndex:1, MaximumNetworkInterfaces:8},
+    ] — total 16. Without per-card distribution, attaching 16 ENIs to
     card 0 (the default) hard-fails RunInstances because card 0 only
-    has 5 slots.
+    has 8 slots.
 
     When `network_cards` is None or empty (single-card instance types,
     or a stripped-down DescribeInstanceTypes payload), all ENIs land on
@@ -211,7 +209,7 @@ def build_network_interfaces(
     `network_cards` (when supplied from DescribeInstanceTypes' NetworkInfo
     payload) drives ENI placement across physical network cards via
     `distribute_enis_across_cards` — required on multi-card instance
-    types like c6in.metal where the primary card holds only 5 of the 15
+    types like c6in.metal where the primary card holds only 8 of the 16
     available ENI slots.
     """
     if target_count < 1:

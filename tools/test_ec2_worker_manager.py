@@ -12,6 +12,7 @@ Run from the anyscan repo root:
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -58,19 +59,32 @@ m = _load_module()
 
 
 def _c6in_metal_describe() -> dict[str, Any]:
-    """The DescribeInstanceTypes payload AWS returns for c6in.metal."""
+    """The DescribeInstanceTypes payload AWS returns for c6in.metal.
+
+    Recorded from `aws ec2 describe-instance-types --instance-types
+    c6in.metal --region us-east-1` (anygpt-48, 2026-04-28). The shape
+    is 2 NetworkCards × 8 = 16, NOT the 4-card 5/4/3/3=15 the original
+    fixture claimed — see PR 65 issuecomment-4338158487 for the live
+    capture.
+    """
     return {
         "InstanceTypes": [
             {
                 "InstanceType": "c6in.metal",
                 "NetworkInfo": {
-                    "MaximumNetworkInterfaces": 15,
-                    "MaximumNetworkCards": 4,
+                    "MaximumNetworkInterfaces": 16,
+                    "MaximumNetworkCards": 2,
                     "NetworkCards": [
-                        {"NetworkCardIndex": 0, "MaximumNetworkInterfaces": 5},
-                        {"NetworkCardIndex": 1, "MaximumNetworkInterfaces": 4},
-                        {"NetworkCardIndex": 2, "MaximumNetworkInterfaces": 3},
-                        {"NetworkCardIndex": 3, "MaximumNetworkInterfaces": 3},
+                        {
+                            "NetworkCardIndex": 0,
+                            "MaximumNetworkInterfaces": 8,
+                            "NetworkPerformance": "Up to 170 Gigabit",
+                        },
+                        {
+                            "NetworkCardIndex": 1,
+                            "MaximumNetworkInterfaces": 8,
+                            "NetworkPerformance": "Up to 170 Gigabit",
+                        },
                     ],
                 },
             }
@@ -145,7 +159,7 @@ class EniCapFromDescribeResponseTests(unittest.TestCase):
     """eni_cap_from_describe_response handles AWS payload edge cases."""
 
     def test_c6in_metal_payload(self):
-        self.assertEqual(m.eni_cap_from_describe_response(_c6in_metal_describe()), 15)
+        self.assertEqual(m.eni_cap_from_describe_response(_c6in_metal_describe()), 16)
 
     def test_c6in_xlarge_payload(self):
         self.assertEqual(m.eni_cap_from_describe_response(_c6in_xlarge_describe()), 4)
@@ -169,9 +183,9 @@ class EniCapFromDescribeResponseTests(unittest.TestCase):
 class NetworkCardsFromDescribeResponseTests(unittest.TestCase):
     def test_c6in_metal_payload(self):
         cards = m.network_cards_from_describe_response(_c6in_metal_describe())
-        self.assertEqual(len(cards), 4)
+        self.assertEqual(len(cards), 2)
         self.assertEqual(
-            sum(c["MaximumNetworkInterfaces"] for c in cards), 15
+            sum(c["MaximumNetworkInterfaces"] for c in cards), 16
         )
 
     def test_missing_returns_empty(self):
@@ -205,21 +219,19 @@ class DistributeEnisAcrossCardsTests(unittest.TestCase):
             [(0, 0), (0, 1)],
         )
 
-    def test_c6in_metal_15_eni_layout_respects_per_card_caps(self):
+    def test_c6in_metal_16_eni_layout_respects_per_card_caps(self):
         cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
             "NetworkCards"
         ]
-        placement = m.distribute_enis_across_cards(15, cards)
-        self.assertEqual(len(placement), 15)
+        placement = m.distribute_enis_across_cards(16, cards)
+        self.assertEqual(len(placement), 16)
         per_card: dict[int, list[int]] = {}
         for card_idx, dev_idx in placement:
             per_card.setdefault(card_idx, []).append(dev_idx)
         # Each card should be at exactly its declared capacity for the
-        # full-15 case; the round-robin policy fills evenly.
-        self.assertEqual(per_card[0], [0, 1, 2, 3, 4])
-        self.assertEqual(per_card[1], [0, 1, 2, 3])
-        self.assertEqual(per_card[2], [0, 1, 2])
-        self.assertEqual(per_card[3], [0, 1, 2])
+        # full-16 case; the round-robin policy fills evenly.
+        self.assertEqual(per_card[0], [0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(per_card[1], [0, 1, 2, 3, 4, 5, 6, 7])
 
     def test_primary_eni_lands_on_card_zero(self):
         cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
@@ -232,11 +244,12 @@ class DistributeEnisAcrossCardsTests(unittest.TestCase):
         cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
             "NetworkCards"
         ]
-        # 4 ENIs across 4 cards: one per card.
+        # 4 ENIs across 2 cards × 8 cap: round-robin alternates card 0 / 1
+        # starting from the primary ENI on card 0.
         placement = m.distribute_enis_across_cards(4, cards)
         self.assertEqual(
-            sorted(card_idx for card_idx, _ in placement),
-            [0, 1, 2, 3],
+            [card_idx for card_idx, _ in placement],
+            [0, 1, 0, 1],
         )
 
     def test_zero_target_raises(self):
@@ -402,8 +415,8 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
         # Describe should not be called when the operator hasn't opted in.
         self.assertEqual(ec2.describe_payload, _c6in_metal_describe())  # untouched
 
-    def test_max_enis_15_on_c6in_metal_emits_15_network_interfaces(self):
-        config = _make_config(max_enis=15, instance_type="c6in.metal")
+    def test_max_enis_16_on_c6in_metal_emits_16_network_interfaces(self):
+        config = _make_config(max_enis=16, instance_type="c6in.metal")
         ec2 = _FakeEc2Client(describe_payload=_c6in_metal_describe())
         manager = _make_manager(config, ec2)
 
@@ -416,14 +429,14 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
         self.assertNotIn("SubnetId", call)
         self.assertNotIn("SecurityGroupIds", call)
         self.assertIn("NetworkInterfaces", call)
-        self.assertEqual(len(call["NetworkInterfaces"]), 15)
+        self.assertEqual(len(call["NetworkInterfaces"]), 16)
         # Every NIC carries the security group on its Groups key.
         for nic in call["NetworkInterfaces"]:
             self.assertEqual(nic["Groups"], ["sg-1"])
             self.assertEqual(nic["SubnetId"], "subnet-primary")
             self.assertIn("NetworkCardIndex", nic)
-        self.assertEqual(result["eni_attach"]["attached"], 15)
-        self.assertEqual(result["eni_attach"]["hardware_cap"], 15)
+        self.assertEqual(result["eni_attach"]["attached"], 16)
+        self.assertEqual(result["eni_attach"]["hardware_cap"], 16)
 
     def test_max_enis_15_on_c6in_xlarge_clamps_to_4(self):
         config = _make_config(max_enis=15, instance_type="c6in.xlarge")
@@ -523,6 +536,73 @@ class FromEnvIntegrationTests(unittest.TestCase):
         os.environ["ANYSCAN_MAX_ENIS"] = "0"
         with self.assertRaises(SystemExit):
             m.ManagerConfig.from_env()
+
+
+class RecordedDescribeInstanceTypesIntegrityTests(unittest.TestCase):
+    """Anchor the synthetic c6in.metal fixture to a recorded AWS payload.
+
+    `tools/c6in_metal_describe_instance_types.json` is a verbatim capture
+    of `aws ec2 describe-instance-types --instance-types c6in.metal
+    --region us-east-1` (anygpt-48, 2026-04-28). Asserting against the
+    real payload prevents the mock-vs-reality drift PR 65
+    issuecomment-4338158487 caught after the launch path had already
+    shipped: the synthetic fixture claimed 4 cards × (5/4/3/3)=15 while
+    AWS actually returns 2 cards × 8 = 16.
+    """
+
+    RECORDED_PAYLOAD_PATH = (
+        Path(__file__).resolve().parent / "c6in_metal_describe_instance_types.json"
+    )
+
+    def setUp(self) -> None:
+        with self.RECORDED_PAYLOAD_PATH.open() as fh:
+            self.recorded = json.load(fh)
+
+    def test_recorded_payload_eni_cap_is_16(self):
+        self.assertEqual(m.eni_cap_from_describe_response(self.recorded), 16)
+
+    def test_recorded_payload_has_two_network_cards(self):
+        cards = m.network_cards_from_describe_response(self.recorded)
+        self.assertEqual(len(cards), 2)
+
+    def test_recorded_payload_each_card_has_capacity_8(self):
+        cards = m.network_cards_from_describe_response(self.recorded)
+        for card in cards:
+            self.assertEqual(card["MaximumNetworkInterfaces"], 8)
+
+    def test_recorded_payload_card_indexes_are_zero_and_one(self):
+        cards = m.network_cards_from_describe_response(self.recorded)
+        self.assertEqual(
+            sorted(c["NetworkCardIndex"] for c in cards),
+            [0, 1],
+        )
+
+    def test_synthetic_fixture_agrees_with_recorded_on_load_bearing_fields(self):
+        """The synthetic _c6in_metal_describe() must match the recorded
+        payload on the fields the launch path actually consumes.
+
+        Drops the bandwidth fields (the synthetic fixture intentionally
+        omits them) and any future AWS-side additions; only the fields
+        eni_cap_from_describe_response and distribute_enis_across_cards
+        read are required to match.
+        """
+        synthetic = _c6in_metal_describe()
+        self.assertEqual(
+            m.eni_cap_from_describe_response(synthetic),
+            m.eni_cap_from_describe_response(self.recorded),
+        )
+        synthetic_cards = m.network_cards_from_describe_response(synthetic)
+        recorded_cards = m.network_cards_from_describe_response(self.recorded)
+        self.assertEqual(len(synthetic_cards), len(recorded_cards))
+        synthetic_caps = sorted(
+            (c["NetworkCardIndex"], c["MaximumNetworkInterfaces"])
+            for c in synthetic_cards
+        )
+        recorded_caps = sorted(
+            (c["NetworkCardIndex"], c["MaximumNetworkInterfaces"])
+            for c in recorded_cards
+        )
+        self.assertEqual(synthetic_caps, recorded_caps)
 
 
 if __name__ == "__main__":
