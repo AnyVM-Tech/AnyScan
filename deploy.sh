@@ -30,6 +30,12 @@ VULNSCANNER_SOURCE_BIN="${VULNSCANNER_SOURCE_BIN:-$VULNSCANNER_SOURCE_DIR/scanne
 VULNSCANNER_INSTALL_BIN="$BIN_DIR/scanner"
 ENABLED_EXTENSION_MANIFESTS="$LOCAL_BOOTSTRAP_MANIFEST"
 
+# Build-time AF_XDP opt-in. Mirrors install-external-deps.sh /
+# package-worker-bundle.sh — see plans/2026-04-27-portscan-afxdp-plan-v1.md
+# §3.6 and anygpt-42. When set to 1 the prod-host install path passes
+# USE_AF_XDP=1 to make and rejects a cached AF_PACKET-only binary.
+ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
+
 print_banner() {
     printf '═══════════════════════════════════════════════════════════\n'
     printf '            AnyScan Rust Deploy Script           \n'
@@ -83,14 +89,54 @@ path.write_text("\n".join(lines) + "\n")
 PY
 }
 
+binary_has_afxdp_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command -v ldd >/dev/null 2>&1; then
+        if ldd "$bin" 2>/dev/null | grep -q 'libxdp\.so'; then
+            return 0
+        fi
+    fi
+    if command -v readelf >/dev/null 2>&1; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libxdp\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 install_vulnscanner_binary() {
     local source_bin=""
+    local make_args=()
+    if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
+        make_args+=("USE_AF_XDP=1")
+    fi
+    # When AF_XDP is requested but the cached source binary lacks libxdp
+    # linkage, drop it so the build branch below fires. anygpt-42: the
+    # previous logic short-circuited on the existence of a stale
+    # AF_PACKET-only binary, leaving --io-engine=af_xdp non-functional
+    # at runtime even after the operator opted into the rebuild.
+    if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ] \
+        && [ -x "$VULNSCANNER_SOURCE_BIN" ] \
+        && ! binary_has_afxdp_linkage "$VULNSCANNER_SOURCE_BIN"; then
+        printf '[*] Removing pre-AF_XDP scanner at %s so the build path with USE_AF_XDP=1 fires.\n' \
+            "$VULNSCANNER_SOURCE_BIN"
+        rm -f "$VULNSCANNER_SOURCE_BIN"
+        if [ -f "$VULNSCANNER_SOURCE_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
+            make -C "$VULNSCANNER_SOURCE_DIR" clean >/dev/null 2>&1 || true
+        fi
+    fi
     if [ -x "$VULNSCANNER_SOURCE_BIN" ]; then
         source_bin="$VULNSCANNER_SOURCE_BIN"
         printf '[*] Installing VulnScanner binary from %s...\n' "$source_bin"
     elif [ -f "$VULNSCANNER_SOURCE_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
-        printf '[*] Building VulnScanner binary from %s...\n' "$VULNSCANNER_SOURCE_DIR"
-        if ! make -C "$VULNSCANNER_SOURCE_DIR"; then
+        if [ "${#make_args[@]}" -gt 0 ]; then
+            printf '[*] Building VulnScanner binary from %s with %s...\n' \
+                "$VULNSCANNER_SOURCE_DIR" "${make_args[*]}"
+        else
+            printf '[*] Building VulnScanner binary from %s...\n' "$VULNSCANNER_SOURCE_DIR"
+        fi
+        if ! make -C "$VULNSCANNER_SOURCE_DIR" "${make_args[@]}"; then
             printf '[!] Failed to build VulnScanner binary; continuing without scanner adapter enablement.\n' >&2
             return 1
         fi
@@ -101,6 +147,12 @@ install_vulnscanner_binary() {
         printf '[*] Installing VulnScanner binary from PATH %s...\n' "$source_bin"
     else
         printf '[!] VulnScanner binary not found; continuing without scanner adapter enablement.\n'
+        return 1
+    fi
+
+    if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ] && ! binary_has_afxdp_linkage "$source_bin"; then
+        printf '[!] ANYSCAN_USE_AF_XDP=1 but %s does not link libxdp.so. Install libxdp-dev/libbpf-dev/libelf-dev and re-run.\n' \
+            "$source_bin" >&2
         return 1
     fi
 

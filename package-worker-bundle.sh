@@ -29,6 +29,15 @@ WORKER_TAGS_OVERRIDE="${ANYSCAN_PACKAGE_WORKER_TAGS:-}"
 WORKER_SUPPORTS_BOOTSTRAP_OVERRIDE="${ANYSCAN_PACKAGE_WORKER_SUPPORTS_BOOTSTRAP:-}"
 BUNDLE_NAME_OVERRIDE="${ANYSCAN_PACKAGE_BUNDLE_NAME:-}"
 
+# Build-time AF_XDP opt-in (mirrors install-external-deps.sh). When 1 and
+# the staged scanner binary does not link libxdp, the bundle script
+# rebuilds the engine with `make USE_AF_XDP=1` so the bundle ships an
+# AF_XDP-capable scanner. Default 0 keeps existing bundle CI green.
+# Source: plans/2026-04-27-portscan-afxdp-plan-v1.md §3.6 + anygpt-42.
+ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
+ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT="$SCRIPT_DIR/../../anyscan-engine-c"
+ANYSCAN_VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT}"
+
 print_banner() {
     printf '═══════════════════════════════════════════════════════════\n'
     printf '                 Remote Agent Packager                   \n'
@@ -309,6 +318,43 @@ strip_binary() {
     fi
 }
 
+# Mirror of binary_has_afxdp_linkage in install-external-deps.sh; kept
+# inline rather than sourced so this script remains stand-alone for CI.
+binary_has_afxdp_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command_exists ldd; then
+        if ldd "$bin" 2>/dev/null | grep -q 'libxdp\.so'; then
+            return 0
+        fi
+    fi
+    if command_exists readelf; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libxdp\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# Fire a `make USE_AF_XDP=1` in the engine repo so the bundle ships an
+# AF_XDP-linked scanner. Used when ANYSCAN_USE_AF_XDP=1 and the cached
+# binary either does not exist or was built without libxdp linkage.
+rebuild_scanner_with_afxdp() {
+    local repo_dir="$1"
+    if [ ! -f "$repo_dir/Makefile" ]; then
+        printf '[!] ANYSCAN_USE_AF_XDP=1 requested but no Makefile at %s.\n' "$repo_dir" >&2
+        printf '    Run install-external-deps.sh ANYSCAN_USE_AF_XDP=1 first, or set ANYSCAN_PACKAGE_VULNSCANNER_BIN to a pre-built AF_XDP-capable scanner binary.\n' >&2
+        return 1
+    fi
+    if ! command_exists make; then
+        printf '[!] make not on PATH; cannot rebuild scanner with USE_AF_XDP=1.\n' >&2
+        return 1
+    fi
+    printf '[*] Rebuilding scanner with USE_AF_XDP=1 in %s...\n' "$repo_dir"
+    make -C "$repo_dir" clean >/dev/null 2>&1 || true
+    make -C "$repo_dir" USE_AF_XDP=1
+}
+
 copy_runtime_file() {
     local source="$1"
     local dest_dir="$2"
@@ -521,12 +567,40 @@ main() {
         # which carries the AF_XDP integration patches; fall back to the legacy
         # upstream-clone path and the system-installed binary.
         # See plans/2026-04-27-portscan-afxdp-plan-v1.md §9.1.
-        if [ -x "$SCRIPT_DIR/../../anyscan-engine-c/scanner" ]; then
-            SCANNER_SOURCE_BIN="$SCRIPT_DIR/../../anyscan-engine-c/scanner"
+        if [ -x "$ANYSCAN_VULNSCANNER_REPO_DIR/scanner" ]; then
+            SCANNER_SOURCE_BIN="$ANYSCAN_VULNSCANNER_REPO_DIR/scanner"
         elif [ -x "$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner" ]; then
             SCANNER_SOURCE_BIN="$SCRIPT_DIR/../../VulnScanner-zmap-alternative-/scanner"
         elif [ -x /opt/anyscan/bin/scanner ]; then
             SCANNER_SOURCE_BIN="/opt/anyscan/bin/scanner"
+        fi
+    fi
+    # AF_XDP wire-up (anygpt-42 / plans/2026-04-27-portscan-afxdp-plan-v1.md
+    # §3.6): when the operator opts in via ANYSCAN_USE_AF_XDP=1 and the
+    # candidate binary either does not exist or is the legacy AF_PACKET-only
+    # build, fire `make USE_AF_XDP=1` in the engine repo so the bundle
+    # actually ships an AF_XDP-capable scanner. Without this step the
+    # runtime --io-engine=af_xdp flag has no AF_XDP code to dispatch to,
+    # which is the gap anygpt-42 caught.
+    if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
+        local needs_engine_rebuild=0
+        if [ -z "$SCANNER_SOURCE_BIN" ] || [ ! -x "$SCANNER_SOURCE_BIN" ]; then
+            needs_engine_rebuild=1
+        elif ! binary_has_afxdp_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[*] %s lacks libxdp linkage; ANYSCAN_USE_AF_XDP=1 requires a rebuild.\n' "$SCANNER_SOURCE_BIN"
+            needs_engine_rebuild=1
+        fi
+        if [ "$needs_engine_rebuild" = "1" ]; then
+            if ! rebuild_scanner_with_afxdp "$ANYSCAN_VULNSCANNER_REPO_DIR"; then
+                printf '[!] ANYSCAN_USE_AF_XDP=1 but unable to produce an AF_XDP-linked scanner. Aborting bundle.\n' >&2
+                exit 1
+            fi
+            SCANNER_SOURCE_BIN="$ANYSCAN_VULNSCANNER_REPO_DIR/scanner"
+        fi
+        if [ ! -x "$SCANNER_SOURCE_BIN" ] || ! binary_has_afxdp_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[!] Scanner at %s still lacks libxdp linkage after rebuild. Aborting bundle.\n' \
+                "$SCANNER_SOURCE_BIN" >&2
+            exit 1
         fi
     fi
     include_scanner="false"
@@ -667,6 +741,9 @@ Bundle control route:
   control_url: ${runtime_api_base_url}
   management_url: ${runtime_management_url}
   control_proxy_url: ${runtime_api_proxy_url}
+Bundle scanner build:
+  scanner_included: ${include_scanner}
+  use_af_xdp: ${ANYSCAN_USE_AF_XDP}
 EOF
 
     bundle_path="$DIST_DIR/${bundle_name}.tar.gz"

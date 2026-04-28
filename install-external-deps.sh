@@ -17,6 +17,46 @@ VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$REPO_ROOT/anyscan-engine-
 VULNSCANNER_BIN_PATH="$VULNSCANNER_REPO_DIR/scanner"
 VULNSCANNER_INSTALLED_BIN="/opt/anyscan/bin/scanner"
 
+# Build-time AF_XDP opt-in. Default 0 keeps every existing AMI building the
+# same legacy binary; setting 1 causes every `make` invocation in this
+# script (and the bundle/deploy scripts that reuse this output) to pass
+# `USE_AF_XDP=1` so the scanner gets the AF_XDP code path linked. The
+# anygpt-42 wire-up gap was that nothing in this chain forwarded the flag,
+# so the runtime --io-engine=af_xdp knob had no AF_XDP code to dispatch
+# to. See plans/2026-04-27-portscan-afxdp-plan-v1.md §3.6.
+ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
+
+# True when the existing scanner binary was linked against libxdp at build
+# time. The AF_XDP build path (USE_AF_XDP=1 in the engine Makefile) adds
+# `-lxdp -lbpf -lelf -lz` so libxdp.so shows up as a dynamic dependency;
+# the legacy AF_PACKET-only build does not. We probe ldd first and fall
+# back to readelf -d so the check works on hosts that strip glibc.
+binary_has_afxdp_linkage() {
+	local bin="$1"
+	[ -x "$bin" ] || return 1
+	if command -v ldd >/dev/null 2>&1; then
+		if ldd "$bin" 2>/dev/null | grep -q 'libxdp\.so'; then
+			return 0
+		fi
+	fi
+	if command -v readelf >/dev/null 2>&1; then
+		if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'libxdp\.so'; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# Resolve the make argv once so install/bundle/deploy paths produce
+# byte-identical invocations and the unit test in
+# tools/test-install-external-deps-afxdp.sh can assert the expected
+# token list. Stays empty (no extra args) when ANYSCAN_USE_AF_XDP=0.
+vulnscanner_make_args() {
+	if [ "${ANYSCAN_USE_AF_XDP:-0}" = "1" ]; then
+		printf 'USE_AF_XDP=1\n'
+	fi
+}
+
 EXTENSION_MANIFESTS="$SCRIPT_DIR/local-bootstrap-provisioner.json,$SCRIPT_DIR/vulnscanner-zmap-adapter.json"
 ANYGPT_API_ENV_FILE_DEFAULT="$REPO_ROOT/apps/api/.env"
 
@@ -114,10 +154,34 @@ else
 	git clone "$VULNSCANNER_REPO_URL" "$VULNSCANNER_REPO_DIR"
 fi
 
+need_build=0
 if [ ! -x "$VULNSCANNER_BIN_PATH" ]; then
+	need_build=1
+elif [ "$ANYSCAN_USE_AF_XDP" = "1" ] && ! binary_has_afxdp_linkage "$VULNSCANNER_BIN_PATH"; then
+	# Cached binary was built with the legacy USE_AF_XDP=0 path. The
+	# AF_XDP code is not linked in, so leaving this in place silently
+	# defeats `--io-engine=af_xdp`. Force a clean rebuild rather than
+	# an incremental one — partial artifacts from the previous build
+	# can mask missing source files added by the AF_XDP block of the
+	# engine Makefile.
+	printf '[*] Existing scanner at %s lacks libxdp linkage; forcing rebuild because ANYSCAN_USE_AF_XDP=1.\n' "$VULNSCANNER_BIN_PATH"
 	if [ -f "$VULNSCANNER_REPO_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
-		printf '[*] Building VulnScanner scanner binary...\n'
-		make -C "$VULNSCANNER_REPO_DIR"
+		make -C "$VULNSCANNER_REPO_DIR" clean >/dev/null 2>&1 || true
+	fi
+	rm -f "$VULNSCANNER_BIN_PATH"
+	need_build=1
+fi
+
+if [ "$need_build" = "1" ]; then
+	if [ -f "$VULNSCANNER_REPO_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
+		# shellcheck disable=SC2046  # word-splitting wanted: function emits 0 or 1 token
+		make_args=( $(vulnscanner_make_args) )
+		if [ "${#make_args[@]}" -gt 0 ]; then
+			printf '[*] Building VulnScanner scanner binary with %s...\n' "${make_args[*]}"
+		else
+			printf '[*] Building VulnScanner scanner binary...\n'
+		fi
+		make -C "$VULNSCANNER_REPO_DIR" "${make_args[@]}"
 	else
 		printf '[!] Scanner binary is missing and make is unavailable.\n' >&2
 		exit 1
@@ -126,6 +190,12 @@ fi
 
 if [ ! -x "$VULNSCANNER_BIN_PATH" ]; then
 	printf '[!] Expected scanner binary was not created at %s\n' "$VULNSCANNER_BIN_PATH" >&2
+	exit 1
+fi
+
+if [ "$ANYSCAN_USE_AF_XDP" = "1" ] && ! binary_has_afxdp_linkage "$VULNSCANNER_BIN_PATH"; then
+	printf '[!] ANYSCAN_USE_AF_XDP=1 but %s does not link libxdp.so. Build deps were probably missing — install libxdp-dev/libbpf-dev/libelf-dev and re-run.\n' \
+		"$VULNSCANNER_BIN_PATH" >&2
 	exit 1
 fi
 
