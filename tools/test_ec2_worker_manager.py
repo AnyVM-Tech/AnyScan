@@ -338,8 +338,16 @@ class BuildNetworkInterfacesTests(unittest.TestCase):
         for spec in ifs:
             self.assertNotIn("AssociatePublicIpAddress", spec)
 
-    def test_associate_public_ip_true_sets_on_primary_only(self):
-        """Multi-card: only DeviceIndex=0 + NetworkCardIndex=0 gets the flag."""
+    def test_associate_public_ip_suppressed_when_multi_nic_multi_card(self):
+        """AWS rejects AssociatePublicIpAddress whenever len(NetworkInterfaces) > 1.
+
+        Even though the field would only logically belong on the
+        primary entry, the AWS API surfaces this as
+        InvalidParameterCombination on the entire RunInstances call. So
+        when the helper produces more than one NIC, the field must not
+        appear anywhere in the payload — multi-ENI launches that need a
+        public IP must allocate+associate an Elastic IP post-launch.
+        """
         cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
             "NetworkCards"
         ]
@@ -350,38 +358,31 @@ class BuildNetworkInterfacesTests(unittest.TestCase):
             network_cards=cards,
             associate_public_ip=True,
         )
-        public_ip_entries = [
-            spec for spec in ifs if spec.get("AssociatePublicIpAddress") is True
-        ]
-        self.assertEqual(len(public_ip_entries), 1)
-        primary = public_ip_entries[0]
-        self.assertEqual(primary["DeviceIndex"], 0)
-        self.assertEqual(primary["NetworkCardIndex"], 0)
-        # Every other entry is silent on the field — AWS rejects it on
-        # secondaries, so we must not emit a `False` either.
-        secondaries = [
-            spec for spec in ifs if spec is not primary
-        ]
-        for spec in secondaries:
+        for spec in ifs:
             self.assertNotIn("AssociatePublicIpAddress", spec)
 
-    def test_associate_public_ip_true_single_card_path(self):
-        """Single-card (network_cards=None): primary entry is just DeviceIndex=0."""
+    def test_associate_public_ip_suppressed_when_multi_nic_single_card(self):
+        """Single-card target_count>1 is also rejected by AWS."""
         ifs = m.build_network_interfaces(
             target_count=3,
             subnet_ids=["subnet-aaa"],
             security_group_ids=["sg-1"],
             associate_public_ip=True,
         )
-        public_ip_entries = [
-            spec for spec in ifs if spec.get("AssociatePublicIpAddress") is True
-        ]
-        self.assertEqual(len(public_ip_entries), 1)
-        self.assertEqual(public_ip_entries[0]["DeviceIndex"], 0)
-        # NetworkCardIndex was not emitted on this path.
-        self.assertNotIn("NetworkCardIndex", public_ip_entries[0])
-        for spec in ifs[1:]:
+        for spec in ifs:
             self.assertNotIn("AssociatePublicIpAddress", spec)
+
+    def test_associate_public_ip_emitted_on_single_nic_payload(self):
+        """target_count=1: AWS accepts AssociatePublicIpAddress on the only NIC."""
+        ifs = m.build_network_interfaces(
+            target_count=1,
+            subnet_ids=["subnet-aaa"],
+            security_group_ids=["sg-1"],
+            associate_public_ip=True,
+        )
+        self.assertEqual(len(ifs), 1)
+        self.assertIs(ifs[0].get("AssociatePublicIpAddress"), True)
+        self.assertEqual(ifs[0]["DeviceIndex"], 0)
 
 
 def _make_config(**overrides) -> Any:
@@ -421,10 +422,26 @@ def _make_config(**overrides) -> Any:
 class _FakeEc2Client:
     """Minimal in-memory EC2 stub recording RunInstances calls."""
 
-    def __init__(self, describe_payload: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        describe_payload: dict[str, Any] | None = None,
+        *,
+        allocate_address_error: dict[str, str] | None = None,
+        associate_address_error: dict[str, str] | None = None,
+        release_address_error: dict[str, str] | None = None,
+    ) -> None:
         self.describe_payload = describe_payload
         self.run_instances_calls: list[dict[str, Any]] = []
         self.terminate_calls: list[list[str]] = []
+        self.allocate_address_calls: list[dict[str, Any]] = []
+        self.associate_address_calls: list[dict[str, Any]] = []
+        self.disassociate_address_calls: list[dict[str, Any]] = []
+        self.release_address_calls: list[dict[str, Any]] = []
+        self.allocate_address_error = allocate_address_error
+        self.associate_address_error = associate_address_error
+        self.release_address_error = release_address_error
+        self._next_alloc_id = 1
+        self._next_assoc_id = 1
 
     def describe_instance_types(self, *, InstanceTypes):
         if self.describe_payload is None:
@@ -435,11 +452,56 @@ class _FakeEc2Client:
 
     def run_instances(self, **kwargs):
         self.run_instances_calls.append(kwargs)
-        return {"Instances": [{"InstanceId": "i-fake-123"}]}
+        # Reflect the requested NetworkInterfaces back as the launched
+        # instance's NetworkInterfaces with synthetic IDs/Attachments so
+        # the post-launch EIP path can find a primary ENI.
+        nics_in = kwargs.get("NetworkInterfaces") or []
+        nics_out = []
+        for idx, nic in enumerate(nics_in):
+            nics_out.append(
+                {
+                    "NetworkInterfaceId": f"eni-fake-{idx}",
+                    "Attachment": {"DeviceIndex": nic.get("DeviceIndex", idx)},
+                }
+            )
+        return {
+            "Instances": [
+                {
+                    "InstanceId": "i-fake-123",
+                    "NetworkInterfaces": nics_out,
+                }
+            ]
+        }
 
     def terminate_instances(self, *, InstanceIds):
         self.terminate_calls.append(list(InstanceIds))
         return {"TerminatingInstances": [{"InstanceId": InstanceIds[0]}]}
+
+    def allocate_address(self, **kwargs):
+        self.allocate_address_calls.append(kwargs)
+        if self.allocate_address_error is not None:
+            raise _StubClientError({"Error": self.allocate_address_error})
+        alloc_id = f"eipalloc-fake-{self._next_alloc_id}"
+        self._next_alloc_id += 1
+        return {"AllocationId": alloc_id, "PublicIp": "203.0.113.42"}
+
+    def associate_address(self, **kwargs):
+        self.associate_address_calls.append(kwargs)
+        if self.associate_address_error is not None:
+            raise _StubClientError({"Error": self.associate_address_error})
+        assoc_id = f"eipassoc-fake-{self._next_assoc_id}"
+        self._next_assoc_id += 1
+        return {"AssociationId": assoc_id}
+
+    def disassociate_address(self, **kwargs):
+        self.disassociate_address_calls.append(kwargs)
+        return {}
+
+    def release_address(self, **kwargs):
+        self.release_address_calls.append(kwargs)
+        if self.release_address_error is not None:
+            raise _StubClientError({"Error": self.release_address_error})
+        return {}
 
     # describe_instances + status calls happen in current_instance_id /
     # _describe_instance; the tests below stub current_instance_id() to
@@ -574,8 +636,12 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
             subnet_sequence, ["subnet-X", "subnet-Y", "subnet-X", "subnet-Y"]
         )
 
-    def test_associate_public_ip_knob_propagates_to_primary_eni(self):
-        """ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP=1 lands on the primary NIC only."""
+    def test_associate_public_ip_knob_triggers_post_launch_path_on_multi_eni(self):
+        """ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP=1 + multi-ENI: NetworkInterfaces[]
+        carries no AssociatePublicIpAddress (AWS rejects it), and the
+        manager allocates+associates an Elastic IP post-launch on the
+        primary ENI instead.
+        """
         config = _make_config(
             max_enis=15,
             instance_type="c6in.metal",
@@ -587,23 +653,39 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
         with mock.patch.object(manager, "current_instance_id", return_value=None), \
              mock.patch.object(manager, "ensure_ssh_access", return_value=None), \
              mock.patch.object(manager, "build_user_data", return_value="#!fake"):
-            manager.recreate_instance()
+            result = manager.recreate_instance()
 
+        # Launch payload must be free of AssociatePublicIpAddress on
+        # every NIC — that's what AWS hard-rejects with
+        # InvalidParameterCombination on multi-ENI launches.
         call = ec2.run_instances_calls[0]
         nics = call["NetworkInterfaces"]
-        primary_candidates = [
-            nic for nic in nics
-            if nic.get("DeviceIndex") == 0 and nic.get("NetworkCardIndex") == 0
-        ]
-        self.assertEqual(len(primary_candidates), 1)
-        self.assertIs(primary_candidates[0].get("AssociatePublicIpAddress"), True)
-        secondaries = [nic for nic in nics if nic is not primary_candidates[0]]
-        self.assertGreater(len(secondaries), 0)
-        for nic in secondaries:
+        self.assertGreater(len(nics), 1)
+        for nic in nics:
             self.assertNotIn("AssociatePublicIpAddress", nic)
 
+        # Post-launch EIP path was taken.
+        self.assertEqual(len(ec2.allocate_address_calls), 1)
+        self.assertEqual(ec2.allocate_address_calls[0], {"Domain": "vpc"})
+        self.assertEqual(len(ec2.associate_address_calls), 1)
+        assoc_call = ec2.associate_address_calls[0]
+        self.assertTrue(assoc_call["NetworkInterfaceId"].startswith("eni-fake-"))
+        self.assertTrue(assoc_call["AllocationId"].startswith("eipalloc-fake-"))
+        self.assertIs(assoc_call.get("AllowReassociation"), True)
+
+        # Status surfaces in eni_attach so the daemon log shows it.
+        public_ip_status = result["eni_attach"]["public_ip"]
+        self.assertEqual(public_ip_status["status"], "associated")
+        self.assertEqual(public_ip_status["public_ip"], "203.0.113.42")
+
+        # AllocationId/AssociationId persist in state for cleanup on the
+        # next recreate_instance.
+        self.assertIn("eip_allocation_id", manager.state)
+        self.assertIn("eip_association_id", manager.state)
+
     def test_associate_public_ip_default_off_emits_no_field(self):
-        """Default config (knob off) → no NIC carries AssociatePublicIpAddress."""
+        """Default config (knob off) → no NIC carries AssociatePublicIpAddress
+        and no post-launch EIP path runs."""
         config = _make_config(max_enis=15, instance_type="c6in.metal")
         ec2 = _FakeEc2Client(describe_payload=_c6in_metal_describe())
         manager = _make_manager(config, ec2)
@@ -616,6 +698,108 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
         call = ec2.run_instances_calls[0]
         for nic in call["NetworkInterfaces"]:
             self.assertNotIn("AssociatePublicIpAddress", nic)
+        self.assertEqual(ec2.allocate_address_calls, [])
+        self.assertEqual(ec2.associate_address_calls, [])
+
+    def test_associate_public_ip_allocate_failure_does_not_abort_recreate(self):
+        """An AllocateAddress error surfaces in eni_attach but the recreate
+        result still reports the launched instance — the worker is usable
+        on private IPs, operators can retry the EIP step manually."""
+        config = _make_config(
+            max_enis=15,
+            instance_type="c6in.metal",
+            associate_public_ip=True,
+        )
+        ec2 = _FakeEc2Client(
+            describe_payload=_c6in_metal_describe(),
+            allocate_address_error={
+                "Code": "AddressLimitExceeded",
+                "Message": "EIP cap reached",
+            },
+        )
+        manager = _make_manager(config, ec2)
+
+        with mock.patch.object(manager, "current_instance_id", return_value=None), \
+             mock.patch.object(manager, "ensure_ssh_access", return_value=None), \
+             mock.patch.object(manager, "build_user_data", return_value="#!fake"):
+            result = manager.recreate_instance()
+
+        self.assertEqual(result["launched"]["InstanceId"], "i-fake-123")
+        public_ip_status = result["eni_attach"]["public_ip"]
+        self.assertEqual(public_ip_status["status"], "allocate_address_failed")
+        self.assertEqual(public_ip_status["code"], "AddressLimitExceeded")
+        self.assertEqual(ec2.associate_address_calls, [])
+        self.assertNotIn("eip_allocation_id", manager.state)
+
+    def test_associate_public_ip_associate_failure_records_alloc_for_cleanup(self):
+        """If allocate succeeds but associate fails, the AllocationId is
+        still recorded so the next recreate releases it (no EIP leak)."""
+        config = _make_config(
+            max_enis=15,
+            instance_type="c6in.metal",
+            associate_public_ip=True,
+        )
+        ec2 = _FakeEc2Client(
+            describe_payload=_c6in_metal_describe(),
+            associate_address_error={
+                "Code": "InvalidNetworkInterfaceID.NotFound",
+                "Message": "ENI vanished",
+            },
+        )
+        manager = _make_manager(config, ec2)
+
+        with mock.patch.object(manager, "current_instance_id", return_value=None), \
+             mock.patch.object(manager, "ensure_ssh_access", return_value=None), \
+             mock.patch.object(manager, "build_user_data", return_value="#!fake"):
+            result = manager.recreate_instance()
+
+        public_ip_status = result["eni_attach"]["public_ip"]
+        self.assertEqual(public_ip_status["status"], "associate_address_failed")
+        self.assertIn("allocation_id", public_ip_status)
+        self.assertEqual(
+            manager.state["eip_allocation_id"], public_ip_status["allocation_id"]
+        )
+        self.assertNotIn("eip_association_id", manager.state)
+
+    def test_release_recorded_eip_runs_before_terminate_on_recreate(self):
+        """A previous post-launch EIP is released before terminating the
+        old instance, so we don't leak EIPs across recreates."""
+        config = _make_config(
+            max_enis=15,
+            instance_type="c6in.metal",
+            associate_public_ip=True,
+        )
+        ec2 = _FakeEc2Client(describe_payload=_c6in_metal_describe())
+        manager = _make_manager(config, ec2)
+        # Simulate a prior recreate having allocated/associated.
+        manager.state["eip_allocation_id"] = "eipalloc-old-9"
+        manager.state["eip_association_id"] = "eipassoc-old-9"
+
+        with mock.patch.object(
+            manager, "current_instance_id", return_value="i-old-prev"
+        ), mock.patch.object(
+            manager, "ensure_ssh_access", return_value=None
+        ), mock.patch.object(
+            manager, "build_user_data", return_value="#!fake"
+        ):
+            result = manager.recreate_instance()
+
+        # Old EIP disassociated + released, new one allocated for the
+        # fresh instance.
+        self.assertEqual(
+            ec2.disassociate_address_calls,
+            [{"AssociationId": "eipassoc-old-9"}],
+        )
+        self.assertEqual(
+            ec2.release_address_calls, [{"AllocationId": "eipalloc-old-9"}]
+        )
+        self.assertEqual(result["released_eip"]["status"], "released")
+        self.assertEqual(
+            result["released_eip"]["allocation_id"], "eipalloc-old-9"
+        )
+        self.assertEqual(len(ec2.allocate_address_calls), 1)
+        # State reflects the new EIP, not the released one.
+        self.assertNotEqual(manager.state["eip_allocation_id"], "eipalloc-old-9")
 
 
 class FromEnvIntegrationTests(unittest.TestCase):
