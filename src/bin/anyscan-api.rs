@@ -90,6 +90,21 @@ const HOSTED_AGENT_BUNDLE_ARTIFACT_PATH_PREFIX: &str = "/api/agent/bundles";
 const HOSTED_AGENT_BUNDLE_CHUNK_SIZE: usize = 64 * 1024;
 const HOSTED_AGENT_BUNDLE_KEEP_COUNT: usize = 5;
 const HOSTED_AGENT_BUNDLE_FINGERPRINT_LEN: usize = 12;
+// Build-flag env vars folded into the hosted bundle source fingerprint.
+// Two API processes that ship the same agent/scanner binaries but were
+// invoked with different ANYSCAN_USE_AF_XDP / ANYSCAN_USE_DPDK /
+// ANYSCAN_USE_PFRING_ZC / ANYSCAN_INSTALL_KERNEL_BACKPORT settings
+// produce different bundles (the packager rebuilds the scanner with
+// matching linkage), so the cache key must distinguish them. Without
+// this, a default-flags rebuild evicts a feature-flagged bundle and
+// `/api/agent/install.sh?rebuild=false` ends up serving a stub
+// scanner — see PR #65 issuecomment-4339242358 (anygpt-52).
+const BUNDLE_BUILD_FLAG_ENV_VARS: &[&str] = &[
+    "ANYSCAN_USE_AF_XDP",
+    "ANYSCAN_USE_DPDK",
+    "ANYSCAN_USE_PFRING_ZC",
+    "ANYSCAN_INSTALL_KERNEL_BACKPORT",
+];
 const HOSTED_OPENWRT_OPAL_OUTPUT_DIR: &str = "/var/lib/anyscan/openwrt-opal";
 const HOSTED_OPENWRT_OPAL_INSTALL_PATH: &str = "/api/openwrt/opal/install.sh";
 const HOSTED_OPENWRT_OPAL_FILE_PATH_PREFIX: &str = "/api/openwrt/opal/files";
@@ -3804,8 +3819,45 @@ fn current_hosted_agent_bundle_source_fingerprint() -> Result<String> {
             &mut hasher,
         )?;
     }
+    hash_bundle_build_flag_env_vars(&mut hasher, |k| std::env::var(k).ok());
     let digest = format!("{:x}", hasher.finalize());
     Ok(digest)
+}
+
+/// Fold the build-flag env vars into the bundle source fingerprint hash.
+///
+/// Each var is hashed as a (label, name, value) triple separated by NULs
+/// so distinct vars/values can never collide. Unset vars hash as empty
+/// strings — that's fine because empty != "1" and the goal is just to
+/// distinguish "default" from any feature-flagged build.
+///
+/// `env_lookup` is injected so tests can pass a hermetic closure
+/// instead of poking the global process environment (Rust runs unit
+/// tests in parallel by default).
+fn hash_bundle_build_flag_env_vars(
+    hasher: &mut Sha256,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) {
+    for var in BUNDLE_BUILD_FLAG_ENV_VARS {
+        hasher.update(b"bundle-build-flag\0");
+        hasher.update(var.as_bytes());
+        hasher.update(b"\0");
+        let value = env_lookup(var).unwrap_or_default();
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+}
+
+/// Pure helper used by tests: SHA-256-hex of just the build-flag env
+/// vars under a given lookup. Matches the contribution `hash_bundle_
+/// build_flag_env_vars` makes to the full fingerprint.
+#[cfg(test)]
+fn bundle_build_flag_env_fingerprint(
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_bundle_build_flag_env_vars(&mut hasher, env_lookup);
+    format!("{:x}", hasher.finalize())
 }
 
 fn native_hosted_agent_platform_key() -> &'static str {
@@ -4852,5 +4904,102 @@ mod tests {
              pollutes the source fingerprint without ever reaching the bundle. \
              Unreferenced entries: {unreferenced_assets:?}"
         );
+    }
+
+    #[test]
+    fn bundle_build_flag_env_fingerprint_changes_when_af_xdp_flips() {
+        // Default (everything unset) → baseline.
+        let baseline = bundle_build_flag_env_fingerprint(|_| None);
+        // ANYSCAN_USE_AF_XDP=1 must produce a different fingerprint
+        // — that's the whole point of folding the flag into the cache key.
+        let with_af_xdp = bundle_build_flag_env_fingerprint(|k| {
+            if k == "ANYSCAN_USE_AF_XDP" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        });
+        assert_ne!(baseline, with_af_xdp);
+    }
+
+    #[test]
+    fn bundle_build_flag_env_fingerprint_distinguishes_each_flag() {
+        // Each flag flipped on its own must yield a unique fingerprint.
+        // Otherwise an AF_XDP-only build and a DPDK-only build would
+        // collide in the cache.
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(bundle_build_flag_env_fingerprint(|_| None));
+        for flag in BUNDLE_BUILD_FLAG_ENV_VARS {
+            let fp = bundle_build_flag_env_fingerprint(|k| {
+                if k == *flag {
+                    Some("1".to_string())
+                } else {
+                    None
+                }
+            });
+            assert!(
+                seen.insert(fp.clone()),
+                "build-flag fingerprint collision when only {flag} is set: {fp}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundle_build_flag_env_fingerprint_distinguishes_values() {
+        // Same flag, different value → different fingerprint. Operators
+        // who toggle ANYSCAN_USE_AF_XDP between "1" and "0" (rather than
+        // unset) still get distinct cache slots.
+        let on = bundle_build_flag_env_fingerprint(|k| {
+            if k == "ANYSCAN_USE_AF_XDP" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        });
+        let off = bundle_build_flag_env_fingerprint(|k| {
+            if k == "ANYSCAN_USE_AF_XDP" {
+                Some("0".to_string())
+            } else {
+                None
+            }
+        });
+        let unset = bundle_build_flag_env_fingerprint(|_| None);
+        assert_ne!(on, off);
+        assert_ne!(on, unset);
+        assert_ne!(off, unset);
+    }
+
+    #[test]
+    fn bundle_build_flag_env_fingerprint_stable_under_same_input() {
+        // Same lookup → same fingerprint. Sanity check that the helper
+        // is deterministic and doesn't read process env when given an
+        // explicit closure.
+        let lookup = |k: &str| {
+            if k == "ANYSCAN_USE_DPDK" {
+                Some("1".to_string())
+            } else {
+                None
+            }
+        };
+        let first = bundle_build_flag_env_fingerprint(lookup);
+        let second = bundle_build_flag_env_fingerprint(lookup);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn bundle_build_flag_env_vars_covers_every_documented_flag() {
+        // Pin the set of flags that the bundle cache key honors.
+        // package-worker-bundle.sh and install-external-deps.sh each
+        // branch on these; if a new ANYSCAN_USE_* knob is added it
+        // must be folded in here as well or the cache will pollute.
+        let flags: HashSet<&str> = BUNDLE_BUILD_FLAG_ENV_VARS.iter().copied().collect();
+        for required in [
+            "ANYSCAN_USE_AF_XDP",
+            "ANYSCAN_USE_DPDK",
+            "ANYSCAN_USE_PFRING_ZC",
+            "ANYSCAN_INSTALL_KERNEL_BACKPORT",
+        ] {
+            assert!(flags.contains(required), "missing build flag: {required}");
+        }
     }
 }
