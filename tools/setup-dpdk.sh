@@ -54,9 +54,11 @@ Usage:
   setup-dpdk.sh status
 
 Environment:
-  ANYSCAN_DPDK_PCI_BDFS     CSV of PCI BDFs or iface names (used when --bdfs is omitted)
-  ANYSCAN_DPDK_HUGEPAGES_GB Hugepages reservation in GiB (default 4)
-  ANYSCAN_DPDK_DEVBIND      dpdk-devbind.py path (auto-detected when unset)
+  ANYSCAN_DPDK_PCI_BDFS              CSV of PCI BDFs or iface names (used when --bdfs is omitted)
+  ANYSCAN_DPDK_HUGEPAGES_GB          Hugepages reservation in GiB (default 4)
+  ANYSCAN_DPDK_HUGEPAGES_1G_MOUNT    Hugetlbfs mount path for 1 GiB pages (default /mnt/huge1g; empty = skip)
+  ANYSCAN_DPDK_HUGEPAGES_2M_MOUNT    Hugetlbfs mount path for 2 MiB pages (default /mnt/huge2m; empty = skip)
+  ANYSCAN_DPDK_DEVBIND               dpdk-devbind.py path (auto-detected when unset)
 
 Refusal rules (hard-coded):
   - eth0 is never bound (agentd control-plane interface).
@@ -65,6 +67,17 @@ USAGE
 }
 
 ANYSCAN_DPDK_HUGEPAGES_GB="${ANYSCAN_DPDK_HUGEPAGES_GB:-4}"
+# Hugetlbfs mount points. Reserving hugepages via /sys/.../nr_hugepages
+# is not enough: DPDK's EAL also requires a hugetlbfs of the matching
+# pagesize to be mounted. anygpt-52 hit this on c6in.metal: 8×1 GiB
+# pages were reserved, but EAL still reported "No available 1048576 kB
+# hugepages reported on node 0" because nothing was mounted at /mnt/
+# huge1g — the operator had to `mount -t hugetlbfs -o pagesize=1G nodev
+# /mnt/huge1g` manually. The script now mounts these by default;
+# operators who already provision hugetlbfs via fstab can override
+# either path or set them to the empty string to skip.
+ANYSCAN_DPDK_HUGEPAGES_1G_MOUNT="${ANYSCAN_DPDK_HUGEPAGES_1G_MOUNT:-/mnt/huge1g}"
+ANYSCAN_DPDK_HUGEPAGES_2M_MOUNT="${ANYSCAN_DPDK_HUGEPAGES_2M_MOUNT:-/mnt/huge2m}"
 ANYSCAN_DPDK_PCI_BDFS="${ANYSCAN_DPDK_PCI_BDFS:-}"
 ANYSCAN_DPDK_DEVBIND="${ANYSCAN_DPDK_DEVBIND:-}"
 
@@ -110,6 +123,28 @@ iface_to_bdf() {
     fi
     # /sys/devices/pci0000:00/0000:00:06.0 → 0000:00:06.0 (last component)
     basename "$resolved"
+}
+
+# Reverse of iface_to_bdf: walk /sys/bus/pci/devices/<bdf>/net/ for the
+# first interface name. Returns the empty string when the BDF has no
+# kernel netdev (already bound to vfio-pci, or non-NIC PCI device).
+# Used by cmd_bind to bring the iface down before invoking dpdk-devbind:
+# the devbind safety check refuses active interfaces with "Warning:
+# routing table indicates that interface is active. Not modifying" and
+# leaves the operator to figure out the bring-down step on every NIC.
+bdf_to_iface() {
+    local bdf="$1"
+    local netdir="/sys/bus/pci/devices/$bdf/net"
+    if [ ! -d "$netdir" ]; then
+        return 0
+    fi
+    local entry
+    for entry in "$netdir"/*; do
+        [ -e "$entry" ] || continue
+        basename "$entry"
+        return 0
+    done
+    return 0
 }
 
 # Parse the user-supplied list (BDFs or iface names) into a deduplicated
@@ -191,6 +226,7 @@ reserve_hugepages() {
         if [ "$current" -ge "$target_gb" ]; then
             printf '[*] %s: %s 1 GiB hugepages already reserved (target %s).\n' \
                 "$SCRIPT_NAME" "$current" "$target_gb"
+            ensure_hugetlbfs_mount "1G" "$ANYSCAN_DPDK_HUGEPAGES_1G_MOUNT"
             return 0
         fi
         printf '[*] %s: reserving %s 1 GiB hugepages...\n' "$SCRIPT_NAME" "$target_gb"
@@ -198,6 +234,7 @@ reserve_hugepages() {
             current="$(cat "$hp1g_dir/nr_hugepages" 2>/dev/null || echo 0)"
             if [ "$current" -ge "$target_gb" ]; then
                 printf '[*] %s: 1 GiB hugepages reserved=%s.\n' "$SCRIPT_NAME" "$current"
+                ensure_hugetlbfs_mount "1G" "$ANYSCAN_DPDK_HUGEPAGES_1G_MOUNT"
                 return 0
             fi
             printf '[!] %s: 1 GiB hugepages reservation fell short (got %s, wanted %s); falling back to 2 MiB.\n' \
@@ -212,6 +249,7 @@ reserve_hugepages() {
         if [ "$current" -ge "$target_2m" ]; then
             printf '[*] %s: %s 2 MiB hugepages already reserved (target %s).\n' \
                 "$SCRIPT_NAME" "$current" "$target_2m"
+            ensure_hugetlbfs_mount "2M" "$ANYSCAN_DPDK_HUGEPAGES_2M_MOUNT"
             return 0
         fi
         printf '[*] %s: reserving %s 2 MiB hugepages...\n' "$SCRIPT_NAME" "$target_2m"
@@ -219,6 +257,7 @@ reserve_hugepages() {
             current="$(cat "$hp2m_dir/nr_hugepages" 2>/dev/null || echo 0)"
             if [ "$current" -ge "$target_2m" ]; then
                 printf '[*] %s: 2 MiB hugepages reserved=%s.\n' "$SCRIPT_NAME" "$current"
+                ensure_hugetlbfs_mount "2M" "$ANYSCAN_DPDK_HUGEPAGES_2M_MOUNT"
                 return 0
             fi
         fi
@@ -227,6 +266,54 @@ reserve_hugepages() {
     printf '[!] %s: could not reserve any hugepages. Check /proc/meminfo HugePages_Total and free system memory.\n' \
         "$SCRIPT_NAME" >&2
     return 1
+}
+
+# Mount a hugetlbfs at $mount_point with `pagesize=$pagesize`. Reserving
+# nr_hugepages alone is not enough — DPDK's EAL refuses to start if no
+# hugetlbfs of the requested page size is mounted ("EAL: No available
+# 1048576 kB hugepages reported"). Idempotent: a no-op if the target is
+# already a hugetlbfs of the right size. Failures are warned but not
+# fatal so the bind step itself doesn't abort on a mount that the
+# operator may have provisioned via fstab differently.
+ensure_hugetlbfs_mount() {
+    local pagesize="$1"      # "1G" or "2M"
+    local mount_point="$2"
+    [ -n "$mount_point" ] || return 0
+    if ! command -v mount >/dev/null 2>&1; then
+        printf '[!] %s: `mount` not on PATH; cannot ensure hugetlbfs at %s.\n' \
+            "$SCRIPT_NAME" "$mount_point" >&2
+        return 0
+    fi
+    if [ ! -d "$mount_point" ]; then
+        if ! mkdir -p "$mount_point" 2>/dev/null; then
+            printf '[!] %s: failed to create %s for hugetlbfs mount.\n' \
+                "$SCRIPT_NAME" "$mount_point" >&2
+            return 0
+        fi
+    fi
+    # Already a hugetlbfs mount of the matching pagesize? findmnt is the
+    # canonical check; fall back to /proc/mounts grep when findmnt is
+    # missing (busybox/minimal AMIs).
+    local existing_opts=""
+    if command -v findmnt >/dev/null 2>&1; then
+        existing_opts="$(findmnt -n -o FSTYPE,OPTIONS --target "$mount_point" 2>/dev/null || true)"
+    elif [ -r /proc/mounts ]; then
+        existing_opts="$(awk -v p="$mount_point" '$2==p{print $3" "$4}' /proc/mounts 2>/dev/null || true)"
+    fi
+    if [ -n "$existing_opts" ] && \
+       printf '%s' "$existing_opts" | grep -q "hugetlbfs" && \
+       printf '%s' "$existing_opts" | grep -qi "pagesize=${pagesize}"; then
+        printf '[*] %s: %s already mounted as hugetlbfs (pagesize=%s).\n' \
+            "$SCRIPT_NAME" "$mount_point" "$pagesize"
+        return 0
+    fi
+    printf '[*] %s: mounting hugetlbfs at %s (pagesize=%s)...\n' \
+        "$SCRIPT_NAME" "$mount_point" "$pagesize"
+    if ! mount -t hugetlbfs -o "pagesize=${pagesize}" nodev "$mount_point" 2>/dev/null; then
+        printf '[!] %s: hugetlbfs mount at %s (pagesize=%s) failed; rte_eal_init may report "no hugepages reported on node 0/1".\n' \
+            "$SCRIPT_NAME" "$mount_point" "$pagesize" >&2
+        return 0
+    fi
 }
 
 # Free hugepages back to the system (set nr_hugepages to 0).
@@ -322,6 +409,28 @@ cmd_bind() {
             printf '[*] %s: %s already bound to vfio-pci; skipping.\n' "$SCRIPT_NAME" "$bdf"
             continue
         fi
+        # dpdk-devbind refuses interfaces that the kernel routing table
+        # still considers active ("Warning: routing table indicates that
+        # interface is active. Not modifying"). Bring the iface down
+        # ourselves so the operator doesn't have to call `ip link set …
+        # down` on each NIC manually before bind. Best-effort: missing
+        # `ip` command, missing iface (already a vfio-pci device with no
+        # netdev), or already-down iface all return non-fatally so the
+        # bind proceeds.
+        local iface
+        iface="$(bdf_to_iface "$bdf" || true)"
+        if [ -n "$iface" ]; then
+            if command -v ip >/dev/null 2>&1; then
+                printf '[*] %s: ip link set %s down (BDF %s) before vfio-pci bind...\n' \
+                    "$SCRIPT_NAME" "$iface" "$bdf"
+                ip link set "$iface" down 2>/dev/null || \
+                    printf '[!] %s: ip link set %s down failed; continuing in case dpdk-devbind succeeds anyway.\n' \
+                        "$SCRIPT_NAME" "$iface" >&2
+            else
+                printf '[!] %s: `ip` command not found; cannot bring %s (%s) down before vfio-pci bind. dpdk-devbind may refuse it.\n' \
+                    "$SCRIPT_NAME" "$iface" "$bdf" >&2
+            fi
+        fi
         printf '[*] %s: binding %s to vfio-pci (was: %s)...\n' "$SCRIPT_NAME" "$bdf" "${current_driver:-none}"
         if ! "$devbind" --bind=vfio-pci "$bdf"; then
             printf '[!] %s: failed to bind %s. Check `dpdk-devbind.py --status`; the device may have an active route or be the only NIC.\n' \
@@ -404,6 +513,15 @@ cmd_status() {
         printf '  dpdk-devbind.py not found\n'
     fi
 }
+
+# Test hook: when ANYSCAN_DPDK_LOAD_ONLY=1 is set the script is being
+# sourced for unit-test access to its helpers (tools/test-setup-dpdk.sh)
+# and must skip the argv dispatch. `return` works in sourced bash;
+# falling through to `exit` covers the unlikely case where the hook is
+# set during a direct invocation.
+if [ "${ANYSCAN_DPDK_LOAD_ONLY:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # argv parsing
 SUBCMD="${1:-}"
