@@ -118,23 +118,27 @@ def env_flag(name: str, default: bool = False) -> bool:
 
 
 # Phase 2 PR D of plans/2026-04-27-portscan-afxdp-plan-v1.md §3.7 added
-# af_xdp; anygpt-46 added pfring_zc with the same shape. The scanner
-# accepts --io-engine={af_packet,af_xdp,pfring_zc}; AF_PACKET stays the
-# unconditional default and unconditional fallback. The other engines
+# af_xdp; anygpt-46 added pfring_zc with the same shape. Phase 2 of
+# plans/2026-04-28-portscan-dpdk-impl-v1.md §3.10.6 adds dpdk. The scanner
+# accepts --io-engine={af_packet,af_xdp,pfring_zc,dpdk}; AF_PACKET stays
+# the unconditional default and unconditional fallback. The other engines
 # are opt-in per worker and gated on install-time probes:
 #   - ANYSCAN_AF_XDP_AVAILABLE   — kernel >=5.10 + libxdp.so loadable
 #   - ANYSCAN_PFRING_ZC_AVAILABLE — pfring kmod loaded + libpfring.so loadable
+#   - ANYSCAN_DPDK_AVAILABLE     — librte_eal.so loadable + vfio_pci loaded +
+#                                  hugepages reserved + scanner USE_DPDK-built
 # We refuse to forward an engine when its probe failed because the
-# scanner would error at startup with a dlopen / cluster-init error and
-# the worker has no way to recover. The fall-back warning is loud on
-# purpose: silently dropping back to AF_PACKET would let an operator who
-# flipped the knob keep believing they were running on the fast path.
-SUPPORTED_IO_ENGINES = ("af_packet", "af_xdp", "pfring_zc")
+# scanner would error at startup with a dlopen / EAL-init error and the
+# worker has no way to recover. The fall-back warning is loud on purpose:
+# silently dropping back to AF_PACKET would let an operator who flipped
+# the knob keep believing they were running on the fast path.
+SUPPORTED_IO_ENGINES = ("af_packet", "af_xdp", "pfring_zc", "dpdk")
 DEFAULT_IO_ENGINE = "af_packet"
 
 _IO_ENGINE_AVAILABILITY_KEYS = {
     "af_xdp": "ANYSCAN_AF_XDP_AVAILABLE",
     "pfring_zc": "ANYSCAN_PFRING_ZC_AVAILABLE",
+    "dpdk": "ANYSCAN_DPDK_AVAILABLE",
 }
 
 
