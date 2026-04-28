@@ -211,6 +211,13 @@ run_install_script() {
     local install_kernel_backport="$2"
     local uname_release="$3"
     local apt_present="$4"
+    # Optional 5th arg: os-release VERSION_CODENAME to write into a
+    # synthetic /etc/os-release the install script will read via
+    # ANYSCAN_OS_RELEASE_FILE. When empty, we pre-set
+    # ANYSCAN_KERNEL_BACKPORT_SUITE/_PACKAGE explicitly to bookworm
+    # defaults so existing case-1..4 assertions stay stable regardless
+    # of the test host's actual codename.
+    local os_release_codename="${5:-}"
 
     local repo_dir="$case_dir/engine"
     local runtime_env="$case_dir/runtime.env"
@@ -220,6 +227,7 @@ run_install_script() {
     local git_log="$case_dir/git.log"
     local stub_dir="$case_dir/stubs"
     local sources_list="$case_dir/anyscan-bookworm-backports.list"
+    local os_release_file=""
 
     mkdir -p "$repo_dir" "$artifact_dir"
     : >"$apt_log"
@@ -232,6 +240,12 @@ run_install_script() {
     prepare_stubs "$stub_dir" "$apt_log" "$make_log" "$git_log" \
         "$uname_release" "$apt_present"
 
+    if [ -n "$os_release_codename" ]; then
+        os_release_file="$case_dir/os-release"
+        printf 'ID=debian\nVERSION_CODENAME=%s\n' "$os_release_codename" \
+            >"$os_release_file"
+    fi
+
     (
         # PATH = stub_dir only. prepare_stubs symlinks the essentials
         # install-external-deps.sh needs (bash, mktemp, install, sed,
@@ -242,7 +256,23 @@ run_install_script() {
         # apt-get` returns false for the install script.
         export PATH="$stub_dir"
         export ANYSCAN_INSTALL_KERNEL_BACKPORT="$install_kernel_backport"
-        export ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="$sources_list"
+        if [ -n "$os_release_file" ]; then
+            # Auto-detect path: let the script derive suite/package from
+            # the synthetic os-release. Pin the sources-list path to a
+            # per-case file so the test doesn't try to write under
+            # /etc/apt — but still derive its name from the codename so
+            # the assertion side stays meaningful.
+            export ANYSCAN_OS_RELEASE_FILE="$os_release_file"
+            export ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="$case_dir/anyscan-${os_release_codename}-backports.list"
+            unset ANYSCAN_KERNEL_BACKPORT_SUITE
+            unset ANYSCAN_KERNEL_BACKPORT_PACKAGE
+        else
+            # Legacy path: pin suite/package explicitly so the
+            # existing case-1..4 assertions hold on any test host.
+            export ANYSCAN_KERNEL_BACKPORT_SUITE="bookworm-backports"
+            export ANYSCAN_KERNEL_BACKPORT_PACKAGE="linux-image-cloud-amd64"
+            export ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="$sources_list"
+        fi
         export ANYSCAN_VULNSCANNER_REPO_DIR="$repo_dir"
         export ANYSCAN_INSTALL_AFXDP_DEPS=false
         export ANYSCAN_USE_AF_XDP=0
@@ -349,6 +379,68 @@ if run_install_script "$case_dir" "1" "6.12.74-cloud-amd64" "no"; then
         "$case_dir/anyscan-bookworm-backports.list"
 else
     note_fail "knob=1 + no apt-get build" "install-external-deps.sh exited non-zero (see $case_dir/stderr.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 5: knob=1 + Trixie host + kernel 6.12 → suite=trixie-backports,
+#         package=linux-image-amd64 (NOT linux-image-cloud-amd64).
+# Confirms PR 65 issuecomment-4338158487 fix: bookworm-backports default
+# silently no-op'd on Trixie because bookworm cloud-amd64 is still 6.12.
+# ---------------------------------------------------------------------------
+case_dir="$WORK_ROOT/case-trixie-host"
+mkdir -p "$case_dir"
+if run_install_script "$case_dir" "1" "6.12.74-cloud-amd64" "yes" "trixie"; then
+    note_pass "knob=1 + trixie host build runs successfully"
+    assert_contains_substring \
+        "knob=1 + trixie: apt-get install -t trixie-backports linux-image-amd64 fires" \
+        "install -y --no-install-recommends -t trixie-backports linux-image-amd64" \
+        "$case_dir/apt-get.log"
+    assert_not_contains_substring \
+        "knob=1 + trixie: bookworm-backports NOT used (would silently no-op)" \
+        "bookworm-backports" \
+        "$case_dir/apt-get.log"
+    assert_not_contains_substring \
+        "knob=1 + trixie: linux-image-cloud-amd64 NOT used (still 6.12 in trixie-backports)" \
+        "linux-image-cloud-amd64" \
+        "$case_dir/apt-get.log"
+    assert_file_present \
+        "knob=1 + trixie: apt source list at trixie-backports path" \
+        "$case_dir/anyscan-trixie-backports.list"
+    assert_contains_substring \
+        "knob=1 + trixie: apt source list points at trixie-backports" \
+        "trixie-backports" \
+        "$case_dir/anyscan-trixie-backports.list"
+    assert_file_missing \
+        "knob=1 + trixie: bookworm-backports source list NOT created" \
+        "$case_dir/anyscan-bookworm-backports.list"
+else
+    note_fail "knob=1 + trixie host build" "install-external-deps.sh exited non-zero (see $case_dir/stderr.log)"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 6: knob=1 + Bookworm host + kernel 6.12 → legacy default preserved
+#         (suite=bookworm-backports, package=linux-image-cloud-amd64).
+# ---------------------------------------------------------------------------
+case_dir="$WORK_ROOT/case-bookworm-host"
+mkdir -p "$case_dir"
+if run_install_script "$case_dir" "1" "6.12.74-cloud-amd64" "yes" "bookworm"; then
+    note_pass "knob=1 + bookworm host build runs successfully"
+    assert_contains_substring \
+        "knob=1 + bookworm: apt-get install -t bookworm-backports linux-image-cloud-amd64 fires" \
+        "install -y --no-install-recommends -t bookworm-backports linux-image-cloud-amd64" \
+        "$case_dir/apt-get.log"
+    assert_file_present \
+        "knob=1 + bookworm: apt source list at bookworm-backports path" \
+        "$case_dir/anyscan-bookworm-backports.list"
+    assert_contains_substring \
+        "knob=1 + bookworm: apt source list points at bookworm-backports" \
+        "bookworm-backports" \
+        "$case_dir/anyscan-bookworm-backports.list"
+    assert_file_missing \
+        "knob=1 + bookworm: trixie-backports source list NOT created" \
+        "$case_dir/anyscan-trixie-backports.list"
+else
+    note_fail "knob=1 + bookworm host build" "install-external-deps.sh exited non-zero (see $case_dir/stderr.log)"
 fi
 
 printf '\n'
