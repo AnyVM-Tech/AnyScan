@@ -1,0 +1,29 @@
+{
+  "InstanceTypes": [
+    {
+      "InstanceType": "c6in.metal",
+      "NetworkInfo": {
+        "NetworkPerformance": "200 Gigabit",
+        "MaximumNetworkInterfaces": 16,
+        "MaximumNetworkCards": 2,
+        "DefaultNetworkCardIndex": 0,
+        "NetworkCards": [
+          {
+            "NetworkCardIndex": 0,
+            "NetworkPerformance": "Up to 170 Gigabit",
+            "MaximumNetworkInterfaces": 8,
+            "BaselineBandwidthInGbps": 100.0,
+            "PeakBandwidthInGbps": 170.0
+          },
+          {
+            "NetworkCardIndex": 1,
+            "NetworkPerformance": "Up to 170 Gigabit",
+            "MaximumNetworkInterfaces": 8,
+            "BaselineBandwidthInGbps": 100.0,
+            "PeakBandwidthInGbps": 170.0
+          }
+        ]
+      }
+    }
+  ]
+}
