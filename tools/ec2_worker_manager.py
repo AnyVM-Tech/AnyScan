@@ -214,18 +214,32 @@ def build_network_interfaces(
     available ENI slots.
 
     `associate_public_ip` (off by default) sets AssociatePublicIpAddress
-    on the primary ENI only — the entry with DeviceIndex=0 and (when
-    multi-card) NetworkCardIndex=0. AWS rejects the field on secondaries.
+    on the primary ENI — but ONLY when the resulting payload has exactly
+    one NetworkInterface entry. AWS hard-rejects RunInstances with
+    `InvalidParameterCombination — The associatePublicIPAddress
+    parameter cannot be specified when launching with multiple network
+    interfaces` whenever len(NetworkInterfaces) > 1, even if the field
+    appears only on the primary entry. Multi-ENI launches that need a
+    public IP must allocate+associate an Elastic IP post-launch — see
+    `Ec2WorkerManager._associate_public_ip_post_launch`.
+
     Needed because RunInstances ignores the subnet's MapPublicIpOnLaunch
     when an explicit NetworkInterfaces[] is passed; without this opt-in
     the launch comes up with no public IP. See PR #65
-    issuecomment-4338158487 (anygpt-48) for the failure mode.
+    issuecomment-4338158487 (anygpt-48) for the original failure mode
+    and PR #65 issuecomment-4339242358 (anygpt-52) for the multi-ENI
+    rejection that motivated the post-launch path.
     """
     if target_count < 1:
         raise ValueError("target_count must be >= 1")
     if not subnet_ids:
         raise ValueError("subnet_ids must contain at least one subnet")
     placements = distribute_enis_across_cards(target_count, network_cards)
+    # AWS rejects AssociatePublicIpAddress whenever more than one
+    # NetworkInterface entry is supplied. Only emit it inline when the
+    # resulting payload is single-NIC; multi-ENI launches must rely on
+    # post-launch allocate-address + associate-address.
+    inline_associate_public_ip = associate_public_ip and len(placements) == 1
     interfaces: list[dict[str, Any]] = []
     primary_assigned = False
     for sequence_index, (card_index, device_index) in enumerate(placements):
@@ -241,13 +255,7 @@ def build_network_interfaces(
             spec["NetworkCardIndex"] = card_index
         if security_group_ids:
             spec["Groups"] = list(security_group_ids)
-        # AssociatePublicIpAddress is only valid on the primary ENI.
-        # Set it on exactly one entry: DeviceIndex=0 plus (when we're
-        # emitting NetworkCardIndex) NetworkCardIndex=0. The placement
-        # helper guarantees the primary ENI lands first, so we only
-        # need to flip the flag the first time we see a DeviceIndex=0
-        # entry on card 0.
-        if associate_public_ip and not primary_assigned and device_index == 0:
+        if inline_associate_public_ip and not primary_assigned and device_index == 0:
             on_primary_card = (not network_cards) or card_index == 0
             if on_primary_card:
                 spec["AssociatePublicIpAddress"] = True
@@ -918,6 +926,12 @@ class Ec2WorkerManager:
     def recreate_instance(self) -> dict[str, Any]:
         current_id = self.current_instance_id()
         terminated = None
+        # If a previous run allocated an Elastic IP for the multi-ENI
+        # post-launch path, release it before terminating so the
+        # AllocationId doesn't leak. Terminating the instance auto-
+        # disassociates the EIP but leaves it allocated to the account
+        # (charged hourly until released).
+        released_eip = self._release_recorded_eip()
         if current_id:
             terminated = self.ec2.terminate_instances(InstanceIds=[current_id])
         ssh_rule = self.ensure_ssh_access()
@@ -1004,12 +1018,141 @@ class Ec2WorkerManager:
                 self.state["launched_at_epoch"] = launch_time.timestamp()
             except Exception:
                 pass
+
+        # Multi-ENI launches cannot carry AssociatePublicIpAddress on the
+        # NetworkInterfaces[] payload (AWS hard-rejects with
+        # InvalidParameterCombination), so we have to allocate an Elastic
+        # IP and associate it with the primary ENI post-launch when the
+        # operator opted into ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP. Any failure
+        # is recorded in eni_attach but does not abort the recreate:
+        # operators can retry the EIP step manually and the worker is
+        # still usable on private IPs in the meantime. See PR #65
+        # issuecomment-4339242358 (anygpt-52) for the failure mode.
+        if target_count > 1 and self.config.associate_public_ip:
+            eni_attach_info["public_ip"] = self._associate_public_ip_post_launch(
+                instance
+            )
+
         self._save_state()
-        return {
+        result: dict[str, Any] = {
             "terminated": terminated,
             "launched": instance,
             "ssh_rule": ssh_rule,
             "eni_attach": eni_attach_info,
+        }
+        if released_eip is not None:
+            result["released_eip"] = released_eip
+        return result
+
+    def _release_recorded_eip(self) -> dict[str, Any] | None:
+        """Release the EIP recorded by the previous post-launch association.
+
+        Returns None when no EIP was recorded; otherwise returns a status
+        dict suitable for embedding in recreate_instance's result. Errors
+        are logged in the dict but do not raise: a stuck release should
+        not block the worker recreate.
+        """
+        allocation_id = self.state.get("eip_allocation_id")
+        if not allocation_id:
+            return None
+        association_id = self.state.get("eip_association_id")
+        disassoc_error: dict[str, str] | None = None
+        if association_id:
+            try:
+                self.ec2.disassociate_address(AssociationId=association_id)
+            except botocore.exceptions.ClientError as exc:
+                disassoc_error = {
+                    "code": exc.response["Error"].get("Code") or "",
+                    "message": exc.response["Error"].get("Message") or "",
+                }
+        try:
+            self.ec2.release_address(AllocationId=allocation_id)
+        except botocore.exceptions.ClientError as exc:
+            return {
+                "status": "release_address_failed",
+                "allocation_id": allocation_id,
+                "code": exc.response["Error"].get("Code"),
+                "error": exc.response["Error"].get("Message"),
+                "disassociate_error": disassoc_error,
+            }
+        self.state.pop("eip_allocation_id", None)
+        self.state.pop("eip_association_id", None)
+        return {
+            "status": "released",
+            "allocation_id": allocation_id,
+            "disassociate_error": disassoc_error,
+        }
+
+    def _associate_public_ip_post_launch(
+        self, instance: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Allocate an Elastic IP and associate it with the primary ENI.
+
+        Used after a multi-ENI RunInstances call where the
+        AssociatePublicIpAddress field on NetworkInterfaces[] would have
+        been rejected by AWS. Failures are returned as a status dict
+        rather than raised so the worker still comes up on private IPs.
+
+        The AllocationId/AssociationId are recorded in self.state so the
+        next recreate_instance can release the EIP before launching a
+        replacement (otherwise we leak EIPs on every recreate).
+        """
+        primary_eni_id: str | None = None
+        for nic in instance.get("NetworkInterfaces", []) or []:
+            attachment = nic.get("Attachment") or {}
+            if attachment.get("DeviceIndex") == 0:
+                primary_eni_id = nic.get("NetworkInterfaceId")
+                break
+        if not primary_eni_id:
+            return {
+                "status": "no_primary_eni",
+                "error": "no DeviceIndex=0 ENI found in RunInstances response",
+            }
+
+        try:
+            alloc = self.ec2.allocate_address(Domain="vpc")
+        except botocore.exceptions.ClientError as exc:
+            return {
+                "status": "allocate_address_failed",
+                "code": exc.response["Error"].get("Code"),
+                "error": exc.response["Error"].get("Message"),
+            }
+        allocation_id = alloc.get("AllocationId")
+        public_ip = alloc.get("PublicIp")
+        if not allocation_id:
+            return {
+                "status": "allocate_address_no_id",
+                "error": "AllocateAddress did not return AllocationId",
+            }
+
+        try:
+            assoc = self.ec2.associate_address(
+                AllocationId=allocation_id,
+                NetworkInterfaceId=primary_eni_id,
+                AllowReassociation=True,
+            )
+        except botocore.exceptions.ClientError as exc:
+            # Allocation succeeded but association failed; record the
+            # AllocationId so the next recreate can release it, otherwise
+            # we leak an unattached EIP on every retry.
+            self.state["eip_allocation_id"] = allocation_id
+            return {
+                "status": "associate_address_failed",
+                "code": exc.response["Error"].get("Code"),
+                "error": exc.response["Error"].get("Message"),
+                "allocation_id": allocation_id,
+                "public_ip": public_ip,
+            }
+        association_id = assoc.get("AssociationId")
+        self.state["eip_allocation_id"] = allocation_id
+        if association_id:
+            self.state["eip_association_id"] = association_id
+        return {
+            "status": "associated",
+            "allocation_id": allocation_id,
+            "association_id": association_id,
+            "network_interface_id": primary_eni_id,
+            "public_ip": public_ip,
         }
 
     def run_once(self) -> dict[str, Any]:
