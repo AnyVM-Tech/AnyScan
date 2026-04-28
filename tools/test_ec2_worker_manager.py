@@ -302,6 +302,74 @@ class BuildNetworkInterfacesTests(unittest.TestCase):
         )
         self.assertNotIn("Groups", ifs[0])
 
+    def test_associate_public_ip_default_omits_field(self):
+        """No NIC carries AssociatePublicIpAddress when the knob is off."""
+        # Single-card path.
+        ifs = m.build_network_interfaces(
+            target_count=2,
+            subnet_ids=["subnet-aaa"],
+            security_group_ids=["sg-1"],
+        )
+        for spec in ifs:
+            self.assertNotIn("AssociatePublicIpAddress", spec)
+        # Multi-card path.
+        cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
+            "NetworkCards"
+        ]
+        ifs = m.build_network_interfaces(
+            target_count=4,
+            subnet_ids=["subnet-aaa"],
+            security_group_ids=["sg-1"],
+            network_cards=cards,
+        )
+        for spec in ifs:
+            self.assertNotIn("AssociatePublicIpAddress", spec)
+
+    def test_associate_public_ip_true_sets_on_primary_only(self):
+        """Multi-card: only DeviceIndex=0 + NetworkCardIndex=0 gets the flag."""
+        cards = _c6in_metal_describe()["InstanceTypes"][0]["NetworkInfo"][
+            "NetworkCards"
+        ]
+        ifs = m.build_network_interfaces(
+            target_count=4,
+            subnet_ids=["subnet-aaa"],
+            security_group_ids=["sg-1"],
+            network_cards=cards,
+            associate_public_ip=True,
+        )
+        public_ip_entries = [
+            spec for spec in ifs if spec.get("AssociatePublicIpAddress") is True
+        ]
+        self.assertEqual(len(public_ip_entries), 1)
+        primary = public_ip_entries[0]
+        self.assertEqual(primary["DeviceIndex"], 0)
+        self.assertEqual(primary["NetworkCardIndex"], 0)
+        # Every other entry is silent on the field — AWS rejects it on
+        # secondaries, so we must not emit a `False` either.
+        secondaries = [
+            spec for spec in ifs if spec is not primary
+        ]
+        for spec in secondaries:
+            self.assertNotIn("AssociatePublicIpAddress", spec)
+
+    def test_associate_public_ip_true_single_card_path(self):
+        """Single-card (network_cards=None): primary entry is just DeviceIndex=0."""
+        ifs = m.build_network_interfaces(
+            target_count=3,
+            subnet_ids=["subnet-aaa"],
+            security_group_ids=["sg-1"],
+            associate_public_ip=True,
+        )
+        public_ip_entries = [
+            spec for spec in ifs if spec.get("AssociatePublicIpAddress") is True
+        ]
+        self.assertEqual(len(public_ip_entries), 1)
+        self.assertEqual(public_ip_entries[0]["DeviceIndex"], 0)
+        # NetworkCardIndex was not emitted on this path.
+        self.assertNotIn("NetworkCardIndex", public_ip_entries[0])
+        for spec in ifs[1:]:
+            self.assertNotIn("AssociatePublicIpAddress", spec)
+
 
 def _make_config(**overrides) -> Any:
     base = dict(
@@ -331,6 +399,7 @@ def _make_config(**overrides) -> Any:
         loop_interval_seconds=60,
         max_enis=None,
         eni_subnet_ids=[],
+        associate_public_ip=False,
     )
     base.update(overrides)
     return m.ManagerConfig(**base)
@@ -492,6 +561,49 @@ class RecreateInstanceLaunchPathTests(unittest.TestCase):
             subnet_sequence, ["subnet-X", "subnet-Y", "subnet-X", "subnet-Y"]
         )
 
+    def test_associate_public_ip_knob_propagates_to_primary_eni(self):
+        """ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP=1 lands on the primary NIC only."""
+        config = _make_config(
+            max_enis=15,
+            instance_type="c6in.metal",
+            associate_public_ip=True,
+        )
+        ec2 = _FakeEc2Client(describe_payload=_c6in_metal_describe())
+        manager = _make_manager(config, ec2)
+
+        with mock.patch.object(manager, "current_instance_id", return_value=None), \
+             mock.patch.object(manager, "ensure_ssh_access", return_value=None), \
+             mock.patch.object(manager, "build_user_data", return_value="#!fake"):
+            manager.recreate_instance()
+
+        call = ec2.run_instances_calls[0]
+        nics = call["NetworkInterfaces"]
+        primary_candidates = [
+            nic for nic in nics
+            if nic.get("DeviceIndex") == 0 and nic.get("NetworkCardIndex") == 0
+        ]
+        self.assertEqual(len(primary_candidates), 1)
+        self.assertIs(primary_candidates[0].get("AssociatePublicIpAddress"), True)
+        secondaries = [nic for nic in nics if nic is not primary_candidates[0]]
+        self.assertGreater(len(secondaries), 0)
+        for nic in secondaries:
+            self.assertNotIn("AssociatePublicIpAddress", nic)
+
+    def test_associate_public_ip_default_off_emits_no_field(self):
+        """Default config (knob off) → no NIC carries AssociatePublicIpAddress."""
+        config = _make_config(max_enis=15, instance_type="c6in.metal")
+        ec2 = _FakeEc2Client(describe_payload=_c6in_metal_describe())
+        manager = _make_manager(config, ec2)
+
+        with mock.patch.object(manager, "current_instance_id", return_value=None), \
+             mock.patch.object(manager, "ensure_ssh_access", return_value=None), \
+             mock.patch.object(manager, "build_user_data", return_value="#!fake"):
+            manager.recreate_instance()
+
+        call = ec2.run_instances_calls[0]
+        for nic in call["NetworkInterfaces"]:
+            self.assertNotIn("AssociatePublicIpAddress", nic)
+
 
 class FromEnvIntegrationTests(unittest.TestCase):
     """ManagerConfig.from_env honors ANYSCAN_MAX_ENIS / ENI_SUBNET_IDS."""
@@ -523,6 +635,25 @@ class FromEnvIntegrationTests(unittest.TestCase):
         os.environ["ANYSCAN_MAX_ENIS"] = "0"
         with self.assertRaises(SystemExit):
             m.ManagerConfig.from_env()
+
+    def test_associate_public_ip_default_off(self):
+        os.environ.pop("ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP", None)
+        cfg = m.ManagerConfig.from_env()
+        self.assertFalse(cfg.associate_public_ip)
+
+    def test_associate_public_ip_truthy_values_enable(self):
+        for raw in ("1", "true", "yes", "on", "TRUE", "Yes"):
+            with self.subTest(value=raw):
+                os.environ["ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP"] = raw
+                cfg = m.ManagerConfig.from_env()
+                self.assertTrue(cfg.associate_public_ip)
+
+    def test_associate_public_ip_falsy_values_disable(self):
+        for raw in ("0", "false", "no", "off", "FALSE", ""):
+            with self.subTest(value=raw):
+                os.environ["ANYSCAN_EC2_ASSOCIATE_PUBLIC_IP"] = raw
+                cfg = m.ManagerConfig.from_env()
+                self.assertFalse(cfg.associate_public_ip)
 
 
 if __name__ == "__main__":
