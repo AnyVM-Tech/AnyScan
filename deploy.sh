@@ -36,6 +36,21 @@ ENABLED_EXTENSION_MANIFESTS="$LOCAL_BOOTSTRAP_MANIFEST"
 # USE_AF_XDP=1 to make and rejects a cached AF_PACKET-only binary.
 ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 
+# Opt-in kernel backport upgrade. Mirrors install-external-deps.sh —
+# see PR 65 issuecomment-4336192354 / anygpt-42 / anygpt-44. Default 0
+# leaves the running kernel untouched (existing AMIs unchanged). 1
+# installs the Debian bookworm-backports kernel image so the host can
+# run kernel 6.16+ with the in-flight ena_xdp_zc patches that AF_XDP
+# zerocopy on ENA needs. Never auto-reboots; the operator schedules
+# the reboot. After install probes /sys/module/ena/version + dmesg
+# for ena_xdp_zc support.
+ANYSCAN_INSTALL_KERNEL_BACKPORT="${ANYSCAN_INSTALL_KERNEL_BACKPORT:-0}"
+ANYSCAN_KERNEL_BACKPORT_MIN_VERSION="${ANYSCAN_KERNEL_BACKPORT_MIN_VERSION:-6.16}"
+ANYSCAN_KERNEL_BACKPORT_PACKAGE="${ANYSCAN_KERNEL_BACKPORT_PACKAGE:-linux-image-cloud-amd64}"
+ANYSCAN_KERNEL_BACKPORT_SUITE="${ANYSCAN_KERNEL_BACKPORT_SUITE:-bookworm-backports}"
+ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="${ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST:-/etc/apt/sources.list.d/anyscan-bookworm-backports.list}"
+ANYSCAN_KERNEL_BACKPORT_MIRROR="${ANYSCAN_KERNEL_BACKPORT_MIRROR:-http://deb.debian.org/debian}"
+
 print_banner() {
     printf '═══════════════════════════════════════════════════════════\n'
     printf '            AnyScan Rust Deploy Script           \n'
@@ -105,6 +120,110 @@ binary_has_afxdp_linkage() {
     return 1
 }
 
+# Mirrors install-external-deps.sh::kernel_version_at_least.
+kernel_version_at_least() {
+    local have="$1" need="$2"
+    local have_major have_minor need_major need_minor
+    have_major="${have%%.*}"
+    have_minor="${have#*.}"
+    have_minor="${have_minor%%.*}"
+    have_minor="${have_minor%%[!0-9]*}"
+    need_major="${need%%.*}"
+    need_minor="${need#*.}"
+    need_minor="${need_minor%%.*}"
+    need_minor="${need_minor%%[!0-9]*}"
+    have_major="${have_major:-0}"
+    have_minor="${have_minor:-0}"
+    need_major="${need_major:-0}"
+    need_minor="${need_minor:-0}"
+    if [ "$have_major" -gt "$need_major" ]; then
+        return 0
+    fi
+    if [ "$have_major" -lt "$need_major" ]; then
+        return 1
+    fi
+    if [ "$have_minor" -ge "$need_minor" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# Mirrors install-external-deps.sh::probe_ena_xdp_zc.
+probe_ena_xdp_zc() {
+    if [ ! -e /sys/module/ena/version ]; then
+        printf '[!] ena driver not loaded on running kernel — cannot confirm AF_XDP zerocopy support. Reboot into the backport kernel and re-run this probe.\n' >&2
+        return 1
+    fi
+    local ena_ver
+    ena_ver="$(cat /sys/module/ena/version 2>/dev/null || true)"
+    printf '[*] ena driver version on running kernel: %s\n' "${ena_ver:-unknown}"
+    if command -v dmesg >/dev/null 2>&1 \
+        && dmesg 2>/dev/null | grep -qiE 'ena_xdp_zc|ena.*xdp.*zerocopy|ena.*xdp_zc'; then
+        printf '[*] ena_xdp_zc indicator detected in dmesg — AF_XDP zerocopy should be available.\n'
+        return 0
+    fi
+    printf '[!] ena_xdp_zc indicator NOT found in dmesg on running kernel %s. AF_XDP zerocopy may not be available; the scanner will fall back to drv+copy mode. Reboot into kernel %s+ and re-run if you just installed the backport image.\n' \
+        "$(uname -r 2>/dev/null || echo unknown)" "$ANYSCAN_KERNEL_BACKPORT_MIN_VERSION" >&2
+    return 1
+}
+
+# Mirrors install-external-deps.sh::install_kernel_backport_if_requested.
+# deploy.sh runs as root (the script enforces this above), so the
+# function takes a slightly simpler path than the install-external-deps.sh
+# variant — no sudo branch is needed here.
+install_kernel_backport_if_requested() {
+    if [ "${ANYSCAN_INSTALL_KERNEL_BACKPORT:-0}" != "1" ]; then
+        return 0
+    fi
+    local current_kernel current_kernel_ver
+    current_kernel="$(uname -r 2>/dev/null || echo unknown)"
+    current_kernel_ver="${current_kernel%%-*}"
+    printf '[*] ANYSCAN_INSTALL_KERNEL_BACKPORT=1 — current kernel %s (need >= %s for ena_xdp_zc).\n' \
+        "$current_kernel" "$ANYSCAN_KERNEL_BACKPORT_MIN_VERSION"
+    if kernel_version_at_least "$current_kernel_ver" "$ANYSCAN_KERNEL_BACKPORT_MIN_VERSION"; then
+        printf '[*] Running kernel already meets %s+; backport image install skipped.\n' \
+            "$ANYSCAN_KERNEL_BACKPORT_MIN_VERSION"
+        probe_ena_xdp_zc || true
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        printf '[*] Skipping kernel backport: apt-get not on PATH (this knob targets Debian-family hosts).\n'
+        return 0
+    fi
+    if [ ! -f "$ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST" ]; then
+        printf '[*] Writing apt source for %s to %s...\n' \
+            "$ANYSCAN_KERNEL_BACKPORT_SUITE" "$ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST"
+        if ! printf 'deb %s %s main\n' \
+                "$ANYSCAN_KERNEL_BACKPORT_MIRROR" \
+                "$ANYSCAN_KERNEL_BACKPORT_SUITE" \
+            >"$ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST"; then
+            printf '[!] Failed to write %s; cannot install backport kernel image. Skipping.\n' \
+                "$ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST" >&2
+            return 0
+        fi
+    else
+        printf '[*] Reusing existing apt source list at %s.\n' "$ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST"
+    fi
+    printf '[*] Refreshing apt indexes for %s...\n' "$ANYSCAN_KERNEL_BACKPORT_SUITE"
+    if ! apt-get update >/dev/null 2>&1; then
+        printf '[!] apt-get update failed; cannot install backport kernel image. Skipping.\n' >&2
+        return 0
+    fi
+    printf '[*] Installing %s from %s (no auto-reboot)...\n' \
+        "$ANYSCAN_KERNEL_BACKPORT_PACKAGE" "$ANYSCAN_KERNEL_BACKPORT_SUITE"
+    if ! apt-get install -y --no-install-recommends \
+            -t "$ANYSCAN_KERNEL_BACKPORT_SUITE" \
+            "$ANYSCAN_KERNEL_BACKPORT_PACKAGE" >/dev/null 2>&1; then
+        printf '[!] Failed to install %s from %s; existing kernel unchanged.\n' \
+            "$ANYSCAN_KERNEL_BACKPORT_PACKAGE" "$ANYSCAN_KERNEL_BACKPORT_SUITE" >&2
+        return 0
+    fi
+    printf '[*] REBOOT REQUIRED: backport kernel image %s staged on disk. This script does NOT auto-reboot — schedule a maintenance window and reboot to activate kernel %s+.\n' \
+        "$ANYSCAN_KERNEL_BACKPORT_PACKAGE" "$ANYSCAN_KERNEL_BACKPORT_MIN_VERSION"
+    probe_ena_xdp_zc || true
+    return 0
+}
+
 install_vulnscanner_binary() {
     local source_bin=""
     local make_args=()
@@ -166,6 +285,8 @@ if [ "$EUID" -ne 0 ]; then
     printf '[!] Please run as root.\n' >&2
     exit 1
 fi
+
+install_kernel_backport_if_requested
 
 if ! command -v cargo >/dev/null 2>&1; then
     printf '[!] cargo was not found in PATH. Install the Rust toolchain before deploying.\n' >&2

@@ -38,6 +38,17 @@ ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT="$SCRIPT_DIR/../../anyscan-engine-c"
 ANYSCAN_VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT}"
 
+# Opt-in kernel backport flag (mirrors install-external-deps.sh /
+# deploy.sh). Bundles do not contain a kernel image — the actual
+# install happens at deploy time via install-external-deps.sh or
+# deploy.sh on the target host. The bundle README records the flag
+# so a downstream operator knows the producer's intent (e.g. "this
+# bundle was built expecting kernel 6.16+ on the target"). Default
+# 0; existing AMIs unchanged. See PR 65 issuecomment-4336192354 for
+# the ENA / ena_xdp_zc constraint trace and anygpt-44 for this
+# wire-up.
+ANYSCAN_INSTALL_KERNEL_BACKPORT="${ANYSCAN_INSTALL_KERNEL_BACKPORT:-0}"
+
 print_banner() {
     printf '═══════════════════════════════════════════════════════════\n'
     printf '                 Remote Agent Packager                   \n'
@@ -744,6 +755,7 @@ Bundle control route:
 Bundle scanner build:
   scanner_included: ${include_scanner}
   use_af_xdp: ${ANYSCAN_USE_AF_XDP}
+  install_kernel_backport: ${ANYSCAN_INSTALL_KERNEL_BACKPORT}
 EOF
 
     bundle_path="$DIST_DIR/${bundle_name}.tar.gz"
