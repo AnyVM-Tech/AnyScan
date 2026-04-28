@@ -26,6 +26,53 @@ print_banner() {
 	printf '═══════════════════════════════════════════════════════════\n'
 }
 
+# Install build-time dependencies for the AF_XDP I/O path the scanner gains
+# in Phase 2 of plans/2026-04-27-portscan-afxdp-plan-v1.md (§4.1). The fork
+# Makefile only pulls these in when invoked with `make USE_AF_XDP=1`; with
+# the default `make` they are unused, so we make the install best-effort:
+# run only when apt-get is available AND we have permission to install
+# packages, skip otherwise with a one-line note. The scanner build still
+# succeeds without these packages — `make USE_AF_XDP=1` would fail
+# loudly later, which is the right escalation.
+#
+# Set ANYSCAN_INSTALL_AFXDP_DEPS=false to suppress this block (e.g. on
+# AMIs where the operator pre-pinned a different libxdp version).
+install_afxdp_build_deps() {
+	if [ "${ANYSCAN_INSTALL_AFXDP_DEPS:-true}" != "true" ]; then
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		printf '[*] Skipping AF_XDP build deps: apt-get not on PATH (non-Debian host).\n'
+		return 0
+	fi
+	local apt_cmd=()
+	if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+		apt_cmd=(apt-get)
+	elif command -v sudo >/dev/null 2>&1; then
+		apt_cmd=(sudo -n apt-get)
+	else
+		printf '[*] Skipping AF_XDP build deps: not root and sudo is not available.\n'
+		printf '    Install manually if you plan to build the scanner with USE_AF_XDP=1:\n'
+		printf '      sudo apt-get install -y libxdp-dev libbpf-dev libelf-dev\n'
+		return 0
+	fi
+	# Probe sudo non-interactively; if it would prompt, bail rather than
+	# block the script in CI.
+	if [ "${apt_cmd[0]}" = "sudo" ] && ! sudo -n true >/dev/null 2>&1; then
+		printf '[*] Skipping AF_XDP build deps: sudo would prompt for a password.\n'
+		printf '    Install manually if you plan to build the scanner with USE_AF_XDP=1:\n'
+		printf '      sudo apt-get install -y libxdp-dev libbpf-dev libelf-dev\n'
+		return 0
+	fi
+	printf '[*] Installing AF_XDP build deps (libxdp-dev libbpf-dev libelf-dev)...\n'
+	if ! "${apt_cmd[@]}" install -y --no-install-recommends \
+		libxdp-dev libbpf-dev libelf-dev >/dev/null; then
+		printf '[!] apt-get install of AF_XDP build deps failed; the scanner will still build with default `make`.\n' >&2
+		printf '    Re-run with USE_AF_XDP=1 only after libxdp-dev / libbpf-dev / libelf-dev are present.\n' >&2
+		return 0
+	fi
+}
+
 upsert_env_value() {
 	local key="$1"
 	local value="$2"
@@ -55,6 +102,8 @@ if ! command -v git >/dev/null 2>&1; then
 	printf '[!] git was not found in PATH.\n' >&2
 	exit 1
 fi
+
+install_afxdp_build_deps
 
 if [ -d "$VULNSCANNER_REPO_DIR/.git" ]; then
 	printf '[*] Updating external repository in %s...\n' "$VULNSCANNER_REPO_DIR"
