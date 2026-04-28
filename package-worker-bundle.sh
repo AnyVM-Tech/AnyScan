@@ -40,6 +40,12 @@ ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 # See install-external-deps.sh for license obligation notes (PF_RING ZC
 # requires a commercial ntop license at runtime).
 ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
+# Build-time DPDK opt-in (mirrors ANYSCAN_USE_AF_XDP / ANYSCAN_USE_PFRING_ZC).
+# When 1 and the staged scanner binary does not link librte_eal, the bundle
+# script rebuilds the engine with `make USE_DPDK=1` so the bundle ships a
+# DPDK-capable scanner. Default 0 keeps existing bundle CI green.
+# Source: plans/2026-04-28-portscan-dpdk-impl-v1.md §3.10.2.
+ANYSCAN_USE_DPDK="${ANYSCAN_USE_DPDK:-0}"
 ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT="$SCRIPT_DIR/../../anyscan-engine-c"
 ANYSCAN_VULNSCANNER_REPO_DIR="${ANYSCAN_VULNSCANNER_REPO_DIR:-$ANYSCAN_VULNSCANNER_REPO_DIR_DEFAULT}"
 
@@ -369,6 +375,26 @@ binary_has_pfring_zc_linkage() {
     return 1
 }
 
+# Mirror of binary_has_dpdk_linkage in install-external-deps.sh — kept inline
+# so this script remains stand-alone for CI. librte_eal.so is the canonical
+# probe target: every USE_DPDK=1 build links it (it's the EAL core), and
+# legacy AF_PACKET-only builds never do.
+binary_has_dpdk_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command_exists ldd; then
+        if ldd "$bin" 2>/dev/null | grep -q 'librte_eal\.so'; then
+            return 0
+        fi
+    fi
+    if command_exists readelf; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'librte_eal\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Resolve the engine make argv so cached invocations match
 # install-external-deps.sh::vulnscanner_make_args byte-for-byte. Stays
 # empty when both build flags are 0; otherwise emits one token per line.
@@ -378,6 +404,9 @@ bundle_engine_make_args() {
     fi
     if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
         printf 'USE_PFRING_ZC=1\n'
+    fi
+    if [ "${ANYSCAN_USE_DPDK:-0}" = "1" ]; then
+        printf 'USE_DPDK=1\n'
     fi
 }
 
@@ -417,6 +446,29 @@ rebuild_scanner_with_pfring_zc() {
     fi
     if ! command_exists make; then
         printf '[!] make not on PATH; cannot rebuild scanner with USE_PFRING_ZC=1.\n' >&2
+        return 1
+    fi
+    # shellcheck disable=SC2046
+    local make_args=( $(bundle_engine_make_args) )
+    printf '[*] Rebuilding scanner in %s with %s...\n' "$repo_dir" "${make_args[*]}"
+    make -C "$repo_dir" clean >/dev/null 2>&1 || true
+    make -C "$repo_dir" "${make_args[@]}"
+}
+
+# Fire a `make USE_DPDK=1` (plus any other USE_* opt-ins requested) so the
+# bundle ships a librte_eal-linked scanner. Mirrors rebuild_scanner_with_afxdp
+# and rebuild_scanner_with_pfring_zc; all three funnel through
+# bundle_engine_make_args so multi-engine builds (USE_AF_XDP=1 USE_DPDK=1)
+# produce a single binary that can dispatch either engine at runtime.
+rebuild_scanner_with_dpdk() {
+    local repo_dir="$1"
+    if [ ! -f "$repo_dir/Makefile" ]; then
+        printf '[!] ANYSCAN_USE_DPDK=1 requested but no Makefile at %s.\n' "$repo_dir" >&2
+        printf '    Run install-external-deps.sh ANYSCAN_USE_DPDK=1 first, or set ANYSCAN_PACKAGE_VULNSCANNER_BIN to a pre-built DPDK-capable scanner binary.\n' >&2
+        return 1
+    fi
+    if ! command_exists make; then
+        printf '[!] make not on PATH; cannot rebuild scanner with USE_DPDK=1.\n' >&2
         return 1
     fi
     # shellcheck disable=SC2046
@@ -702,6 +754,35 @@ main() {
             exit 1
         fi
     fi
+    # DPDK wire-up (plans/2026-04-28-portscan-dpdk-impl-v1.md §3.10.2):
+    # same shape as AF_XDP. When ANYSCAN_USE_DPDK=1 and the candidate
+    # binary lacks librte_eal linkage, fire `make USE_DPDK=1` so the
+    # bundled scanner has the io_engine_dpdk vtable wired in. Composes
+    # with AF_XDP and PF_RING — when multiple flags are 1, the earliest
+    # rebuild block produced a binary linked with all the requested
+    # engines (bundle_engine_make_args emits all tokens) so this branch
+    # becomes a no-op linkage check.
+    if [ "${ANYSCAN_USE_DPDK:-0}" = "1" ]; then
+        local needs_dpdk_rebuild=0
+        if [ -z "$SCANNER_SOURCE_BIN" ] || [ ! -x "$SCANNER_SOURCE_BIN" ]; then
+            needs_dpdk_rebuild=1
+        elif ! binary_has_dpdk_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[*] %s lacks librte_eal linkage; ANYSCAN_USE_DPDK=1 requires a rebuild.\n' "$SCANNER_SOURCE_BIN"
+            needs_dpdk_rebuild=1
+        fi
+        if [ "$needs_dpdk_rebuild" = "1" ]; then
+            if ! rebuild_scanner_with_dpdk "$ANYSCAN_VULNSCANNER_REPO_DIR"; then
+                printf '[!] ANYSCAN_USE_DPDK=1 but unable to produce a DPDK-linked scanner. Aborting bundle.\n' >&2
+                exit 1
+            fi
+            SCANNER_SOURCE_BIN="$ANYSCAN_VULNSCANNER_REPO_DIR/scanner"
+        fi
+        if [ ! -x "$SCANNER_SOURCE_BIN" ] || ! binary_has_dpdk_linkage "$SCANNER_SOURCE_BIN"; then
+            printf '[!] Scanner at %s still lacks librte_eal linkage after rebuild. Aborting bundle.\n' \
+                "$SCANNER_SOURCE_BIN" >&2
+            exit 1
+        fi
+    fi
     include_scanner="false"
     if [ -n "$SCANNER_SOURCE_BIN" ] && [ -x "$SCANNER_SOURCE_BIN" ]; then
         printf '[*] Including scanner binary from %s...\n' "$SCANNER_SOURCE_BIN"
@@ -844,6 +925,7 @@ Bundle scanner build:
   scanner_included: ${include_scanner}
   use_af_xdp: ${ANYSCAN_USE_AF_XDP}
   use_pfring_zc: ${ANYSCAN_USE_PFRING_ZC}
+  use_dpdk: ${ANYSCAN_USE_DPDK}
   install_kernel_backport: ${ANYSCAN_INSTALL_KERNEL_BACKPORT}
 EOF
 

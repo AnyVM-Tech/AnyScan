@@ -44,6 +44,23 @@ ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 # the runtime-side gating knob ANYSCAN_PFRING_ZC_AVAILABLE.
 ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
 
+# Build-time DPDK opt-in. Mirrors ANYSCAN_USE_AF_XDP / ANYSCAN_USE_PFRING_ZC.
+# When 1 the engine make is invoked with `USE_DPDK=1` so the scanner gets
+# librte_eal + librte_ethdev + librte_mbuf + librte_net_ena linked in and the
+# io_engine_dpdk vtable in src/engine.c is reachable from pick_io_engine().
+# Without this flag, --io-engine=dpdk fails at parse time with
+# "binary not built with USE_DPDK=1".
+#
+# DPDK additionally requires HOST setup the apt-get install does NOT cover —
+# hugepages reserved + the target NIC bound to vfio-pci. Those are owned by
+# tools/setup-dpdk.sh (idempotent + reversible). install-worker-bundle.sh's
+# probe_dpdk_runtime_available checks both at runtime so an in-place upgrade
+# that flipped USE_DPDK=1 but never ran the host-setup script gets
+# ANYSCAN_DPDK_AVAILABLE=false and the adapter falls back to af_packet.
+#
+# See plans/2026-04-28-portscan-dpdk-impl-v1.md §3.10 for the full wire-up.
+ANYSCAN_USE_DPDK="${ANYSCAN_USE_DPDK:-0}"
+
 # Opt-in kernel backport upgrade. Default 0 leaves the running kernel
 # untouched (existing AMIs unchanged). Setting 1 installs a Debian
 # backports kernel image so the host can run kernel 6.16+ with the
@@ -155,6 +172,29 @@ binary_has_pfring_zc_linkage() {
 	return 1
 }
 
+# True when the existing scanner binary was linked against librte_eal at
+# build time. The DPDK build path (USE_DPDK=1) pulls in libdpdk via
+# pkg-config which produces ~50 -lrte_* link flags; we probe for librte_eal
+# specifically because every DPDK-built binary links it (it's the EAL core
+# library) and PMD-only / mempool-only DPDK applications still need it.
+# Same ldd → readelf -d fallback shape as binary_has_afxdp_linkage so the
+# check works on hosts that strip glibc.
+binary_has_dpdk_linkage() {
+	local bin="$1"
+	[ -x "$bin" ] || return 1
+	if command -v ldd >/dev/null 2>&1; then
+		if ldd "$bin" 2>/dev/null | grep -q 'librte_eal\.so'; then
+			return 0
+		fi
+	fi
+	if command -v readelf >/dev/null 2>&1; then
+		if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'librte_eal\.so'; then
+			return 0
+		fi
+	fi
+	return 1
+}
+
 # Resolve the make argv once so install/bundle/deploy paths produce
 # byte-identical invocations and the unit tests in
 # tools/test-install-external-deps-{afxdp,pfring-zc}.sh can assert the
@@ -166,6 +206,9 @@ vulnscanner_make_args() {
 	fi
 	if [ "${ANYSCAN_USE_PFRING_ZC:-0}" = "1" ]; then
 		printf 'USE_PFRING_ZC=1\n'
+	fi
+	if [ "${ANYSCAN_USE_DPDK:-0}" = "1" ]; then
+		printf 'USE_DPDK=1\n'
 	fi
 }
 
@@ -421,6 +464,59 @@ install_pfring_zc_build_deps() {
 	fi
 }
 
+# Install build-time dependencies for the DPDK I/O path the scanner gains
+# under USE_DPDK=1 in the engine Makefile (-lrte_eal -lrte_ethdev -lrte_mbuf
+# etc, pulled in via `pkg-config --libs libdpdk`). libdpdk-dev is in main on
+# Debian bookworm/trixie + Ubuntu 24.04 noble. Same fail-open semantics as
+# install_afxdp_build_deps: skip if apt-get missing, skip if no privilege,
+# skip if sudo would prompt. The default `make` does not need these
+# packages — only `make USE_DPDK=1` does — so failure to install just
+# means USE_DPDK=1 builds will fail loudly later, which is the correct
+# escalation rather than silently producing a non-DPDK binary.
+#
+# DPDK additionally requires HOST setup (hugepages + vfio-pci binding)
+# that this function does NOT do — that lives in tools/setup-dpdk.sh and
+# is the install-time, not build-time, prerequisite. The split exists
+# because hugepages reservation modifies system memory pressure and
+# binding NICs to vfio-pci removes them from kernel networking; both
+# need an explicit operator action, not an apt-get side-effect.
+#
+# Set ANYSCAN_INSTALL_DPDK_DEPS=false to suppress this block (e.g. on
+# AMIs where the operator pre-pinned a different libdpdk version).
+install_dpdk_build_deps() {
+	if [ "${ANYSCAN_INSTALL_DPDK_DEPS:-true}" != "true" ]; then
+		return 0
+	fi
+	if ! command -v apt-get >/dev/null 2>&1; then
+		printf '[*] Skipping DPDK build deps: apt-get not on PATH (non-Debian host).\n'
+		return 0
+	fi
+	local apt_cmd=()
+	if [ "$(id -u 2>/dev/null || echo 1)" = "0" ]; then
+		apt_cmd=(apt-get)
+	elif command -v sudo >/dev/null 2>&1; then
+		apt_cmd=(sudo -n apt-get)
+	else
+		printf '[*] Skipping DPDK build deps: not root and sudo is not available.\n'
+		printf '    Install manually if you plan to build the scanner with USE_DPDK=1:\n'
+		printf '      sudo apt-get install -y libdpdk-dev dpdk\n'
+		return 0
+	fi
+	if [ "${apt_cmd[0]}" = "sudo" ] && ! sudo -n true >/dev/null 2>&1; then
+		printf '[*] Skipping DPDK build deps: sudo would prompt for a password.\n'
+		printf '    Install manually if you plan to build the scanner with USE_DPDK=1:\n'
+		printf '      sudo apt-get install -y libdpdk-dev dpdk\n'
+		return 0
+	fi
+	printf '[*] Installing DPDK build deps (libdpdk-dev dpdk)...\n'
+	if ! "${apt_cmd[@]}" install -y --no-install-recommends \
+		libdpdk-dev dpdk >/dev/null 2>&1; then
+		printf '[!] apt-get install of DPDK build deps failed; the scanner will still build with default `make`.\n' >&2
+		printf '    Re-run with USE_DPDK=1 only after libdpdk-dev is present.\n' >&2
+		return 0
+	fi
+}
+
 upsert_env_value() {
 	local key="$1"
 	local value="$2"
@@ -453,6 +549,7 @@ fi
 
 install_afxdp_build_deps
 install_pfring_zc_build_deps
+install_dpdk_build_deps
 install_kernel_backport_if_requested
 
 if [ -d "$VULNSCANNER_REPO_DIR/.git" ]; then
@@ -491,6 +588,18 @@ elif [ "$ANYSCAN_USE_PFRING_ZC" = "1" ] && ! binary_has_pfring_zc_linkage "$VULN
 	fi
 	rm -f "$VULNSCANNER_BIN_PATH"
 	need_build=1
+elif [ "$ANYSCAN_USE_DPDK" = "1" ] && ! binary_has_dpdk_linkage "$VULNSCANNER_BIN_PATH"; then
+	# Same shape as the AF_XDP / PF_RING cache checks: force clean
+	# rebuild when the cached binary lacks librte_eal linkage. Without
+	# this the cache short-circuit above would keep shipping a non-DPDK
+	# binary and --io-engine=dpdk would error at parse time with
+	# "binary not built with USE_DPDK=1".
+	printf '[*] Existing scanner at %s lacks librte_eal linkage; forcing rebuild because ANYSCAN_USE_DPDK=1.\n' "$VULNSCANNER_BIN_PATH"
+	if [ -f "$VULNSCANNER_REPO_DIR/Makefile" ] && command -v make >/dev/null 2>&1; then
+		make -C "$VULNSCANNER_REPO_DIR" clean >/dev/null 2>&1 || true
+	fi
+	rm -f "$VULNSCANNER_BIN_PATH"
+	need_build=1
 fi
 
 if [ "$need_build" = "1" ]; then
@@ -522,6 +631,12 @@ fi
 
 if [ "$ANYSCAN_USE_PFRING_ZC" = "1" ] && ! binary_has_pfring_zc_linkage "$VULNSCANNER_BIN_PATH"; then
 	printf '[!] ANYSCAN_USE_PFRING_ZC=1 but %s does not link libpfring.so. Build deps were probably missing — install libpfring-dev (ntop apt-stable repo) and re-run.\n' \
+		"$VULNSCANNER_BIN_PATH" >&2
+	exit 1
+fi
+
+if [ "$ANYSCAN_USE_DPDK" = "1" ] && ! binary_has_dpdk_linkage "$VULNSCANNER_BIN_PATH"; then
+	printf '[!] ANYSCAN_USE_DPDK=1 but %s does not link librte_eal.so. Build deps were probably missing — install libdpdk-dev and re-run.\n' \
 		"$VULNSCANNER_BIN_PATH" >&2
 	exit 1
 fi

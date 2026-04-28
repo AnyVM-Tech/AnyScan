@@ -421,6 +421,110 @@ apply_afxdp_availability() {
     fi
 }
 
+# True when the installed scanner binary at $1 was linked against librte_eal
+# at build time (i.e. compiled with USE_DPDK=1). Mirrors
+# binary_has_afxdp_linkage / binary_has_pfring_zc_linkage; same ldd →
+# readelf -d fallback so the check works on stripped or static glibc hosts.
+binary_has_dpdk_linkage() {
+    local bin="$1"
+    [ -x "$bin" ] || return 1
+    if command_exists ldd; then
+        if ldd "$bin" 2>/dev/null | grep -q 'librte_eal\.so'; then
+            return 0
+        fi
+    fi
+    if command_exists readelf; then
+        if readelf -d "$bin" 2>/dev/null | grep -E '\(NEEDED\)' | grep -q 'librte_eal\.so'; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+probe_dpdk_runtime_available() {
+    # Phase 2 of plans/2026-04-28-portscan-dpdk-impl-v1.md §4.3. The bundled
+    # scanner can be invoked with --io-engine=dpdk only when ALL of:
+    #   (a) the installed scanner binary at $VULNSCANNER_BIN_DEST was built
+    #       with USE_DPDK=1 (probed by checking librte_eal linkage on the
+    #       on-disk binary). Mirrors the (c) gate the PR #75 review added
+    #       to probe_pfring_zc_runtime_available.
+    #   (b) librte_eal.so is loadable on the host (the scanner is dynamically
+    #       linked against it; without the runtime libs the scanner crashes
+    #       at startup with a dlopen error).
+    #   (c) the vfio-pci kernel module is loaded (the EAL bring-up calls
+    #       rte_eal_init which probes vfio-pci-bound devices; without the
+    #       module no DPDK port is reachable).
+    #   (d) at least one hugepage is reserved (the DPDK mempool needs
+    #       hugepage-backed memory for the mbuf pool — no hugepages →
+    #       rte_pktmbuf_pool_create fails). We probe both 2 MiB and 1 GiB
+    #       hugepage pools because tools/setup-dpdk.sh prefers 1 GiB when
+    #       available and falls back to 2 MiB.
+    #   (e) at least one NIC is bound to vfio-pci. We don't probe this
+    #       directly because dpdk-devbind.py may not be on PATH yet at
+    #       install time; instead we check that a vfio control device
+    #       (/dev/vfio/vfio) exists, which is the kernel-side prerequisite
+    #       that vfio-pci's binding step would have created.
+    # If any check fails ANYSCAN_DPDK_AVAILABLE=false and the adapter falls
+    # back to af_packet — no silent failure modes.
+    if ! binary_has_dpdk_linkage "$VULNSCANNER_BIN_DEST"; then
+        printf 'false'
+        return 0
+    fi
+    if ! command_exists ldconfig; then
+        printf 'false'
+        return 0
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q '\<librte_eal\.so'; then
+        printf 'false'
+        return 0
+    fi
+    if [ ! -d /sys/module/vfio_pci ] && [ ! -d /sys/module/vfio-pci ]; then
+        printf 'false'
+        return 0
+    fi
+    # Hugepages probe: walk /sys/kernel/mm/hugepages/* and assert that at
+    # least one page-size directory has nr_hugepages > 0. Matches both 2 MiB
+    # and 1 GiB pages without hard-coding which one is expected.
+    local hugepages_total=0
+    if [ -d /sys/kernel/mm/hugepages ]; then
+        local hp_dir count
+        for hp_dir in /sys/kernel/mm/hugepages/hugepages-*kB; do
+            [ -e "$hp_dir/nr_hugepages" ] || continue
+            count="$(cat "$hp_dir/nr_hugepages" 2>/dev/null || echo 0)"
+            if [[ "$count" =~ ^[0-9]+$ ]]; then
+                hugepages_total=$(( hugepages_total + count ))
+            fi
+        done
+    fi
+    if [ "$hugepages_total" -le 0 ]; then
+        printf 'false'
+        return 0
+    fi
+    if [ ! -e /dev/vfio/vfio ]; then
+        # The vfio control char device is created by the vfio-pci module
+        # when at least one device has been bound. If it's missing, no NIC
+        # has been bound yet — operator must run tools/setup-dpdk.sh bind.
+        printf 'false'
+        return 0
+    fi
+    printf 'true'
+}
+
+apply_dpdk_availability() {
+    # Mirror of apply_afxdp_availability / apply_pfring_zc_availability:
+    # always write the flag so /etc/agentd/runtime.env carries an explicit
+    # value and a partial upgrade can't leave a stale "true" in place
+    # after vfio-pci was unloaded or hugepages were freed.
+    local dpdk_available
+    dpdk_available="$(probe_dpdk_runtime_available)"
+    upsert_env_value "ANYSCAN_DPDK_AVAILABLE" "$dpdk_available" "$RUNTIME_ENV_FILE"
+    if [ "$dpdk_available" = "true" ]; then
+        printf '[*] DPDK runtime probe passed (binary + librte_eal.so + vfio_pci + hugepages + /dev/vfio); ANYSCAN_DPDK_AVAILABLE=true.\n'
+    else
+        printf '[*] DPDK runtime probe failed (binary not librte_eal-linked, librte_eal.so missing, vfio_pci unloaded, no hugepages reserved, or /dev/vfio absent); ANYSCAN_DPDK_AVAILABLE=false. Run tools/setup-dpdk.sh bind on the host to fix the runtime side.\n'
+    fi
+}
+
 # True when the installed scanner binary at $1 was linked against
 # libpfring at build time (i.e. compiled with USE_PFRING_ZC=1). Same
 # probe shape as binary_has_pfring_zc_linkage in install-external-deps.sh
@@ -875,6 +979,7 @@ main() {
     apply_host_resource_defaults "$cpu_threads"
     apply_afxdp_availability
     apply_pfring_zc_availability
+    apply_dpdk_availability
     apply_scanner_host_tunings
 
     if [ "$existing_install" = "true" ]; then

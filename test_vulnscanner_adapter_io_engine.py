@@ -49,6 +49,7 @@ IO_ENGINE_ENV_KEYS = (
     "ANYSCAN_SCANNER_IO_ENGINE",
     "ANYSCAN_AF_XDP_AVAILABLE",
     "ANYSCAN_PFRING_ZC_AVAILABLE",
+    "ANYSCAN_DPDK_AVAILABLE",
 )
 
 
@@ -121,11 +122,16 @@ class ResolveIoEngineTests(unittest.TestCase):
         self.assertIn("ANYSCAN_AF_XDP_AVAILABLE", captured.getvalue())
 
     def test_invalid_value_falls_back_to_af_packet_with_warning(self) -> None:
-        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        # Use a value that is NOT in SUPPORTED_IO_ENGINES. dpdk used to be
+        # the canonical "invalid" placeholder here; once the dpdk plan
+        # landed it became a valid engine name, so this test has to use a
+        # different unrecognized value. "fake_engine" is unlikely to ever
+        # be promoted to a real engine.
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "fake_engine"
         captured = io.StringIO()
         with contextlib.redirect_stderr(captured):
             self.assertEqual(adapter.resolve_io_engine(), "af_packet")
-        self.assertIn("dpdk", captured.getvalue())
+        self.assertIn("fake_engine", captured.getvalue())
 
     def test_pfring_zc_with_runtime_available(self) -> None:
         os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
@@ -164,6 +170,50 @@ class ResolveIoEngineTests(unittest.TestCase):
         os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "true"
         os.environ["ANYSCAN_AF_XDP_AVAILABLE"] = "false"
         self.assertEqual(adapter.resolve_io_engine(), "pfring_zc")
+
+    def test_dpdk_with_runtime_available(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "true"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "dpdk")
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_dpdk_request_uppercase_normalizes(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "DPDK"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "true"
+        self.assertEqual(adapter.resolve_io_engine(), "dpdk")
+
+    def test_dpdk_with_unavailable_runtime_falls_back_with_warning(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "false"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "af_packet")
+        message = captured.getvalue()
+        self.assertIn("dpdk", message)
+        self.assertIn("ANYSCAN_DPDK_AVAILABLE", message)
+
+    def test_dpdk_without_availability_var_falls_back(self) -> None:
+        # Missing ANYSCAN_DPDK_AVAILABLE behaves the same as false: the
+        # installer always writes the value (true OR false), so a missing
+        # key implies an old install where the DPDK probe never ran.
+        # Be conservative.
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            self.assertEqual(adapter.resolve_io_engine(), "af_packet")
+        self.assertIn("ANYSCAN_DPDK_AVAILABLE", captured.getvalue())
+
+    def test_dpdk_does_not_consult_other_availability_flags(self) -> None:
+        # Cross-engine availability flags must not interfere: AF_XDP and
+        # PF_RING ZC being unavailable should have zero effect on a dpdk
+        # request when ANYSCAN_DPDK_AVAILABLE=true.
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "true"
+        os.environ["ANYSCAN_AF_XDP_AVAILABLE"] = "false"
+        os.environ["ANYSCAN_PFRING_ZC_AVAILABLE"] = "false"
+        self.assertEqual(adapter.resolve_io_engine(), "dpdk")
 
     def test_blank_value_defaults_to_af_packet_silently(self) -> None:
         os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = ""
@@ -230,6 +280,23 @@ class BuildCommandIoEngineTests(unittest.TestCase):
         cmd = self._build()
         self.assertIn("--io-engine=pfring_zc", cmd)
         self.assertNotIn("--io-engine=af_packet", cmd)
+
+    def test_dpdk_request_with_runtime_available_appends_dpdk(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "true"
+        cmd = self._build()
+        self.assertIn("--io-engine=dpdk", cmd)
+        self.assertNotIn("--io-engine=af_packet", cmd)
+
+    def test_dpdk_request_without_runtime_falls_back_to_af_packet(self) -> None:
+        os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "dpdk"
+        os.environ["ANYSCAN_DPDK_AVAILABLE"] = "false"
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            cmd = self._build()
+        self.assertIn("--io-engine=af_packet", cmd)
+        self.assertNotIn("--io-engine=dpdk", cmd)
+        self.assertIn("ANYSCAN_DPDK_AVAILABLE", captured.getvalue())
 
     def test_pfring_zc_request_without_runtime_falls_back_to_af_packet(self) -> None:
         os.environ["ANYSCAN_SCANNER_IO_ENGINE"] = "pfring_zc"
