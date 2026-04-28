@@ -355,6 +355,61 @@ apply_host_resource_defaults() {
     fi
 }
 
+probe_afxdp_runtime_available() {
+    # Phase 2 PR C of plans/2026-04-27-portscan-afxdp-plan-v1.md §4.3.
+    # The scanner can be invoked with --io-engine=af_xdp only when (a) the
+    # kernel is recent enough that XDP_USE_NEED_WAKEUP behaves correctly
+    # (≥5.10, plan §4.3) and (b) libxdp.so is loadable on the host (the
+    # binary is dynamically linked against it when built with
+    # USE_AF_XDP=1; if the runtime libs are absent the scanner crashes
+    # at startup with a dlopen error). Both checks are cheap, so do them
+    # at install time and write ANYSCAN_AF_XDP_AVAILABLE so downstream
+    # code (the adapter, future tooling) does not have to redo the
+    # probe per-scan. The variable defaults to "false" — operators can
+    # override to "true" by hand if they know the bundle's bin/scanner
+    # was built with USE_AF_XDP=1 and they have the libs from a path not
+    # visible to ldconfig (e.g. LD_LIBRARY_PATH).
+    local kernel_release kernel_major kernel_minor
+    kernel_release="$(uname -r 2>/dev/null || true)"
+    if [ -z "$kernel_release" ]; then
+        printf 'false'
+        return 0
+    fi
+    kernel_major="${kernel_release%%.*}"
+    local rest="${kernel_release#*.}"
+    kernel_minor="${rest%%.*}"
+    case "$kernel_major" in ''|*[!0-9]*) printf 'false'; return 0 ;; esac
+    case "$kernel_minor" in ''|*[!0-9]*) kernel_minor=0 ;; esac
+    if [ "$kernel_major" -lt 5 ] || { [ "$kernel_major" -eq 5 ] && [ "$kernel_minor" -lt 10 ]; }; then
+        printf 'false'
+        return 0
+    fi
+    if ! command_exists ldconfig; then
+        printf 'false'
+        return 0
+    fi
+    if ! ldconfig -p 2>/dev/null | grep -q '\<libxdp\.so'; then
+        printf 'false'
+        return 0
+    fi
+    printf 'true'
+}
+
+apply_afxdp_availability() {
+    # Always write the flag (true OR false) so the value is explicit in
+    # /etc/agentd/runtime.env and a partial upgrade can't leave a stale
+    # "true" in place after the kernel was downgraded or libxdp was
+    # uninstalled. This mirrors the AGENT_REMOTE_UPDATE_* pattern above.
+    local afxdp_available
+    afxdp_available="$(probe_afxdp_runtime_available)"
+    upsert_env_value "ANYSCAN_AF_XDP_AVAILABLE" "$afxdp_available" "$RUNTIME_ENV_FILE"
+    if [ "$afxdp_available" = "true" ]; then
+        printf '[*] AF_XDP runtime probe passed (kernel + libxdp.so present); ANYSCAN_AF_XDP_AVAILABLE=true.\n'
+    else
+        printf '[*] AF_XDP runtime probe failed (kernel <5.10 or libxdp.so missing); ANYSCAN_AF_XDP_AVAILABLE=false.\n'
+    fi
+}
+
 apply_scanner_host_tunings() {
     if [ ! -x "$TUNE_SCANNER_HOST_HELPER_DEST_FILE" ]; then
         return 0
@@ -727,6 +782,7 @@ main() {
     fi
 
     apply_host_resource_defaults "$cpu_threads"
+    apply_afxdp_availability
     apply_scanner_host_tunings
 
     if [ "$existing_install" = "true" ]; then

@@ -28,8 +28,20 @@ ExecStart=/opt/agentd/bin/agentd daemon
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# CAP_BPF is required for the AF_XDP I/O path the scanner gains in
+# Phase 2 of plans/2026-04-27-portscan-afxdp-plan-v1.md (§4.4): opening an
+# XSK socket and attaching libxdp's default redirect program both go
+# through the bpf() syscall. The scanner only opens an XSK when invoked
+# with --io-engine=af_xdp; AF_PACKET (the default) does not need CAP_BPF,
+# so granting it here is purely a runtime gate that lets workers opt in
+# via ANYSCAN_SCANNER_IO_ENGINE without a unit file refresh. CAP_BPF is
+# scoped narrowly: it does not imply CAP_SYS_ADMIN or kernel-module load
+# rights. Older (<5.8) kernels collapse it into CAP_SYS_ADMIN and the
+# capability bits we set here are simply ignored — the install-time
+# probe in install-worker-bundle.sh refuses to enable af_xdp on those
+# hosts so the unit-file grant has no effect there either.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
