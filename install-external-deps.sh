@@ -45,26 +45,72 @@ ANYSCAN_USE_AF_XDP="${ANYSCAN_USE_AF_XDP:-0}"
 ANYSCAN_USE_PFRING_ZC="${ANYSCAN_USE_PFRING_ZC:-0}"
 
 # Opt-in kernel backport upgrade. Default 0 leaves the running kernel
-# untouched (existing AMIs unchanged). Setting 1 installs the Debian
-# bookworm-backports kernel image so the host can run kernel 6.16+
-# with the in-flight `ena_xdp_zc` ENA driver patches that AF_XDP
-# zerocopy on ENA needs. The PR 65 §10 / anygpt-42 live bench showed
-# ENA on kernel 6.12.74 caps the c6in.metal 8-NIC cap=4 throughput
-# at ~22M pps in drv+copy mode, vs the 30-50M projection driver-mode
-# zerocopy was supposed to deliver. See PR 65 issuecomment-4336192354
-# for the constraint trace.
+# untouched (existing AMIs unchanged). Setting 1 installs a Debian
+# backports kernel image so the host can run kernel 6.16+ with the
+# in-flight `ena_xdp_zc` ENA driver patches that AF_XDP zerocopy on
+# ENA needs. The PR 65 §10 / anygpt-42 live bench showed ENA on
+# kernel 6.12.74 caps the c6in.metal 8-NIC cap=4 throughput at ~22M
+# pps in drv+copy mode, vs the 30-50M projection driver-mode zerocopy
+# was supposed to deliver. See PR 65 issuecomment-4336192354 for the
+# constraint trace.
+#
+# The suite and package default to the host's Debian codename:
+# trixie-backports / linux-image-amd64 on Debian 13, bookworm-backports
+# / linux-image-cloud-amd64 on Debian 12. PR 65 issuecomment-4338158487
+# (anygpt-48) caught the previous static bookworm-backports default
+# silently no-op'ing on the Trixie AMI: bookworm-backports
+# linux-image-cloud-amd64 resolves to 6.12.74-2~bpo12+1 — exactly the
+# kernel the metal already runs — so the opt-in completed "0 upgraded,
+# 0 newly installed" and the operator got a green light without ever
+# upgrading. Trixie's linux-image-cloud-amd64 is also still 6.12 as of
+# 2026-04, so we explicitly switch the package to the non-cloud
+# linux-image-amd64 on non-bookworm suites.
+#
+# Operator-set ANYSCAN_KERNEL_BACKPORT_SUITE / _PACKAGE / _SOURCES_LIST
+# still win — the codename detection is just a smarter default.
 #
 # Never auto-reboots. The new kernel is staged on disk and the operator
 # has to schedule the reboot themselves. After install the script
 # probes `/sys/module/ena/version` + dmesg for `ena_xdp_zc` support
 # and warns if absent so the operator knows whether the
 # CURRENTLY-RUNNING kernel will deliver zerocopy.
+
+# Detect the Debian codename so backport defaults match the running
+# release. /etc/os-release VERSION_CODENAME is the canonical source on
+# Debian/Ubuntu hosts; missing or unreadable file → fall back to
+# "bookworm" so the legacy default doesn't change for hosts where the
+# os-release file isn't accessible. Override the file path with
+# ANYSCAN_OS_RELEASE_FILE for testing.
+detect_debian_codename() {
+	local release_file="${ANYSCAN_OS_RELEASE_FILE:-/etc/os-release}"
+	local codename=""
+	if [ -r "$release_file" ]; then
+		# shellcheck source=/dev/null
+		codename="$(. "$release_file" 2>/dev/null && printf '%s\n' "${VERSION_CODENAME:-}")"
+	fi
+	if [ -z "$codename" ]; then
+		codename="bookworm"
+	fi
+	printf '%s\n' "$codename"
+}
+
 ANYSCAN_INSTALL_KERNEL_BACKPORT="${ANYSCAN_INSTALL_KERNEL_BACKPORT:-0}"
 ANYSCAN_KERNEL_BACKPORT_MIN_VERSION="${ANYSCAN_KERNEL_BACKPORT_MIN_VERSION:-6.16}"
-ANYSCAN_KERNEL_BACKPORT_PACKAGE="${ANYSCAN_KERNEL_BACKPORT_PACKAGE:-linux-image-cloud-amd64}"
-ANYSCAN_KERNEL_BACKPORT_SUITE="${ANYSCAN_KERNEL_BACKPORT_SUITE:-bookworm-backports}"
-ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="${ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST:-/etc/apt/sources.list.d/anyscan-bookworm-backports.list}"
+_anyscan_codename="$(detect_debian_codename)"
+ANYSCAN_KERNEL_BACKPORT_SUITE="${ANYSCAN_KERNEL_BACKPORT_SUITE:-${_anyscan_codename}-backports}"
+# Package selection: trixie-backports linux-image-cloud-amd64 is still
+# 6.12 as of 2026-04 — only the non-cloud linux-image-amd64 jumps to
+# 6.19. Bookworm-backports keeps the legacy linux-image-cloud-amd64
+# default for back-compat on operators still on bookworm hosts.
+if [ "$ANYSCAN_KERNEL_BACKPORT_SUITE" = "bookworm-backports" ]; then
+	_anyscan_default_pkg="linux-image-cloud-amd64"
+else
+	_anyscan_default_pkg="linux-image-amd64"
+fi
+ANYSCAN_KERNEL_BACKPORT_PACKAGE="${ANYSCAN_KERNEL_BACKPORT_PACKAGE:-$_anyscan_default_pkg}"
+ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST="${ANYSCAN_KERNEL_BACKPORT_SOURCES_LIST:-/etc/apt/sources.list.d/anyscan-${ANYSCAN_KERNEL_BACKPORT_SUITE}.list}"
 ANYSCAN_KERNEL_BACKPORT_MIRROR="${ANYSCAN_KERNEL_BACKPORT_MIRROR:-http://deb.debian.org/debian}"
+unset _anyscan_codename _anyscan_default_pkg
 
 # True when the existing scanner binary was linked against libxdp at build
 # time. The AF_XDP build path (USE_AF_XDP=1 in the engine Makefile) adds
