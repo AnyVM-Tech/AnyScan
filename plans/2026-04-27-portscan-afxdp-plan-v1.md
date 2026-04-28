@@ -340,6 +340,29 @@ AF_XDP requires `CAP_NET_RAW` and `CAP_BPF` (kernel ≥ 5.8) or `CAP_SYS_ADMIN` 
 | Kernel < 5.10 on some legacy worker hosts           | Low        | High (if hit) | Runtime probe gates AF_XDP off and logs; falls back to AF_PACKET cleanly.                                      |
 | systemd unit missing `CAP_BPF`                      | High (will hit on first prod run) | High | Phase 2 PR includes systemd unit edit; Phase 1 just records the dependency.                                    |
 | Phase 2 LOC estimate slips                          | Medium     | Low         | Subdivide Phase 2 into the four PRs in §8 so a slip in one doesn't block the others.                           |
+| Operator scales NIC count past CPU sweet spot       | Medium     | High        | Subprocess concurrency cap stays at **`ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES=4`** regardless of NIC count — see §6.1 below.                       |
+
+### 6.1 Multi-NIC subprocess cap stays at 4 regardless of NIC count
+
+The c6in.xlarge → c6in.metal upgrade path lets operators attach up to 15 ENIs (anygpt-45 wires the launch path; PR sequence: PR #64 ENI auto-discovery → PR #65 AF_XDP plan → anygpt-45 launch-path scaling). Every additional ENI in AF_XDP `drv+copy` mode (the only mode ENA exposes on kernel ≤6.12.74) adds ~3M pps linearly until CPU contention saturates, so the temptation is to also raise the per-host *subprocess* cap — `ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES` (defaulted to 4 by `install-worker-bundle.sh:323-324`) — proportionally with NIC count.
+
+**Don't.** anygpt-4's c6in.metal bench data already settled this:
+
+| NIC count | Subproc cap | Aggregate pps     |
+|-----------|-------------|-------------------|
+| 4         | 4           | 12.8 M (kernel TX peak) |
+| 8         | 8           | 1.3 M (CPU-thrash collapse) |
+| 8         | 4           | ~12 M (parity with 4-NIC) |
+
+The 8/8 row is the load-bearing data point: shards 5-8 CPU-starved shards 1-4, NAPI softirqs queued behind userland sender loops, and the aggregate dropped by an order of magnitude. **The host-CPU sweet spot is `cap=4` and that does not move when you add NICs** — it's the kernel TX-batch + AIMD reaction-time interaction, not a NIC-count function.
+
+What more NICs *do* unlock, when paired with `cap=4`:
+
+- **AF_PACKET (today):** the per-socket TX-lock keeps each shard near 3M pps. `cap=4` × 4 NICs = ~12M aggregate. Adding NICs 5-15 buys nothing in this mode because `cap=4` only ever drives 4 of them.
+- **AF_XDP `drv+copy` (Phase 2 of this plan, kernel ≤6.12.74):** each shard rises to ~3M pps × `cap=4` = ~12-22M aggregate (per the anyscan_afxdp_ena_constraint memory). Adding NICs 5-15 still buys nothing **at `cap=4`**.
+- **AF_XDP `zerocopy` (kernel >6.12.74, separate worker):** the per-shard ceiling rises into the 8-12M pps range, and *now* multiple sender loops on different NICs can run concurrently because the syscall path is mostly gone. At that point a higher cap becomes worth measuring — but that's a kernel-upgrade story, gated on this plan's §4.3 probe returning a `zerocopy`-capable host.
+
+So: **leave `ANYSCAN_RATE_MAX_CONCURRENT_SUBPROCESSES=4`** when scaling beyond 8 ENIs. The remaining 11 NICs are headroom for the kernel-upgrade worker that flips ENA from `drv+copy` to `zerocopy`; they are not free pps on the existing kernel. Any operator who raises the cap should re-bench on a fresh c6in.metal box first — anygpt-4's 8/8 collapse is the stop sign.
 
 ---
 
